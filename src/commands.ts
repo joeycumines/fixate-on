@@ -158,11 +158,11 @@ export async function handleCommand(
   }
 
   const trimmed = args.trim();
-  // Status defaults to a concise headline; --verbose opts into the full status output.
+  // Status defaults to a concise headline; --verbose/--full opt into the full wall.
   let verbose = false;
   let statusKey = trimmed;
-  if (/--verbose$/i.test(statusKey)) {
-    const candidate = statusKey.replace(/\s*--verbose$/i, '').trim();
+  if (/--(?:verbose|full)$/i.test(statusKey)) {
+    const candidate = statusKey.replace(/\s*--(?:verbose|full)$/i, '').trim();
     if (!candidate || STATUS_COMMANDS.has(candidate.toLowerCase())) {
       verbose = true;
       statusKey = candidate;
@@ -208,6 +208,24 @@ export async function handleCommand(
   }
 
   if (LIST_COMMANDS.has(trimmed.toLowerCase())) {
+    const goals = session.listActiveGoals();
+    const archived = session.listArchivedResults();
+    const focusedMachine = session.getMachine();
+    const focusedId = focusedMachine?.snapshot().goalId ?? null;
+    return formatGoalList(
+      goals,
+      archived,
+      focusedId,
+      commandName,
+      session.isOrdered(),
+    );
+  }
+
+  // `list all` is the documented explicit form of the same listing: live goals
+  // plus the settled archive. Anything else after `list` is rejected rather
+  // than treated as an objective.
+  const listAllMatch = /^(?:list|ls)\s+all$/i.exec(trimmed);
+  if (listAllMatch) {
     const goals = session.listActiveGoals();
     const archived = session.listArchivedResults();
     const focusedMachine = session.getMachine();

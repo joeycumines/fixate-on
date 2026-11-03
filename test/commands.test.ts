@@ -306,6 +306,36 @@ test('handleCommand with status shows status', async () => {
   expect(result).toContain('Working: Build the feature');
 });
 
+test('handleCommand status --full returns the full verbose wall', async () => {
+  const machine = makeMachine();
+  const session = makeSessionContext({machine});
+  const full = await handleCommand('status --full', session, 'goal');
+  const verbose = await handleCommand('status --verbose', session, 'goal');
+  const headline = await handleCommand('status', session, 'goal');
+  expect(full).toBe(verbose);
+  expect(full.length).toBeGreaterThan(headline.length);
+});
+
+test('handleCommand list all lists live goals and the archive', async () => {
+  const machine = makeMachine();
+  const session = makeSessionContext({
+    machine,
+    archived: [makeResult()],
+  });
+  const result = await handleCommand('list all', session, 'goal');
+  expect(result).toContain('Goals (1):');
+  expect(result).toContain('Build the feature');
+  expect(result).toContain('Archived (1, newest last):');
+  expect(result).toContain('Old completed goal');
+});
+
+test('handleCommand list with an unknown operand still refuses', async () => {
+  const machine = makeMachine();
+  const session = makeSessionContext({machine});
+  const result = await handleCommand('list bogus', session, 'goal');
+  expect(result).toContain('does not accept additional arguments');
+});
+
 test('handleCommand with no goal shows message', async () => {
   const session = makeSessionContext({
     machine: null,
