@@ -1,0 +1,49 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "openrouter": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "OpenRouter",
+      "env": [
+        "OPENROUTER_API_KEY"
+      ],
+      "options": {
+        "baseURL": "https://openrouter.ai/api/v1"
+      },
+      "models": {
+        "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free": {
+          "name": "Nemotron Nano Omni (free)",
+          "limit": {
+            "context": 131072,
+            "output": 8192
+          },
+          "reasoning": false
+        }
+      }
+    }
+  },
+  "agent": {
+    "title": {
+      "model": "openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+    }
+  },
+  "plugin": [
+    [
+      "file://__BUNDLE_DIR__/plugin/fixate-on/plugin.js",
+      {
+        "stateRoot": ".opencode/goals",
+        "childSessionJudge": false
+      }
+    ]
+  ],
+  "permission": {
+    "external_directory": {
+      "__BUNDLE_DIR__/*": "allow",
+      "/dev/*": "deny"
+    },
+    "edit": "allow",
+    "bash": "allow"
+  },
+  "model": "openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+  "default_agent": "Implementer"
+}

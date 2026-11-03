@@ -1,0 +1,46 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+  schedule:
+    # Mondays, 07:17 UTC. Off the hour on purpose: the whole ecosystem
+    # schedules on :00 and the free runners are contended then.
+    - cron: "17 7 * * 1"
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # A new push to a PR supersedes the run in flight. On main and on a schedule,
+  # a run is never cancelled: a half-finished gate result is worth more than a
+  # few saved minutes.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: latest
+      - name: Cache the Bun install cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+      - name: Install locked dependencies
+        run: bun install --frozen-lockfile
+      - name: Type check
+        run: bun run type:check
+      - name: Run the test suite
+        run: bun test test/*.test.ts
+      - name: Lint
+        run: bun run lint
+      - name: Generate the bundle
+        run: bun run bundle
+      - name: Audit the dependency tree
+        run: bun run audit

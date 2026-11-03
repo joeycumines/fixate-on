@@ -1,0 +1,42 @@
+name: Feature request
+description: A change to what a goal does, which commands exist, or what the TUI shows.
+labels: [enhancement]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Goal commands (/goal and its subcommands)
+        - Auto-continue and completion checks
+        - Persistence and session state
+        - TUI or dashboard
+        - Plugin options
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you are trying to do
+      description: Describe the task or the failure you hit, not only the feature you want.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behaviour
+      description: If it is a command, give its name and an example line.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Workarounds you use today
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched the existing issues and this is not a duplicate.
+          required: true

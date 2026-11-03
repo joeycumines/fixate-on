@@ -1,0 +1,17 @@
+{
+  "theme": {
+    "name": "cobalt2"
+  },
+  "session": {
+    "sidebar": "auto"
+  },
+  "plugins": [
+    {
+      "package": "file://__BUNDLE_DIR__/plugin/fixate-on/tui-v2.js",
+      "options": {
+        "stateRoot": ".opencode/goals",
+        "workspaceDirectory": "__WORK_DIR__"
+      }
+    }
+  ]
+}

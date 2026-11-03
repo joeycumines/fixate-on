@@ -1,0 +1,130 @@
+name: Release
+on:
+  push:
+    tags: [ "v*" ]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish the packed tarball to npm after the gate passes"
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  gate:
+    name: Release gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: latest
+      - name: Cache the Bun install cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+      - name: Install locked dependencies
+        run: bun install --frozen-lockfile
+      - name: Read the package version and ask the registry
+        id: version
+        run: |
+          set -eu
+          manifest=./package.json
+          name="$(bun -e 'const p = await Bun.file(process.argv[1]).json(); process.stdout.write(p.name)' "$manifest")"
+          version="$(bun -e 'const p = await Bun.file(process.argv[1]).json(); process.stdout.write(p.version)' "$manifest")"
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          # Fail CLOSED. Any non-zero exit from `npm view` used to be read as
+          # "not published", and a registry outage, a timeout or a rate limit
+          # all produce a non-zero exit indistinguishable from a genuine 404 —
+          # so the gate passed and the version collided AFTER a human approved
+          # the release environment. Only an explicit 404 means "free".
+          if npm view "$name@$version" version >/dev/null 2>"$RUNNER_TEMP/npm-view.err"; then
+            echo "::error::$name@$version is already published to the registry. Bump package.json and tag the new version; npm cannot reuse one."
+            exit 1
+          fi
+          if ! grep -q 'E404' "$RUNNER_TEMP/npm-view.err"; then
+            echo "::error::could not determine whether $name@$version is published. The registry said:"
+            cat "$RUNNER_TEMP/npm-view.err"
+            exit 1
+          fi
+          echo "$name@$version is not published yet"
+      - name: A manual publish dispatch must be on a tag
+        if: inputs.publish == true
+        run: |
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            echo "::error::a publish was requested from $GITHUB_REF ($GITHUB_REF_TYPE). Tag the release commit and dispatch from the tag, or push the tag."
+            exit 1
+          fi
+          echo "publish requested from tag $GITHUB_REF_NAME"
+      - name: Check the tag matches the package version
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          if [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package version $VERSION"
+            exit 1
+          fi
+      - name: Check the release ref is an annotated tag on main
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          if [ "$(git cat-file -t "$GITHUB_REF_NAME")" != "tag" ]; then
+            echo "::error::$GITHUB_REF_NAME is a lightweight tag. Use an annotated tag: git tag -a $GITHUB_REF_NAME -m \"fixate-on $GITHUB_REF_NAME\""
+            exit 1
+          fi
+          git fetch --quiet --depth=1 origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_REF_NAME points at a commit that is not reachable from origin/main. Merge the work first, then tag the merged commit."
+            exit 1
+          fi
+          echo "$GITHUB_REF_NAME is an annotated tag on main"
+      - name: Run the release gate
+        run: bun run release:check
+      - name: Pack the artifact
+        run: bun pm pack --destination dist
+      - name: Upload the verified artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: package-${{ steps.version.outputs.value }}
+          path: dist/*.tgz
+          if-no-files-found: error
+          retention-days: 30
+  publish:
+    name: Publish to npm
+    needs: gate
+    if: github.event_name != 'pull_request' && (github.event_name == 'push' || inputs.publish)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download the verified artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: package-${{ needs.gate.outputs.version }}
+          path: ${{ runner.temp }}/verified
+      - name: Publish
+        run: |
+          set -eu
+          shopt -s nullglob
+          tarballs=("$RUNNER_TEMP"/verified/*.tgz)
+          if [ "${#tarballs[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one tarball in $RUNNER_TEMP/verified, found ${#tarballs[@]}"
+            exit 1
+          fi
+          echo "Publishing ${tarballs[0]}"
+          npm publish "${tarballs[0]}" --provenance --access public

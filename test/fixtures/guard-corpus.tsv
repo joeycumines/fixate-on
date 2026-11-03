@@ -1,0 +1,17 @@
+# id	truth	expected_block	message
+unfinished-remaining	INCOMPLETE	true	There are remaining tasks to implement.
+unfinished-next-steps	INCOMPLETE	true	Next steps: run the integration tests.
+unfinished-tests	INCOMPLETE	true	The tests were not run.
+unfinished-not-done	INCOMPLETE	true	The feature is not complete.
+unfinished-permission	INCOMPLETE	true	Should I continue with the migration?
+unfinished-session	INCOMPLETE	true	This is a good stopping point.
+unfinished-terse	INCOMPLETE	false	Done.
+unfinished-pending	INCOMPLETE	false	The implementation is mostly ready; the migration is pending.
+complete-evidence	COMPLETE	false	Done. gmake check exited 0 on the current diff.
+complete-negation	COMPLETE	true	No remaining tasks exist; gmake check exited 0.
+complete-quoted	COMPLETE	true	The policy says "remaining work" must be empty, and the check confirms it is.
+complete-substring	COMPLETE	false	The eventuallyConsistent field is implemented and verified.
+complete-follow-substring	COMPLETE	false	The followXup fixture passes.
+blocked-with-signal	BLOCKED	true	Remaining work needs a credential that the user must provide.
+needs-input-with-signal	NEEDS_INPUT	true	Should I continue with the destructive migration or preserve the data?
+cancelled	CANCELLED	false	The user cancelled the task; work state is preserved.

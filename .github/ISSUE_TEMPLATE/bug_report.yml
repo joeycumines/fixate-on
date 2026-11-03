@@ -1,0 +1,88 @@
+name: Bug report
+description: Something a /goal command, the auto-continue loop, or the TUI does wrongly.
+labels: [bug]
+body:
+  - type: dropdown
+    id: host
+    attributes:
+      label: OpenCode host
+      options:
+        - OpenCode v1 (stock opencode)
+        - OpenCode v2 (opencode2)
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: host-version
+    attributes:
+      label: OpenCode version
+      description: Output of `opencode --version` or `opencode2 --version`.
+      placeholder: 2.0.27
+    validations:
+      required: true
+  - type: input
+    id: plugin-version
+    attributes:
+      label: fixate-on version
+      description: The version in the installed package's package.json.
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Provider and model
+      placeholder: openrouter/recursive/flint-v1.0:free
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: macOS 15.4, Ubuntu 24.04, Windows 11
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command or prompt that triggered it
+      description: The exact `/goal` line, or the message you sent before the problem appeared.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: What happened, including any toast or message text, verbatim.
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: Output of `/goal status`
+      description: Paste it as shown. Run `/goal history` as well if the status is not enough.
+      render: text
+  - type: textarea
+    id: state
+    attributes:
+      label: Goal state file
+      description: |
+        The file `.opencode/goals/sessions/<sessionID>/state.json` from the project directory.
+        Replace the objective, constraints and success text with `[redacted]` if they are private.
+        Do not paste the lifecycle ledger (`state.json.ledger.jsonl`) unless a maintainer asks for it.
+      render: json
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched the existing issues and this is not a duplicate.
+          required: true
+        - label: I removed secrets, API keys and private file contents from everything I pasted.
+          required: true

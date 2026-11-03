@@ -1,0 +1,58 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "openrouter": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "OpenRouter",
+      "env": [
+        "OPENROUTER_API_KEY"
+      ],
+      "options": {
+        "baseURL": "https://openrouter.ai/api/v1"
+      },
+      "models": {
+        "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free": {
+          "name": "Nemotron Nano Omni (free)",
+          "limit": {
+            "context": 131072,
+            "output": 8192
+          },
+          "reasoning": false
+        }
+      }
+    }
+  },
+  "plugins": [
+    {
+      "package": "file://__BUNDLE_DIR__/hack/e2e-harness/plugin-dir/server.js",
+      "options": {
+        "stateRoot": ".opencode/goals",
+        "workspaceDirectory": "__WORK_DIR__",
+        "sdkShape": "flat"
+      }
+    }
+  ],
+  "permission": {
+    "external_directory": {
+      "__BUNDLE_DIR__/*": "allow",
+      "/dev/*": "deny"
+    },
+    "edit": "allow",
+    "bash": "allow"
+  },
+  "command": {
+    "goal": {
+      "description": "Run a goal loop for the objective",
+      "template": "Call the goal-command tool exactly once with its subcommand parameter set verbatim to: $ARGUMENTS\nDo not summarize, do not ask for confirmation, and do not perform any other work. Reply with only the tool output.",
+      "agent": "Implementer",
+      "path": "goal"
+    }
+  },
+  "default_agent": "Implementer",
+  "agent": {
+    "title": {
+      "model": "openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+    }
+  },
+  "model": "openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+}

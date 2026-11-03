@@ -1,0 +1,47 @@
+{
+  "extends": "./node_modules/gts/tsconfig-google.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "build",
+    "resolveJsonModule": true,
+    "allowJs": false,
+    "skipLibCheck": true,
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "target": "ES2022",
+    "lib": [
+      "ES2023"
+    ],
+    "composite": false,
+    "declaration": false,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "types": [
+      "bun-types"
+    ],
+    "jsx": "react-jsx",
+    "jsxImportSource": "@opentui/solid",
+    "paths": {
+      "@opencode-ai/plugin": [
+        "./node_modules/@opencode-ai/plugin/dist/index.d.ts"
+      ],
+      "@opencode-ai/plugin/tool": [
+        "./node_modules/@opencode-ai/plugin/dist/tool.d.ts"
+      ],
+      "@opencode-ai/plugin/tui": [
+        "./node_modules/@opencode-ai/plugin/dist/tui.d.ts"
+      ]
+    }
+  },
+  "include": [
+    "src/**/*.ts",
+    "src/**/*.tsx",
+    "test/**/*.ts",
+    "*.d.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "build",
+    "plugin"
+  ]
+}

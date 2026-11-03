@@ -1,0 +1,19 @@
+node_modules/
+*.log
+*.tgz
+.DS_Store
+
+# Goal state written by the plugin. Used within the "isolated home" test directories.
+.opencode/
+
+# The generated bundle. `bun run bundle` writes it; it is build output, not
+# source, and it must never be committed.
+/plugin/fixate-on/
+
+# e2e-harness runtime scratch (isolated XDG/HOME trees, captures, per-run state)
+/hack/e2e-harness/.isolated-*/
+/hack/e2e-harness/captures/
+/hack/e2e-harness/work/.opencode/
+/hack/e2e-harness/work-v1/.opencode/
+/hack/e2e-harness/slots/
+/hack/e2e-harness/runs/

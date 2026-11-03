@@ -1,0 +1,7 @@
+# GitHub reads this file only from .github/ISSUE_TEMPLATE/. Elsewhere it is
+# ignored silently, and the private security link below would not appear.
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/joeycumines/fixate-on/security/advisories/new
+    about: Report a vulnerability privately. Do not open a public issue.

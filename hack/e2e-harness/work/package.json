@@ -1,0 +1,7 @@
+{
+  "name": "work-target",
+  "type": "module",
+  "scripts": {
+    "test": "bun test"
+  }
+}

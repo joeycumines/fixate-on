@@ -1,0 +1,2 @@
+# Check out LF on all platforms; shell scripts and tmux send-keys sequences must be byte-exact.
+* text=auto eol=lf

@@ -1,0 +1,120 @@
+{
+  "name": "fixate-on",
+  "version": "0.1.0",
+  "description": "A goal-tracking plugin for OpenCode: holds an objective in context, auto-continues idle sessions, and checks completion claims before settling them.",
+  "license": "MIT",
+  "author": {
+    "name": "joeycumines"
+  },
+  "homepage": "https://github.com/joeycumines/fixate-on#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/joeycumines/fixate-on.git"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "agent",
+    "goal",
+    "fixate-on"
+  ],
+  "bugs": {
+    "url": "https://github.com/joeycumines/fixate-on/issues"
+  },
+  "type": "module",
+  "main": "./plugin/fixate-on/plugin.js",
+  "types": "./index.d.ts",
+  "exports": {
+    "./tui": {
+      "types": "./tui.d.ts",
+      "import": "./plugin/fixate-on/tui.js",
+      "default": "./plugin/fixate-on/tui.js"
+    },
+    "./server": {
+      "types": "./index.d.ts",
+      "import": "./plugin/fixate-on/plugin.js",
+      "default": "./plugin/fixate-on/plugin.js"
+    },
+    "./tui-v2": {
+      "types": "./tui-v2.d.ts",
+      "import": "./plugin/fixate-on/tui-v2.js",
+      "default": "./plugin/fixate-on/tui-v2.js"
+    },
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./plugin/fixate-on/plugin.js",
+      "default": "./plugin/fixate-on/plugin.js"
+    }
+  },
+  "files": [
+    "plugin",
+    "index.d.ts",
+    "tui.d.ts",
+    "tui-v2.d.ts",
+    "completion-verdict.schema.json",
+    "docs/tui-integration.md",
+    "README.md",
+    "CONTRIBUTING.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "test": "bun test test/*.test.ts",
+    "type:check": "bunx tsc --noEmit",
+    "lint": "gts lint && eslint \"*.cjs\"",
+    "fix": "gts fix",
+    "bundle": "bun build src/plugin.ts src/tui.ts src/tui-v2.ts --target=bun --external zod --external @opentui/solid --external @opentui/core --external solid-js --outdir=plugin/fixate-on",
+    "clean:bundle": "rm -rf plugin/fixate-on",
+    "check": "bunx tsc --noEmit && bun test test/*.test.ts && bun run lint",
+    "test:coverage": "bun test --coverage test/*.test.ts",
+    "release:check": "bun run bundle && bun run check && bun run audit",
+    "audit": "bun audit",
+    "prepack": "bun run bundle",
+    "prepublishOnly": "bun run release:check"
+  },
+  "engines": {
+    "bun": ">=1.0.0",
+    "opencode": ">=1.17.18 <2"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "packageManager": "bun@1.4.2",
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.17.18 <2",
+    "@opentui/solid": ">=0.5.4",
+    "solid-js": ">=1.9"
+  },
+  "dependencies": {
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "1.17.18",
+    "@opentui/solid": "^0.5.4",
+    "@types/node": "^22.7.5",
+    "@typescript-eslint/eslint-plugin": "^8.72.1",
+    "@typescript-eslint/parser": "^8.72.1",
+    "bun-types": "^1.3.14",
+    "gts": "^7.0.0",
+    "solid-js": "1.9.12",
+    "typescript": "5.9.3"
+  },
+  "overrides": {
+    "toml": ">=5.0.1",
+    "js-yaml": ">=4.3.2",
+    "brace-expansion": ">=5.0.9",
+    "tmp": ">=0.2.6",
+    "@babel/core": ">=7.29.0",
+    "seroval": ">=1.6.3",
+    "zod": "4.6.7"
+  },
+  "peerDependenciesMeta": {
+    "solid-js": {
+      "optional": true
+    },
+    "@opentui/solid": {
+      "optional": true
+    }
+  }
+}
