@@ -133,14 +133,18 @@ Natural language is the primary interface: `/goal <objective>` works with zero f
 | `/goal <objective> [flags]` | Sets or replaces the focused goal in the current session. |
 | `/goal add <objective> [flags]` | Creates and focuses a new goal while leaving existing unfinished goals active. |
 | `/goal sequence <obj1>; <obj2>` | Queues multiple objectives (separated by `;` or newlines) as an ordered pipeline. Focuses the first and keeps successors paused (`queued`) until auto-promoted on completion. |
-| `/goal status [--full \| --verbose]` | Shows a plain-language state headline, remaining brakes, and next duty. `--full` / `--verbose` prints the full usage breakdown, recovery counters, and raw evidentiary claim ledger. |
-| `/goal list [all]` | Lists numbered live goals and settled goals in the per-session archive, with state markers (`focused` = driven now, `idle` = active between turns, `background` = waiting). |
+| `/goal status [--full \| --verbose]` | Shows a plain-language state headline, remaining brakes, and next duty. `--full` / `--verbose` prints the full usage breakdown, recovery counters, and raw evidentiary claim ledger. Alias: `info`. |
+| `/goal list [all]` | Lists numbered live goals and settled goals in the per-session archive, with state markers (`focused` = driven now, `idle` = active between turns, `background` = waiting). Alias: `ls`. |
 | `/goal focus <number \| goalId>` | Switches which goal the dashboard and bare commands target. Persisted on disk. Does not alter goal status (focusing a paused goal leaves it paused; unfocused active goals keep running). |
 | `/goal pause [<goalId>]` | Pauses the focused (or named) goal while retaining its state and history. |
 | `/goal resume [<goalId>]` | Resumes a paused, blocked, or brake-stopped goal with a fresh local budget window and reset turn count, preserving the objective and history. |
 | `/goal edit <new objective>` | Revises the focused goal's objective in place, preserving budgets and history and clearing any paused/blocked state. If the goal already hit a hard brake, run `/goal resume` for a fresh budget window. |
 | `/goal checkpoint <note>` | Records a progress note on the focused goal. |
-| `/goal history [--verbose]` | Displays the lifecycle event trail and latest progress note. |
+| `/goal history [--verbose]` | Displays the lifecycle event trail and latest progress note. Alias: `log`. |
+| `/goal accept [proposalId]` | Applies the focused goal's pending proposal (from `propose_goal_change`) — objective, success criteria, constraints, and artifact pointers — and clears it. A supplied ID must match the pending proposal's. Alias: `accept-proposal`. |
+| `/goal reject [proposalId]` | Discards the focused goal's pending proposal without changing goal terms. A supplied ID must match the pending proposal's. Alias: `reject-proposal`. |
+| `/goal handback` | Returns the handback deliverable for the focused goal: scoped reviewable diff (files, stat, patch), known-risk enumeration, recorded claims, and the external review payload. |
+| `/goal review` | Returns just the external review payload of the focused goal's handback deliverable, for pasting into an external reviewer. Alias: `review-payload`. |
 | `/goal clear [<goalId>]` | Removes live goal state and saved status (aliases: `stop`, `off`, `reset`, `none`, `cancel`). Clears immediately when only one live goal exists; when several exist, bare `/goal clear` refuses and requires a `<goalId>` (or unique prefix). Terminal ledger tombstones remain on disk for crash-safe recovery. |
 
 Every action that accepts a `<goalId>` (`pause`, `resume`, `focus`, `clear`) matches either the full ID or a unique prefix, rejecting ambiguous prefixes with an error instead of guessing.
@@ -153,7 +157,7 @@ Flags accept `--flag value` or `--flag=value`. Quote multi-word values. Unknown 
 |:---|:---|
 | `--success <text>` | Success criteria injected alongside the objective (alias: `--success-criteria`). |
 | `--constraints <text>` | Constraints or non-goals to respect (alias: `--non-goals`). |
-| `--pointer <file>` | Artifact pointer; injects live file content into every continuation without editing the contract. |
+| `--pointer <file>` | Artifact pointer; injects live file content into every continuation without editing the contract. Repeatable and comma-separated (aliases: `--pointers`, `--artifact-pointer`, `--artifact-pointers`). |
 | `--mode <normal\|ordered>` | Prompt mode for a single goal (`default: normal`; `ordered` preserves step order within the objective). |
 | `--max-turns <n>` | Continuation turn ceiling (contract-tier). |
 | `--max-minutes <n>` | Stall brake in minutes (time without progress). |
