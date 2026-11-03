@@ -174,7 +174,7 @@ Flags accept `--flag value` or `--flag=value`. Quote multi-word values. Unknown 
 | `--max-recovery-turns <n>` | Total bounded recovery turns before escalating (`default: 12`). |
 | `--max-unchanged-results <n>` | Consecutive unchanged verifier results (matching candidate + fingerprint) before escalating (`default: 3`). |
 | `--max-blocked-turns <n>` | Consecutive `update_goal {status: "blocked"}` calls required before `blocked` is accepted (`default: 3`). |
-| `--verbose` | Renders verbose command output. |
+| `--verbose` | Renders verbose command output (alias for `--full` on `/goal status`). |
 
 ### Examples
 
