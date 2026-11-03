@@ -54,7 +54,6 @@
     "completion-verdict.schema.json",
     "docs/tui-integration.md",
     "README.md",
-    "CONTRIBUTING.md",
     "LICENSE"
   ],
   "sideEffects": false,

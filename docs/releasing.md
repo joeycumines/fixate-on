@@ -81,7 +81,7 @@ reports. If a release ever *does* depend on it, promote it then.
    tar -tzf dist/fixate-on-1.0.0.tgz | sort
    ```
 
-    Expect **12** entries:
+    Expect **10** files (the `package/` root directory entry is not a file):
 
    - `package.json` (1)
    - the three generated bundles under `plugin/fixate-on/` (3)
@@ -89,8 +89,7 @@ reports. If a release ever *does* depend on it, promote it then.
    - `completion-verdict.schema.json`, the judge verdict wire contract (1)
    - the integration document a host author needs (1):
      `docs/tui-integration.md`
-   - `README.md`, `CONTRIBUTING.md`,
-     `LICENSE` (4)
+   - `README.md`, `LICENSE` (2)
 
    Nothing from `src/`, `test/`, `examples/`, `.github/` or
    `hack/`, and not the maintainer's own runbook: `files` lists
