@@ -86,13 +86,13 @@ reports. If a release ever *does* depend on it, promote it then.
    Count the files and check the bundles are fresh (rebuilt by step 4):
 
    ```sh
-   # 10 files, no directory entries
+   # 11 files (bun pm pack emits no package/ root directory entry)
    tar -tzf dist/fixate-on-1.0.0.tgz | grep -v '/$' | wc -l
    # the three bundles, freshly built
    tar -tzf dist/fixate-on-1.0.0.tgz | grep '^package/plugin/fixate-on/'
    ```
 
-    Expect **10** files (the `package/` root directory entry is not a file):
+    Expect **11** files:
 
    - `package.json` (1)
    - the three generated bundles under `plugin/fixate-on/` (3)
