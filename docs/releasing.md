@@ -3,7 +3,9 @@
 Releases are verified before they are published, and publishing is automated
 from the tag. The gate is the same gate either way: `bun run release:check` must
 pass locally, and the release workflow runs exactly that script before it
-publishes anything.
+publishes anything. For what the published package contains and the
+command-line surface users install, see the
+[README](../README.md#fixate-on); this runbook is maintainer-only.
 
 ## One-time setup
 
@@ -81,6 +83,15 @@ reports. If a release ever *does* depend on it, promote it then.
    tar -tzf dist/fixate-on-1.0.0.tgz | sort
    ```
 
+   Count the files and check the bundles are fresh (rebuilt by step 4):
+
+   ```sh
+   # 10 files, no directory entries
+   tar -tzf dist/fixate-on-1.0.0.tgz | grep -v '/$' | wc -l
+   # the three bundles, freshly built
+   tar -tzf dist/fixate-on-1.0.0.tgz | grep '^package/plugin/fixate-on/'
+   ```
+
     Expect **10** files (the `package/` root directory entry is not a file):
 
    - `package.json` (1)
@@ -119,7 +130,9 @@ artifact whose verification happened when it was built — which is exactly what
 the release workflow does, deliberately, and why its `publish` job depends on
 the `gate` job that produced the bytes. The break-glass commands further down
 publish a tarball, so they carry no net at all: read the tarball's member list
-against the expected shape below, or run `release:check` yourself first.
+against the expected shape below, or run `release:check` yourself first. The
+expected shape is listed under [Prepare](#prepare); if a release goes wrong,
+follow [If a release goes wrong](#if-a-release-goes-wrong).
 
 Do not change `prepack` to `prepare`: `prepare` also fires on `npm install` from
 a git URL, which is a worse failure mode. The bun path is covered by the other
@@ -151,6 +164,13 @@ npm config get ignore-scripts   # must print false for these nets to exist
    ```sh
    git tag -a v1.0.0 -m "fixate-on 1.0.0"
    git push origin v1.0.0
+   ```
+
+   Verify the tag is annotated and matches the version before pushing:
+
+   ```sh
+   git tag -n9 v1.0.0          # the annotation must be present
+   bun -e 'console.log(JSON.parse(require("fs").readFileSync("package.json","utf8")).version)'
    ```
 
    The tag must be exactly `v<version>`. The workflow rejects anything else
@@ -192,11 +212,11 @@ npm config get ignore-scripts   # must print false for these nets to exist
 An npm version cannot be reused and a version cannot be unpublished after 72
 hours. So:
 
-- **The gate failed** — nothing was published. Fix, re-tag with a new version.
+- **The gate failed** — nothing was published. Fix, re-tag with a new version (see [One-time setup](#one-time-setup) for the repository configuration the gate assumes).
 - **The publish job failed after approval** — the version may or may not be
   live. Check the registry before retrying; `npm view fixate-on versions` is
   authoritative. Re-running the workflow on the same tag is safe once the version
-  is confirmed unpublished, and unsafe if it is not.
+  is confirmed unpublished, and unsafe if it is not (see [Publish](#publish)).
 - **The artifact is wrong** — release a patch. Do not rebuild or edit an
   artifact in place after the fact.
 

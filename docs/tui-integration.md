@@ -3,6 +3,11 @@
 The `fixate-on` provides a dual-mode system: a **server plugin**
 that manages goal state and a **TUI companion plugin** that renders
 interactive status panels, keyboard controls, and toast notifications.
+The slash-command and goal-tool surface these panels drive is documented in
+the [README's command reference](../README.md#goal-command-reference); this
+guide covers only the companion's own behavior — see
+[Installation](#installation), [Keyboard Shortcuts](#keyboard-shortcuts), and
+[State Synchronization](#state-synchronization).
 
 ## Architecture
 
@@ -67,6 +72,14 @@ Register the server plugin in `opencode.json` and the TUI companion in `tui.json
 }
 ```
 
+With both files in place, smoke-test the pairing:
+
+```sh
+# from a session running the server plugin, in the TUI companion:
+/goal status          # shows [TUI mode] header when the companion is attached
+/goal list all         # the dashboard mirrors this list within one refresh poll
+```
+
 The server plugin (`fixate-on`) manages goal state, persistence,
 and the command execution loop. The TUI companion (`fixate-on/tui`)
 subscribes to goal lifecycle events and renders interactive panels.
@@ -127,7 +140,10 @@ action key. The prefix is what keeps these out of the prompt's way.
 **The prefix is not universally deliverable.** On some terminals `ctrl+shift+g`
 arrives as `0x07` and the chord never fires. The command palette
 (`ctrl+p`, then type `fixate:`) reaches all six actions on every supported host,
-and is the path every live campaign in `../hack` takes.
+and is the path every live campaign in `../hack` takes. Every palette action has
+an equivalent slash command in the [README's subcommand table](../README.md#subcommands)
+— for example the pause chord mirrors `/goal pause`, the clear chord mirrors
+`/goal clear`.
 
 The `0x07` behaviour was recorded during product design. The prefix is unclaimed
 in common emulators and still undeliverable on some terminals; both can be
@@ -324,4 +340,6 @@ requires the lag documented with numbers rather than left implicit.
 - **`tui.publish` is not a data transport and never was** — see
   [On v1 hosts there is no event transport](#on-v1-hosts-there-is-no-event-transport).
   The v2 companion's data channel is the `tuiTransport` option; the v1
-  companion's is the state file.
+  companion's is the state file. The companion reads goal state written by the
+  server plugin — the same state behind [`/goal list all`](../README.md#subcommands)
+  and [`/goal status --full`](../README.md#subcommands).

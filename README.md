@@ -115,10 +115,12 @@ To test a local checkout without packing, point OpenCode directly at `src/plugin
 
 **Quick smoke test:**
 
-1. Load the plugin in a scratch OpenCode config and configure `command.goal` if running on a v2 host.
+1. Load the plugin in a scratch OpenCode config and configure `command.goal` if running on a v2 host (see [`/goal` on OpenCode v2 hosts](#goal-on-opencode-v2-hosts)).
 2. Run `/goal status` and confirm no active goal is reported.
 3. Run `/goal inspect this repo and call update_goal with status "blocked" if you need user input`.
-4. Verify `/goal status`, `/goal pause`, `/goal resume`, and `/goal clear` transition state as expected.
+4. Verify `/goal status`, `/goal pause`, `/goal resume`, and `/goal clear` transition state as expected (see [Subcommands](#subcommands)).
+
+Related documents: [`docs/tui-integration.md`](docs/tui-integration.md) covers the TUI companion in depth (see [its installation section](docs/tui-integration.md#installation) and [keyboard shortcuts](docs/tui-integration.md#keyboard-shortcuts)); `docs/releasing.md` is the maintainer runbook for cutting a release (see [Prepare](docs/releasing.md#prepare) and [Publish](docs/releasing.md#publish)).
 
 ---
 
@@ -228,7 +230,7 @@ When a session is forked, live goals are **copied** into the fork with newly min
    - If a yielded turn never settles within 15 minutes, the goal stops claiming it will auto-resume, surfaces as waiting on you, and accepts `/goal resume`.
 5. **OpenCode v1 kickoff & echo filtering:** Because slash commands on stock v1 do not launch an assistant turn on their own, the plugin schedules a one-shot kickoff probe (`kickoffDelayMs`, default `2500` ms) when a command activates a goal, sending the first continuation only if no turn started organically. It also fingerprints just-dispatched slash arguments so v1's chat echo of `/goal ...` does not trigger a human-interjection pause.
 6. **Compaction survival:** When OpenCode compacts a session, the plugin injects a deterministic summary reconstructed from the persisted goal record (objective, status, budget usage, recent progress notes, and lifecycle trail) and disables OpenCode's generic post-compaction auto-continue so it cannot race the plugin's continuation.
-7. **Host token accounting:** On v1, token usage is tracked via `message.updated` events (falling back to fetched session messages when per-message events are absent). On v2, usage is tracked via ephemeral `session.usage.updated` steps. Because session context is shared, token usage accrues to every non-terminal goal in the session.
+7. **Host token accounting:** On v1, token usage is tracked via `message.updated` events (falling back to fetched session messages when per-message events are absent). On v2, usage is tracked via ephemeral `session.usage.updated` steps. Because session context is shared, token usage accrues to every non-terminal goal in the session. See [Default brakes](#default-brakes) for the ceilings these numbers feed and [`docs/tui-integration.md` → State Synchronization](docs/tui-integration.md#state-synchronization) for how the companion reads them.
 
 ---
 
@@ -246,7 +248,7 @@ Completion and blocking are driven exclusively through the canonical tool surfac
 | `propose_goal_change` | proposal fields | Records a `pendingProposal` on the goal for human review (agents cannot raise contract-tier turn or token ceilings directly). |
 | `goal-command` | `subcommand` (string) | *(OpenCode v2 only)* Routes `/goal` slash-command invocations into plugin state when wired via `command.goal`. |
 
-Tool schemas are defined with `zod` (a direct dependency). If `registerTools: false` is set or `zod` fails to load at runtime, active goals pause with a visible notice rather than looping on continuation prompts that reference unavailable tools. Legacy tool aliases (`goal_status`, `goal_set`, `goal_pause`, `goal_resume`, `goal_block`, `goal_complete`, `get_goal_history`, `set_goal`, `clear_goal`) are not registered.
+Tool schemas are defined with `zod` (a direct dependency). If `registerTools: false` is set or `zod` fails to load at runtime, active goals pause with a visible notice rather than looping on continuation prompts that reference unavailable tools. Legacy tool aliases (`goal_status`, `goal_set`, `goal_pause`, `goal_resume`, `goal_block`, `goal_complete`, `get_goal_history`, `set_goal`, `clear_goal`) are not registered. The same subcommand surface is reachable from the agent side through the [`goal-command` bridge](#goal-on-opencode-v2-hosts) on v2 hosts.
 
 **Goal statuses:** `active` · `paused` · `blocked` · `budgetLimited` · `finalizing` · `complete`
 
@@ -281,7 +283,7 @@ The completion gate consults one verifier in the following precedence order:
 - `CANCELLED` → settles as an authorized cancellation.
 - **Attestation fault** (provider error, timeout, missing child-session ID) → retried with backoff as a forced continuation; never treated as a verdict on the goal.
 
-**Recovery bounds:** Recovery is bounded by both a total recovery budget (`--max-recovery-turns`, default `12`) and a consecutive-unchanged threshold (`--max-unchanged-results`, default `3`, comparing `candidate` + `fingerprint`). A new candidate resets the consecutive-unchanged counter but not the total budget. Exhausting either bound pauses the goal with stop reason `recovery exhausted` and **never** fabricates `COMPLETE`.
+**Recovery bounds:** Recovery is bounded by both a total recovery budget (`--max-recovery-turns`, default `12`) and a consecutive-unchanged threshold (`--max-unchanged-results`, default `3`, comparing `candidate` + `fingerprint`). A new candidate resets the consecutive-unchanged counter but not the total budget. Exhausting either bound pauses the goal with stop reason `recovery exhausted` and **never** fabricates `COMPLETE`. The advisory phrase scan that annotates `WORKING` recovery prompts is documented under [Advisory phrase triage](#advisory-phrase-triage); the verdict wire contract is `completion-verdict.schema.json`.
 
 ### Tuning the built-in judge (`judgeOptions`)
 
@@ -399,19 +401,35 @@ Pass plugin-level defaults in `opencode.json`:
 | Package subpaths | `.`, `./server`, and `./tui` load standalone; `./tui-v2` depends on host-supplied modules. TypeScript declarations support `NodeNext` and `Bundler`. |
 | Provider templates | Strict-template backends require the goal block to merge into the primary `system` message (covered by regression tests). |
 | Static built-in verifier | The built-in `goal-verify` subagent is read-only (`read`, `glob`, `grep`); it cannot run shell commands itself and relies on workspace inspection plus evidence cited by the primary agent. |
-| OpenCode v2 TUI plugins | Stock released v2 binaries do not load external TUI plugins; v2 TUI e2e campaigns under `hack/e2e-harness/` run against a from-source host. |
+| OpenCode v2 TUI plugins | Stock released v2 binaries do not load external TUI plugins; v2 TUI e2e campaigns under `hack/e2e-harness/` run against a from-source host. See [Host API Requirements](docs/tui-integration.md#host-api-requirements). |
 
 ---
 
 ## Troubleshooting
 
-Start with `/goal status --verbose` and `/goal history --verbose` to inspect the active state, stop reason, brake usage, and recent lifecycle trail.
+Start with `/goal status --full` (or `--verbose`) and `/goal history --verbose` to inspect the active state, stop reason, brake usage, and recent lifecycle trail. For the full lifecycle of a goal see [Multi-Goal & Session-Scoped Behavior](#multi-goal--session-scoped-behavior) and [Completion Verification](#completion-verification); for persistence layout see [Persistence and state root](#persistence-and-state-root).
 
 If a goal does not continue:
 
 1. **Distinguish self-resolving pauses from stops that wait on you:** Goals paused for `user intervention`, `recovery`, or `queued` sequence ordering resume automatically (unless a `user intervention` yield exceeds 15 minutes without settling, at which point `/goal status` flags that it did not re-arm and offers `/goal resume`). Deliberate pauses (`explicit pause`), hard brakes, no-progress/no-tool-call pauses, prompt failures, and `recovery exhausted` require human action.
 2. **Resume after resolving the cause:** Run `/goal resume` to start a fresh local budget window and reset the turn count without losing the objective or history.
 3. **Check structured logs and paths:** Inspect OpenCode's structured logs for persistence, `sdkShape`, prompt dispatch, or verifier faults, and verify that the working directory and `stateRoot` / `FIXATE_ON_STATE_ROOT` match between server and TUI entries.
+
+**Quick diagnostics:**
+
+```sh
+# Full status wall: usage breakdown, recovery counters, claim ledger
+/goal status --full
+
+# Live goals plus the settled archive
+/goal list all
+
+# Lifecycle event trail for the focused goal
+/goal history --verbose
+
+# The same subcommands, routed through the agent tool on v2 hosts
+# (the goal-command bridge takes the subcommand line verbatim)
+```
 
 **Privacy note:** Do not paste raw `state.json` files, `.ledger.jsonl` transcripts, or `FIXATE_ON_EVENT_LOG` output into public issues without redacting them first — they contain goal text, progress notes, local paths, and session identifiers.
 

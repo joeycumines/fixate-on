@@ -178,3 +178,7 @@ measurement is an opinion, and must be labelled as one.
   plugin) to ensure the graph is a DAG.
 - **File naming.** Name files after their primary concern. Test files are
   `<module>.test.ts` colocated in `test/`.
+
+The user-facing behavior these rules protect is documented in
+[README.md](README.md#goal-command-reference); the companion rendering and the
+release runbook live in [docs/](docs/tui-integration.md).
