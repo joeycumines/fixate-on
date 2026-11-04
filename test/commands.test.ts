@@ -353,6 +353,35 @@ test('handleCommand history shows history', async () => {
   expect(result).toContain('Goal history for:');
 });
 
+test('handleCommand history --verbose shows the raw trail including bookkeeping entries', async () => {
+  const history: GoalLifecycleEvent[] = [
+    {timestamp: Date.now() - 60000, type: 'set', detail: 'Goal created'},
+    {
+      timestamp: Date.now() - 30000,
+      type: 'tracking',
+      detail: 'baseline updated',
+    },
+    {timestamp: Date.now(), type: 'paused', detail: 'User paused'},
+  ];
+  const machine = makeMachine(makeGoal({history}));
+  const session = makeSessionContext({machine});
+  const bare = await handleCommand('history', session, 'goal');
+  const verbose = await handleCommand('history --verbose', session, 'goal');
+  const full = await handleCommand('history --full', session, 'goal');
+  expect(bare).toContain('set: Goal created');
+  expect(bare).not.toContain('tracking');
+  expect(verbose).toContain('tracking: baseline updated');
+  expect(verbose.length).toBeGreaterThan(bare.length);
+  expect(full).toBe(verbose);
+});
+
+test('handleCommand history with an unknown operand still refuses', async () => {
+  const machine = makeMachine();
+  const session = makeSessionContext({machine});
+  const result = await handleCommand('history bogus', session, 'goal');
+  expect(result).toContain('does not accept additional arguments');
+});
+
 test('handleCommand list shows goal list', async () => {
   const machine = makeMachine();
   const session = makeSessionContext({machine});

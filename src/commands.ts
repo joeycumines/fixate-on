@@ -11,11 +11,11 @@ import {
   formatGoalList,
   formatGoalResult,
   formatHistory,
+  formatHistoryRaw,
   formatStatus,
 } from './commands-format.ts';
 import {
   CLEAR_COMMANDS,
-  HISTORY_COMMANDS,
   LIST_COMMANDS,
   NO_ARG_SUBCOMMANDS,
   parseGoalArguments,
@@ -181,7 +181,13 @@ export async function handleCommand(
     return `No active goal. Set one with \`/${commandName} <condition>\`.`;
   }
 
-  if (HISTORY_COMMANDS.has(trimmed.toLowerCase())) {
+  // `history [--verbose|--full]`: bare shows signal lifecycle entries; the flag
+  // adds the raw trail (including bookkeeping mutations the bare view filters).
+  const historyMatch = /^(?:history|log)(?:\s+(--verbose|--full))?$/i.exec(
+    trimmed,
+  );
+  if (historyMatch) {
+    const historyVerbose = historyMatch[1] !== undefined;
     const machine = session.getMachine();
     if (machine) {
       const goal = machine.snapshot();
@@ -190,7 +196,9 @@ export async function handleCommand(
         '',
         `Latest checkpoint: ${goal.lastCheckpoint?.summary || 'none yet'}`,
         '',
-        formatHistory(goal.history),
+        historyVerbose
+          ? formatHistoryRaw(goal.history)
+          : formatHistory(goal.history),
       ].join('\n');
     }
     const archived = session.listArchivedResults();
@@ -201,7 +209,9 @@ export async function handleCommand(
         '',
         `Latest checkpoint: ${last.lastCheckpoint?.summary || 'none recorded'}`,
         '',
-        formatHistory(last.history),
+        historyVerbose
+          ? formatHistoryRaw(last.history)
+          : formatHistory(last.history),
       ].join('\n');
     }
     return `No goal history recorded yet. Set a goal with \`/${commandName} <condition>\`.`;
@@ -795,6 +805,7 @@ export {
   formatStatusHeadline,
   formatStatus,
   formatHistory,
+  formatHistoryRaw,
   formatGoalList,
   formatGoalResult,
 } from './commands-format.ts';
