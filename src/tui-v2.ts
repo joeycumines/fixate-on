@@ -578,7 +578,7 @@ export const GoalTuiPluginV2 = {
       dashboardRouteDispose = context.ui.router.register({
         name: dashboardRouteName,
         render: () => {
-          const theme = (context.theme ?? {}) as HostTheme;
+          const theme = dialogTheme();
           // SolidJS reactivity: trigger view updates on store events without route re-navigation.
           const [rev, setRev] = createSignal(0);
           const unsub = store.subscribe(() => setRev(r => r + 1));
@@ -636,11 +636,15 @@ export const GoalTuiPluginV2 = {
             onClose: () => {
               dashboardOpen = false;
               dashboardSessionID = null;
+              scrollHandlers = null;
               try {
                 context.ui.router.navigate({type: 'home'});
               } catch {
                 // Ignore navigation errors on dismissal.
               }
+            },
+            registerScrollCommands: handlers => {
+              scrollHandlers = handlers;
             },
             theme,
             footer: dashboardFooter(dashboardSession),
@@ -656,6 +660,24 @@ export const GoalTuiPluginV2 = {
     let dashboardOpen = false;
     let dashboardSessionID: string | null = null;
     let dashboardUnsubscribe: (() => void) | null = null;
+    // Keyboard-scroll handlers registered by the dashboard route's render.
+    // Null while the dashboard dialog is closed; scroll commands no-op then.
+    let scrollHandlers: {
+      up: () => void;
+      down: () => void;
+      pageUp: () => void;
+      pageDown: () => void;
+    } | null = null;
+
+    /** Resolves the theme on the dialog surface, where the dashboard renders. */
+    const dialogTheme = (): HostTheme => {
+      const raw = (context.theme ?? {}) as HostTheme;
+      try {
+        return typeof raw.surface === 'function' ? raw.surface('dialog') : raw;
+      } catch {
+        return raw;
+      }
+    };
 
     const isDashboardRouteActive = (): boolean => {
       try {
@@ -680,7 +702,7 @@ export const GoalTuiPluginV2 = {
     const repaintDashboard = (): void => {
       if (!dashboardOpen) return;
       const generation = ++dashboardGeneration;
-      const theme = (context.theme ?? {}) as HostTheme;
+      const theme = dialogTheme();
 
       const renderContent = () =>
         DashboardRoute({
@@ -710,6 +732,7 @@ export const GoalTuiPluginV2 = {
           onClose: () => {
             dashboardOpen = false;
             dashboardSessionID = null;
+            scrollHandlers = null;
             if (dashboardUnsubscribe) {
               try {
                 dashboardUnsubscribe();
@@ -723,6 +746,9 @@ export const GoalTuiPluginV2 = {
             } catch {
               // Dialog might already be dismissed.
             }
+          },
+          registerScrollCommands: handlers => {
+            scrollHandlers = handlers;
           },
           theme,
           footer: dashboardFooter(
@@ -738,6 +764,7 @@ export const GoalTuiPluginV2 = {
         if (generation === dashboardGeneration) {
           dashboardOpen = false;
           dashboardSessionID = null;
+          scrollHandlers = null;
           if (dashboardUnsubscribe) {
             try {
               dashboardUnsubscribe();
@@ -824,7 +851,11 @@ export const GoalTuiPluginV2 = {
       );
     };
 
+    // OpenCode 2.x gates command reachability by the active input mode: the palette
+    // and other modals push their own mode, so a base-mode layer vanishes from the
+    // palette the moment it opens. The layer must be global to stay reachable.
     context.keymap.layer(() => ({
+      mode: 'global',
       commands: [
         {
           id: 'fixate-on.dashboard',
@@ -1009,6 +1040,53 @@ export const GoalTuiPluginV2 = {
           palette: true,
           run: async () => {
             await sendGoalCommand('review-payload');
+          },
+        },
+        // Dashboard scrolling: the host scrollbox moves on mouse wheel only;
+        // these commands drive its ref so arrow/page keys scroll too. They
+        // no-op when the dashboard dialog is not open.
+        {
+          id: 'fixate-on.scroll.up',
+          title: `${PRODUCT_DISPLAY_NAME}: Scroll Dashboard Up`,
+          description: 'Scroll the goal dashboard up one line',
+          group: PRODUCT_DISPLAY_NAME,
+          bind: 'up',
+          enabled: () => dashboardOpen,
+          run: () => {
+            scrollHandlers?.up();
+          },
+        },
+        {
+          id: 'fixate-on.scroll.down',
+          title: `${PRODUCT_DISPLAY_NAME}: Scroll Dashboard Down`,
+          description: 'Scroll the goal dashboard down one line',
+          group: PRODUCT_DISPLAY_NAME,
+          bind: 'down',
+          enabled: () => dashboardOpen,
+          run: () => {
+            scrollHandlers?.down();
+          },
+        },
+        {
+          id: 'fixate-on.scroll.page-up',
+          title: `${PRODUCT_DISPLAY_NAME}: Page Dashboard Up`,
+          description: 'Scroll the goal dashboard up one page',
+          group: PRODUCT_DISPLAY_NAME,
+          bind: 'pageup',
+          enabled: () => dashboardOpen,
+          run: () => {
+            scrollHandlers?.pageUp();
+          },
+        },
+        {
+          id: 'fixate-on.scroll.page-down',
+          title: `${PRODUCT_DISPLAY_NAME}: Page Dashboard Down`,
+          description: 'Scroll the goal dashboard down one page',
+          group: PRODUCT_DISPLAY_NAME,
+          bind: 'pagedown',
+          enabled: () => dashboardOpen,
+          run: () => {
+            scrollHandlers?.pageDown();
           },
         },
       ],

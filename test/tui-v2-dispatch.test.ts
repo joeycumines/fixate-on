@@ -177,6 +177,11 @@ interface V2Command {
   run: (input?: string, event?: unknown) => void | boolean | Promise<void>;
 }
 
+interface V2Layer {
+  mode?: string;
+  commands: V2Command[];
+}
+
 function createMockContext() {
   const synthetics: SyntheticCall[] = [];
   const commands: CommandCall[] = [];
@@ -185,6 +190,7 @@ function createMockContext() {
   const toasts: {variant?: string; title?: string; message: string}[] = [];
   const dialogs: {kind: string; title: string; value?: string}[] = [];
   let capturedCommands: V2Command[] = [];
+  let capturedLayerMode: string | undefined;
   let location: {directory: string; workspaceID?: string} | undefined;
   let tabsEnabled = false;
   let failNextSynthetic = false;
@@ -253,8 +259,10 @@ function createMockContext() {
       },
     },
     keymap: {
-      layer: (make: () => {commands: V2Command[]}) => {
-        capturedCommands = make().commands;
+      layer: (make: () => V2Layer) => {
+        const layer = make();
+        capturedCommands = layer.commands;
+        capturedLayerMode = layer.mode;
       },
     },
     ui: {
@@ -300,6 +308,7 @@ function createMockContext() {
   return {
     stub,
     getCommands: () => capturedCommands,
+    getLayerMode: () => capturedLayerMode,
     find: (id: string) => capturedCommands.find(c => c.id === id),
     synthetics,
     commands,
@@ -341,6 +350,164 @@ function findDispatchText(
 // macrotasks run. Deliberate — do not "convert" to waitFor (there is no
 // condition to await; the point is to drain the queue).
 const flush = () => new Promise<void>(resolve => setTimeout(resolve, 0));
+
+// OpenCode 2.x filters command reachability by the active input mode: the command
+// palette and other modals push their own mode, so a base-mode layer's entries
+// vanish from the palette the moment it opens (upstream never shipped the
+// global-mode default for plugin layers — fix commit 359c501ceb lives only on the
+// fix branch). The companion must therefore declare the layer global itself.
+test('the v2 keymap layer is global so palette entries survive the palette mode', async () => {
+  const h = createMockContext();
+  const workspace = await makeGoalFixture('a goal for the layer test');
+  h.setLocation({directory: workspace});
+  const dispose = await GoalTuiPluginV2.setup(h.stub);
+  try {
+    await flush();
+    expect(h.getLayerMode()).toBe('global');
+    const ids = h.getCommands().map(c => c.id);
+    for (const id of [
+      'fixate-on.dashboard',
+      'fixate-on.pause',
+      'fixate-on.resume',
+      'fixate-on.clear',
+      'fixate-on.add',
+      'fixate-on.list',
+      'fixate-on.history',
+      'fixate-on.focus',
+    ]) {
+      expect(ids).toContain(id);
+    }
+  } finally {
+    await dispose();
+  }
+});
+
+// Keyboard scrolling: the host scrollbox only reacts to the mouse wheel unless a
+// keymap command drives its ref. The companion registers scroll commands bound to
+// up/down/pageup/pagedown, gated on the dashboard being open, and the route wires
+// its ref to them via registerScrollCommands.
+test('scroll commands exist, are bound to arrow/page keys, and gate on dashboardOpen', async () => {
+  const h = createMockContext();
+  const workspace = await makeGoalFixture('a goal for the scroll test');
+  h.setLocation({directory: workspace});
+  const dispose = await GoalTuiPluginV2.setup(h.stub);
+  try {
+    await flush();
+    const scrollIds = [
+      'fixate-on.scroll.up',
+      'fixate-on.scroll.down',
+      'fixate-on.scroll.page-up',
+      'fixate-on.scroll.page-down',
+    ] as const;
+    const binds: Record<string, string | undefined> = {};
+    for (const id of scrollIds) {
+      const cmd = h.find(id);
+      expect(cmd, `command ${id} should exist`).toBeTruthy();
+      binds[id] = (cmd as unknown as {bind?: string}).bind;
+    }
+    expect(binds['fixate-on.scroll.up']).toBe('up');
+    expect(binds['fixate-on.scroll.down']).toBe('down');
+    expect(binds['fixate-on.scroll.page-up']).toBe('pageup');
+    expect(binds['fixate-on.scroll.page-down']).toBe('pagedown');
+    // enabled() is a function gated on dashboardOpen; with no dashboard open it
+    // must report disabled so the keys do not fire elsewhere.
+    for (const id of scrollIds) {
+      const cmd = h.find(id) as unknown as {
+        enabled?: boolean | (() => boolean);
+        run: () => void;
+      };
+      const enabled = cmd.enabled;
+      if (typeof enabled === 'function') expect(enabled()).toBe(false);
+      // run() with no dashboard open must not throw.
+      expect(() => cmd.run()).not.toThrow();
+    }
+  } finally {
+    await dispose();
+  }
+});
+
+// Theme tokens: v2 hands plugins a ResolvedTheme whose colors are RGBA objects on
+// v2-shaped paths (text.base/muted, background.raised.base, feedback.*, hue.accent).
+// The route must pass those RGBA objects through to the renderer unchanged: the
+// props accept RGBA natively, and RGBA.toString() yields "rgba(1.00, 0.00, ...)"
+// floats that the renderer's hex parser rejects, falling back to magenta.
+test('the dashboard palette passes v2 RGBA tokens through, never stringified', async () => {
+  const {resolveDashboardPalette} =
+    await import('../src/tui-dashboard-route.tsx');
+  // Real RGBA objects, as the host hands over.
+  const {RGBA} = await import('@opentui/core');
+  const theme = {
+    text: {
+      base: RGBA.fromHex('#eeeeee'),
+      muted: RGBA.fromHex('#999999'),
+      feedback: {
+        success: {base: RGBA.fromHex('#00ff00')},
+        warning: {base: RGBA.fromHex('#ffaa00')},
+        error: {base: RGBA.fromHex('#ff0000')},
+        info: {base: RGBA.fromHex('#00aaff')},
+      },
+    },
+    background: {
+      base: RGBA.fromHex('#111111'),
+      raised: {base: RGBA.fromHex('#222222')},
+    },
+    border: {base: RGBA.fromHex('#444444')},
+    scrollbar: {base: RGBA.fromHex('#555555')},
+    hue: {accent: {500: RGBA.fromHex('#7777ff')}},
+  };
+  const p = resolveDashboardPalette(theme as never);
+  // Identity, not stringification: the exact RGBA object must come out.
+  expect(p.text).toBe(theme.text.base);
+  expect(p.muted).toBe(theme.text.muted);
+  expect(p.panel).toBe(theme.background.raised.base); // raised.base, not old background.panel
+  expect(p.background).toBe(theme.background.base);
+  expect(p.accent).toBe(theme.hue.accent[500]); // hue.accent[500], not text.accent.default
+  expect(p.scrollbar).toBe(theme.scrollbar.base);
+  expect(p.status.active).toBe(theme.text.feedback.success.base);
+  expect(p.status.paused).toBe(theme.text.feedback.warning.base);
+  expect(p.status.blocked).toBe(theme.text.feedback.error.base);
+  expect(p.status.complete).toBe(theme.text.muted);
+  // The palette must contain no stringified "rgba(...)" forms anywhere.
+  const flat = [
+    p.text,
+    p.muted,
+    p.panel,
+    p.background,
+    p.accent,
+    p.scrollbar,
+    ...Object.values(p.status),
+  ];
+  for (const c of flat) {
+    if (typeof c === 'string') expect(c.startsWith('rgba(')).toBe(false);
+  }
+  // Missing tokens fall back to undefined (renderer default), never to a string.
+  const bare = resolveDashboardPalette({} as never);
+  expect(bare.text).toBeUndefined();
+  expect(bare.status.active).toBeUndefined();
+});
+
+test('dashboard scroll handlers drive the scrollbox ref by lines and half-pages', async () => {
+  const {createScrollHandlers} = await import('../src/tui-dashboard-route.tsx');
+  const calls: number[] = [];
+  let el: {scrollBy: (n: number) => void; viewport?: {height: number}} | null =
+    null;
+  const h = createScrollHandlers(() => el);
+  // No element attached: must not throw.
+  h.up();
+  h.down();
+  h.pageUp();
+  h.pageDown();
+  expect(calls).toEqual([]);
+  el = {
+    scrollBy: (n: number) => calls.push(n),
+    viewport: {height: 40},
+  };
+  h.up();
+  h.down();
+  h.pageUp();
+  h.pageDown();
+  expect(calls).toEqual([-1, 1, -20, 20]); // page = half of viewport height 40
+});
 
 test('palette actions dispatch via session.synthetic, NOT session.command', async () => {
   const h = createMockContext();
