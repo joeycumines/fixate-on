@@ -11,29 +11,29 @@ guide covers only the companion's own behavior — see
 
 ## Architecture
 
-**Which file loads what:** stock OpenCode v1 loads the server plugin from the
+**Which file loads what:** stock OpenCode 1.x loads the server plugin from the
 `opencode.json` `plugin` array and the TUI companion ONLY via the `tui.json`
 `plugin` array (`~/.config/opencode/tui.json`, overridable with
 `$OPENCODE_TUI_CONFIG`).
 Registering the companion in `opencode.json` does not load it. With the
-companion in `tui.json`, all 11 `Fixate:` palette entries of the v1 companion render
-(palette filtered on `fixate:`; the v2 companion registers 13) with chord
+companion in `tui.json`, all 11 `Fixate:` palette entries of the 1.x companion render
+(palette filtered on `fixate:`; the 2.x companion registers 13) with chord
 hints shown on the six bound actions. One
 caveat stands: the chords themselves are not byte-deliverable through
 tmux/terminal (`ctrl+shift+g` arrives as `0x07`), so the palette — not the
 chord — is the guaranteed path, and every live campaign in
-`hack/e2e-harness/` drives the palette. The v1 companion therefore keeps
+`hack/e2e-harness/` drives the palette. The 1.x companion therefore keeps
 its slash + state-file surfaces first-class.
 
-On opencode2 the server→TUI channel rides `tool Result.metadata`
+On OpenCode 2.x the server→TUI channel rides `tool Result.metadata`
 (`tool Result.metadata` → `session.tool.success` → `context.data.on` → store),
-not `client.tui.publish`. On stock v1 the transport is disk hydration +
+not `client.tui.publish`. On stock 1.x the transport is disk hydration +
 a state-file refresh loop plus curated human-readable toasts — the publish
-channel is never used as a data transport there (v1 renders every published
+channel is never used as a data transport there (1.x renders every published
 toast on screen, so data events would flood the UI).
 
 ```
-OpenCode Host (v1: toast channel)
+OpenCode 1.x (toast channel)
 
   Server Plugin (src/plugin.ts)          TUI Companion Plugin (src/tui.ts)
     - goal state                          - state store
@@ -43,14 +43,21 @@ OpenCode Host (v1: toast channel)
     - broadcaster
         |  publish
         v
-  Host Event Bus (SSE): client.tui.publish() -> api.event.on("tui.toast.show")
+  OpenCode event bus (SSE): client.tui.publish() -> api.event.on("tui.toast.show")
 ```
 
 ## Installation
 
-Register the server plugin in `opencode.json` and the TUI companion in `tui.json`
-(the v1 loader reads them from different files — putting the companion in
-`opencode.json` does not load it):
+OpenCode 1.x (`opencode`) and 2.x (`opencode2`) each read a different file, and each loads a different companion entrypoint:
+
+| File | Read by | Holds |
+|:---|:---|:---|
+| `opencode.json` | 1.x server | the server plugin (`plugin` array) |
+| `tui.json` (`~/.config/opencode/tui.json` or `$OPENCODE_TUI_CONFIG`) | 1.x TUI only | the 1.x companion (`fixate-on/tui`); putting it in `opencode.json` does not load it |
+| `cli.json` | 2.x TUI | the 2.x companion (`fixate-on/tui-v2`, or a `file://` URL to `plugin/fixate-on/tui-v2.js` in a local checkout) |
+| `opencode.json` (`plugins`) | 2.x server | the server plugin (`{package, options}` entries; released 2.x builds require a directory for local paths) |
+
+**OpenCode 1.x**: server plugin in `opencode.json`, companion in `tui.json`:
 
 `opencode.json`:
 
@@ -62,7 +69,7 @@ Register the server plugin in `opencode.json` and the TUI companion in `tui.json
 }
 ```
 
-`tui.json` (`~/.config/opencode/tui.json`, or `$OPENCODE_TUI_CONFIG`):
+`tui.json`:
 
 ```json
 {
@@ -72,7 +79,31 @@ Register the server plugin in `opencode.json` and the TUI companion in `tui.json
 }
 ```
 
-With both files in place, smoke-test the pairing:
+**OpenCode 2.x**: server plugin in `opencode.json` under `plugins`, companion in `cli.json`:
+
+`opencode.json`:
+
+```json
+{
+  "plugins": [
+    { "package": "fixate-on", "options": { "stateRoot": ".opencode/goals" } }
+  ]
+}
+```
+
+`cli.json`:
+
+```json
+{
+  "plugins": [
+    { "package": "fixate-on/tui-v2", "options": { "stateRoot": ".opencode/goals" } }
+  ]
+}
+```
+
+For a local checkout on 2.x, released builds reject a configured plugin **file** target (`configured plugin path must be a directory`), so point at a small adapter directory that re-exports the bundles: `server.js` re-exporting `plugin/fixate-on/plugin.js`, `tui.js` re-exporting `plugin/fixate-on/tui-v2.js` (not the package's `./tui`, which is the 1.x companion). `hack/e2e-harness/plugin-dir/` in this repository is a working copy. In `cli.json` the companion may instead be a `file://` URL to the `tui-v2.js` bundle, though released 2.x builds before the upstream loading fixes may reject `file://` plugin URLs; install from npm when in doubt. The full recipes, including the shared-config variant that serves both versions from one `opencode.json`, are in [the README's installation section](../README.md#loading-from-local-source).
+
+With the pair in place, smoke-test the pairing:
 
 ```sh
 # from a session running the server plugin, in the TUI companion:
@@ -81,8 +112,13 @@ With both files in place, smoke-test the pairing:
 ```
 
 The server plugin (`fixate-on`) manages goal state, persistence,
-and the command execution loop. The TUI companion (`fixate-on/tui`)
-subscribes to goal lifecycle events and renders interactive panels.
+and the command execution loop. The TUI companion (`fixate-on/tui` on 1.x,
+`fixate-on/tui-v2` on 2.x) subscribes to goal lifecycle events and renders
+interactive panels. Set the identical `stateRoot` option (or
+`FIXATE_ON_STATE_ROOT`) on the server entry and the companion entry; on 2.x
+both live in the same process, so one entry each is enough, while on 1.x they
+are two entries in two files and must agree. Confirm the pairing with
+`/goal status`.
 
 ## Dual-Mode Command Execution
 
@@ -103,7 +139,7 @@ Context tokens: 12,400/200,000
 ...
 ```
 
-The TUI companion receives goal lifecycle events in real time via the host
+The TUI companion receives goal lifecycle events in real time via the OpenCode
 event bus, maintaining a synchronized state store that powers the interactive
 dashboard.
 
@@ -139,7 +175,7 @@ action key. The prefix is what keeps these out of the prompt's way.
 
 **The prefix is not universally deliverable.** On some terminals `ctrl+shift+g`
 arrives as `0x07` and the chord never fires. The command palette
-(`ctrl+p`, then type `fixate:`) reaches all six actions on every supported host,
+(`ctrl+p`, then type `fixate:`) reaches all six actions on every supported OpenCode version,
 and is the path every live campaign in `../hack` takes. Every palette action has
 an equivalent slash command in the [README's subcommand table](../README.md#subcommands)
 — for example the pause chord mirrors `/goal pause`, the clear chord mirrors
@@ -155,7 +191,7 @@ without ever touching a key (AGENTS.md Principle 4).
 ## State Synchronization
 
 The server plugin publishes goal lifecycle events over
-`pluginOptions.tuiTransport` — the v2 adapter's buffering channel, surfaced
+`pluginOptions.tuiTransport` — the 2.x adapter's buffering channel, surfaced
 through tool `Result.metadata`. That envelope carries a `fixate-on` marker the
 companion filters on:
 
@@ -169,11 +205,11 @@ companion filters on:
 title used on the equivalent direct event envelope; both are the package name by
 design, and both are defined once in `src/tui-state.ts`.
 
-### On v1 hosts there is no event transport
+### On OpenCode 1.x there is no event transport
 
-The v1 `client.tui.publish` endpoint renders **every** published envelope as a
+The 1.x `client.tui.publish` endpoint renders **every** published envelope as a
 visible toast, so the server sends **no** data events on that channel — it is
-contractually silent, and a test locks that. On a v1 host the companion instead
+contractually silent, and a test locks that. On 1.x the companion instead
 reads the persisted state file (`readDiskGoalSnapshots`) on a refresh loop
 (`createDiskRefreshLoop`) and curates its own rare, human-readable toasts
 (`tui-toast-policy.ts`). Live indicators still update; the source of truth is the
@@ -238,7 +274,7 @@ the workspace are stopped and waiting on you, grouped by reason. Goals that
 resume on their own — `recovery`, `user intervention`, `queued` — are excluded,
 because the boundary announcement already covers them. The exclusion for
 `user intervention` is conditional: the pause is a promise that the plugin
-will re-arm the goal when your turn ends, and on a host that delivers no idle
+will re-arm the goal when your turn ends, and on a version that delivers no idle
 events the poller is the only thing that can keep that promise. The poller
 can refuse — the newest message is yours and no reply has arrived, the reply
 carries no id, or the turn never reports itself settled — and each refusal is
@@ -269,7 +305,7 @@ though it needed you.
 - **Revision monotonicity** — stale events (lower revision) are ignored for
   existing goals.
 - **Late subscribers hydrate** from the store's current state (no event
-  replay needed), and on v1 from the state file on disk.
+  replay needed), and on 1.x from the state file on disk.
 - **Snapshots are frozen** — the TUI render layer cannot mutate shared state.
 - **A disk refresh that races a write** is a read of a partially written file,
   not a crash: the next tick re-reads.
@@ -308,7 +344,7 @@ requires the lag documented with numbers rather than left implicit.
   the in-memory store drops the goal at once; and the fence's
   `invalidatedGoalIds` is written into the next durable snapshot, so recovery and
   any later read treat the goal as removed — it cannot be resurrected or driven.
-  The v1 companion reads snapshots only, never the ledger, so between a failed
+  The 1.x companion reads snapshots only, never the ledger, so between a failed
   snapshot and the next successful persist there is a bounded window where the
   disk-sourced dashboard can still show the goal; the fence, not the display, is
   the guarantee, and it holds.
@@ -320,7 +356,7 @@ requires the lag documented with numbers rather than left implicit.
 | `src/tui-state.ts` | Snapshot projection, event contract, in-process store (leaf) | `accounting.ts`, `state-machine.ts` |
 | `src/tui-components.ts` | Toast helpers + `PRODUCT_DISPLAY_NAME` (leaf) | None |
 | `src/tui-views.ts` | Dashboard formatter (pure) | `brake-format.ts`, `status-label.ts`, `tui-analytics.ts`, `tui-components.ts`, `tui-state.ts` |
-| `src/tui-dashboard-route.tsx` | Host-native full-screen dashboard route | `tui-components.ts`, `tui-state.ts`, `tui-views.ts` (the card's text comes from `goalCardLines`, which is what makes the attribution and the brake ceiling testable without the host's terminal renderer) |
+| `src/tui-dashboard-route.tsx` | OpenCode-native full-screen dashboard route | `tui-components.ts`, `tui-state.ts`, `tui-views.ts` (the card's text comes from `goalCardLines`, which is what makes the attribution and the brake ceiling testable without OpenCode's terminal renderer) |
 | `src/tui-toast-policy.ts` | Which store moments deserve a visible toast | `status-label.ts`, `tui-components.ts`, `tui-state.ts`, plus the `GoalStatus` type from `state-machine.ts` |
 | `src/tui-action-labels.ts` | Outcome-neutral palette labels and watchdog hints | `tui-components.ts` |
 | `src/tui-analytics.ts` | Cost per turn, burn rate, ETA projection (pure) | `accounting.ts`, `tui-components.ts`, `tui-state.ts` |
@@ -333,12 +369,17 @@ requires the lag documented with numbers rather than left implicit.
 
 ## Host API Requirements
 
+Here "host" means the OpenCode process the plugin runs inside, whichever version it is.
+
 - **OpenCode** >= 1.17.18
-- **`@opencode-ai/plugin`** >= 1.17.18 < 2
-- The host client should expose `ui.toast` / `ui.dialog`. Absent those, the
+- **v1 server plugin:** `@opencode-ai/plugin` >= 1.17.18 < 2 (the 1.x peer SDK). The 2.x path does not import it; the published bundle's default export is the 2.x `{ id, setup }` plugin, which is why `package.json`'s `engines.opencode` range (`<2`) describes the 1.x peer dependency only.
+- **v1 companion:** `@opencode-ai/plugin/tui` from the same 1.x SDK range.
+- **2.x companion (`./tui-v2`):** host-supplied modules; no package dependency.
+- The OpenCode client should expose `ui.toast` / `ui.dialog`. Absent those, the
   companion still tracks state and the dashboard, it just cannot show anything.
+- **Released 2.x builds (measured on installed 2.0.27, upstream tag v2.0.27 / commit `1f4d07a`):** the server rejects a configured plugin **file** target with `configured plugin path must be a directory`, and the TUI loads `cli.json` plugins (including `file://` URLs) without registering their palette entries. Both behaviors are fixed in later 2.x source (commits `0dfcb30d71` and `359c501ceb`); this repo's e2e harness therefore runs a from-source 2.x build (`hack/e2e-harness/opencode2-from-source.sh`). Newer released 2.x builds may already include those fixes; check your build's behavior, or avoid the issue by installing from npm.
 - **`tui.publish` is not a data transport and never was** — see
-  [On v1 hosts there is no event transport](#on-v1-hosts-there-is-no-event-transport).
+  [On OpenCode 1.x there is no event transport](#on-opencode-1x-there-is-no-event-transport).
   The v2 companion's data channel is the `tuiTransport` option; the v1
   companion's is the state file. The companion reads goal state written by the
   server plugin — the same state behind [`/goal list all`](../README.md#subcommands)

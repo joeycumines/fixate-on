@@ -30,10 +30,25 @@ Register the plugin in `opencode.json`:
 }
 ```
 
-On stock OpenCode v1 hosts, this single entry is the only required step. The plugin's `config` hook auto-registers the `/goal` slash command, the `goal` agent, and the read-only `goal-verify` subagent.
+On stock OpenCode 1.x, this single entry is the only required step. The plugin's `config` hook auto-registers the `/goal` slash command, the `goal` agent, and the read-only `goal-verify` subagent.
+
+### OpenCode 1.x vs 2.x
+
+Throughout this section, "OpenCode 1.x" means the `opencode` binary and "OpenCode 2.x" means the `opencode2` binary. One checkout of this plugin can serve both, but the two versions read different config keys and load plugins differently. The differences that matter:
+
+| Concern | OpenCode 1.x (`opencode`) | OpenCode 2.x (`opencode2`) |
+|:---|:---|:---|
+| Server plugin key | `plugin` (bare string or `[spec, options]`) | `plugins` (string or `{package, options}`) |
+| Local-checkout target | a file works (`.../plugin/fixate-on/plugin.js`) | a directory is required; released 2.x builds reject a file target with `configured plugin path must be a directory` |
+| `/goal` registration | `command.execute.before` intercepts the auto-registered command; the `config` hook also installs a bridge `command.goal` template | no `command.execute.before`; declare `command.goal` with the `goal-command` bridge template and `$ARGUMENTS` (below), or rely on the plugin's `command.transform` rewrite |
+| Native agents (`goal`, `goal-verify`) | registered by the `config` hook | not created; the 2.x adapter registers tools and the command transform only |
+| TUI companion | `tui.json` `plugin` array → `fixate-on/tui` | `cli.json` `plugins` array → `fixate-on/tui-v2` (a `file://` entry pointing at the bundle) |
+| Permission key in a shared config | `permission` (a map) | `permissions`; 2.x also accepts the 1.x spelling, 1.x does not accept the 2.x one |
+
+A bridge `command.goal` template is harmless on 1.x (the hook still intercepts first) and required on 2.x, so one config document can serve both versions.
 
 <details>
-<summary>Optional: customize <code>command.goal</code> on OpenCode v1</summary>
+<summary>Optional: customize <code>command.goal</code> on OpenCode 1.x</summary>
 
 ```json
 {
@@ -47,13 +62,13 @@ On stock OpenCode v1 hosts, this single entry is the only required step. The plu
 }
 ```
 
-A user-defined `command.goal` is preserved via `??=` semantics, except for its `agent` field, which the plugin deletes. OpenCode routes to a command's `agent` *after* `command.execute.before` fires, so keeping `agent` on v1 would override the hook's output; the continuation loop uses the session's default agent instead.
+A user-defined `command.goal` is preserved via `??=` semantics, except for its `agent` field, which the plugin deletes. OpenCode routes to a command's `agent` *after* `command.execute.before` fires, so keeping `agent` on 1.x would override the hook's output; the continuation loop uses the session's default agent instead.
 
 </details>
 
-### `/goal` on OpenCode v2 hosts
+### `/goal` on OpenCode 2.x
 
-On OpenCode v2 hosts (`opencode2`), plugins cannot intercept slash-command execution via `command.execute.before`, and a command template without `$ARGUMENTS` appends raw arguments as chat text. For `/goal` submissions to reach goal state rather than plain chat, configure `command.goal` to route through the plugin's `goal-command` bridge tool:
+On OpenCode 2.x (`opencode2`), plugins cannot intercept slash-command execution via `command.execute.before`, and a command template without `$ARGUMENTS` appends raw arguments as chat text. For `/goal` submissions to reach goal state rather than plain chat, configure `command.goal` to route through the plugin's `goal-command` bridge tool:
 
 ```json
 {
@@ -67,31 +82,54 @@ On OpenCode v2 hosts (`opencode2`), plugins cannot intercept slash-command execu
 }
 ```
 
+The same template text is installed automatically: on 2.x the plugin's `command.transform` rewrites any registered `goal`/`goal <sub>` commands to this shape and deletes their `agent` field, so a hand-written `command.goal` is only needed where the transform is unavailable. On 1.x the `config` hook installs it too, and `command.execute.before` still intercepts first; the template is a harmless fallback there.
+
 With this template wired, `/goal <objective> --pointer SPEC.md --max-turns 10` creates the goal with artifact pointers on disk, drives continuations, and settles through the claim ledger. On stock OpenCode 1.x this template is unnecessary because the plugin intercepts the auto-registered command directly.
+
+**What each version registers:** on 1.x the `config` hook registers the `/goal` slash command (plus `goal <sub>` subcommands), the `goal` agent, and the hidden read-only `goal-verify` subagent. On 2.x the adapter registers the goal tools and rewrites command templates, but does not create the `goal`/`goal-verify` agents; the built-in judge there runs through a child session bound to the workspace, so agent selection and `/goal status` output are unaffected, but any config that references a `goal` agent by name only applies on 1.x.
 
 ### TUI companion setup
 
-The optional TUI companion (`fixate-on/tui`) provides an interactive dashboard, command palette actions (`ctrl+p` → `fixate:`), keyboard chords, and lifecycle toasts. Because `TuiPluginModule` and the server `PluginModule` are mutually exclusive, stock OpenCode v1 loads the server plugin from `opencode.json` and the TUI companion **only** from `tui.json` (`~/.config/opencode/tui.json` or `$OPENCODE_TUI_CONFIG`):
+The optional TUI companion provides an interactive dashboard, command palette actions (`ctrl+p` → `fixate:`), keyboard chords, and lifecycle toasts. The two OpenCode versions load it from different files, and the two versions use different companion entrypoints:
 
-`opencode.json`:
+- **OpenCode 1.x**: because `TuiPluginModule` and the server `PluginModule` are mutually exclusive, stock 1.x loads the server plugin from `opencode.json` and the 1.x companion (`fixate-on/tui`) only from `tui.json` (`~/.config/opencode/tui.json` or `$OPENCODE_TUI_CONFIG`):
 
-```json
-{
-  "plugin": ["fixate-on"]
-}
-```
+  `opencode.json`:
 
-`tui.json`:
+  ```json
+  {
+    "plugin": ["fixate-on"]
+  }
+  ```
 
-```json
-{
-  "plugin": [
-    ["fixate-on/tui", { "logLevel": "info" }]
-  ]
-}
-```
+  `tui.json`:
 
-**State root alignment:** Both the server plugin and the TUI companion resolve the persisted state directory independently and reject goal files whose embedded session ID does not match their parent directory. If you override the default state directory, either set the `FIXATE_ON_STATE_ROOT` environment variable (read by both) or pass the identical `stateRoot` option to both entries:
+  ```json
+  {
+    "plugin": [
+      ["fixate-on/tui", { "logLevel": "info" }]
+    ]
+  }
+  ```
+
+- **OpenCode 2.x**: there is no `tui.json` contract. The 2.x companion (`fixate-on/tui-v2`) loads as a CLI plugin entry in `cli.json`:
+
+  `cli.json`:
+
+  ```json
+  {
+    "plugins": [
+      {
+        "package": "fixate-on/tui-v2",
+        "options": { "stateRoot": ".opencode/goals" }
+      }
+    ]
+  }
+  ```
+
+  A `file://` URL to `plugin/fixate-on/tui-v2.js` inside a local checkout works the same way. Released 2.x builds differ in which local forms they accept (see [Compatibility & Known Limits](#compatibility--known-limits)); when in doubt, install from npm (`fixate-on/tui-v2`) rather than pointing at a file path.
+
+**State root alignment:** Both the server plugin and the TUI companion resolve the persisted state directory independently and reject goal files whose embedded session ID does not match their parent directory. If you override the default state directory, either set the `FIXATE_ON_STATE_ROOT` environment variable (read by both) or pass the identical `stateRoot` option to **both** entries (server plugin and companion):
 
 ```json
 {
@@ -101,21 +139,82 @@ The optional TUI companion (`fixate-on/tui`) provides an interactive dashboard, 
 }
 ```
 
-See [`docs/tui-integration.md`](docs/tui-integration.md) for the dual-mode output headers, v1 disk-refresh vs v2 `Result.metadata` transport architecture, toast coalescing rules, and keyboard shortcut tables.
+On 2.x the companion loads in the same process as the server plugin, so setting `stateRoot` on the single `plugins` entry is enough; confirm the pairing with `/goal status`.
+
+See [`docs/tui-integration.md`](docs/tui-integration.md) for the dual-mode output headers, 1.x disk-refresh vs 2.x `Result.metadata` transport architecture, toast coalescing rules, and keyboard shortcut tables.
 
 ### Loading from local source
 
-To test a local checkout without packing, point OpenCode directly at `src/plugin.ts` (keep test files out of OpenCode's auto-loaded plugin directory):
+To test a local checkout without packing, point OpenCode at the built bundle (run `bun run bundle` first — `plugin/fixate-on/` is generated, gitignored output; keep test files out of OpenCode's auto-loaded plugin directory):
+
+**OpenCode 1.x**: a file target is fine:
 
 ```json
 {
-  "plugin": ["file:///absolute/path/to/fixate-on/src/plugin.ts"]
+  "plugin": ["file:///absolute/path/to/fixate-on/plugin/fixate-on/plugin.js"]
 }
 ```
 
+**OpenCode 2.x**: released 2.x builds require a directory for a configured plugin (`configured plugin path must be a directory`), and the package root itself is not a valid directory target because 2.x resolves `<dir>/server` / `<dir>/tui` while this package's `./tui` export is the 1.x companion. Point at a small adapter directory that re-exports the bundles:
+
+```js
+// plugin-wrappers/fixate-on/package.json
+{
+  "name": "fixate-on-local",
+  "private": true,
+  "type": "module",
+  "main": "./server.js",
+  "exports": { ".": "./server.js", "./tui": "./tui.js" }
+}
+```
+
+```js
+// plugin-wrappers/fixate-on/server.js
+export { default } from "file:///absolute/path/to/fixate-on/plugin/fixate-on/plugin.js"
+```
+
+```js
+// plugin-wrappers/fixate-on/tui.js — must re-export tui-v2.js, not the package's ./tui (the 1.x companion)
+export { default } from "file:///absolute/path/to/fixate-on/plugin/fixate-on/tui-v2.js"
+```
+
+```json
+{
+  "plugins": [
+    { "package": "file:///home/me/.config/opencode/plugin-wrappers/fixate-on", "options": {} }
+  ],
+  "command": {
+    "goal": {
+      "description": "Set a session-scoped goal and auto-continue until complete.",
+      "template": "Call the goal-command tool exactly once with its subcommand parameter set verbatim to: $ARGUMENTS\nDo not summarize, do not ask for confirmation, and do not perform any other work. Reply with only the tool output.",
+      "agent": "build"
+    }
+  }
+}
+```
+
+The adapter's relative depths depend on where it sits; adjust them to your layout. The e2e harness in `hack/e2e-harness/` ships a working copy of this adapter (`plugin-dir/`) you can copy.
+
+**Both versions from one document:** a shared `opencode.json` works if it keeps the 1.x spelling for the keys 1.x requires (`plugin` and `permission`) and uses the keys both versions normalize (`mcp.servers`, `commands`):
+
+```json
+{
+  "plugin": [["file:///home/me/.config/opencode/plugin-wrappers/fixate-on", {}]],
+  "commands": {
+    "goal": {
+      "template": "Call the goal-command tool exactly once with its subcommand parameter set verbatim to: $ARGUMENTS\nDo not summarize, do not ask for confirmation, and do not perform any other work. Reply with only the tool output.",
+      "agent": "build"
+    }
+  },
+  "permission": { "external_directory": { "*": "ask" } }
+}
+```
+
+Do not rename `plugin` to `plugins` or `permission` to `permissions` in a shared document: 1.x silently drops `plugins` (the plugin never loads and `/goal` is absent, with no error) and rejects the 2.x permission spelling. 2.x accepts and migrates the 1.x spellings, so the 1.x spelling is the portable one. If you want the 2.x keys, give 1.x its own config file.
+
 **Quick smoke test:**
 
-1. Load the plugin in a scratch OpenCode config and configure `command.goal` if running on a v2 host (see [`/goal` on OpenCode v2 hosts](#goal-on-opencode-v2-hosts)).
+1. Load the plugin in a scratch OpenCode config and configure `command.goal` if running OpenCode 2.x (see [`/goal` on OpenCode 2.x](#goal-on-opencode-2x)).
 2. Run `/goal status` and confirm no active goal is reported.
 3. Run `/goal inspect this repo and call update_goal with status "blocked" if you need user input`.
 4. Verify `/goal status`, `/goal pause`, `/goal resume`, and `/goal clear` transition state as expected (see [Subcommands](#subcommands)).
@@ -212,31 +311,31 @@ Goals are **session-scoped**: each goal belongs to exactly one session and is st
 When a session is forked, live goals are **copied** into the fork with newly minted `goalId` values while the parent session keeps its own goals:
 
 - **Intent crosses over, work does not:** The copy preserves the objective, completion contract (`--success`, `--constraints`, artifact pointers), mode, and brake configuration. Turn counts, tokens used, recovery and fault counters, blocked streaks, claims, and pending intents start empty in the fork. Settled goals (`complete`, `budgetLimited`) are not copied.
-- **OpenCode v1 vs v2 fork detection:** Stock OpenCode v1 creates a fork as an unrelated top-level session without a `parentID` (leaving only a mutable `… (fork #1)` title); the plugin refuses to guess ancestry from titles, so v1 forks start without copied goals. OpenCode v2 emits a durable `session.forked` event carrying `parentID` and the fork boundary, which triggers the copy.
+- **OpenCode 1.x vs 2.x fork detection:** Stock OpenCode 1.x creates a fork as an unrelated top-level session without a `parentID` (leaving only a mutable `… (fork #1)` title); the plugin refuses to guess ancestry from titles, so 1.x forks start without copied goals. OpenCode 2.x emits a durable `session.forked` event carrying `parentID` and the fork boundary, which triggers the copy.
 - **Deleted sessions:** If a goal's owning session is deleted, the next continuation fails and pauses the goal with the status reason `session not found` so the cause is explicit rather than silently abandoning the goal or reporting completion.
 
 ---
 
 ## Continuation Loop & Steering
 
-1. **System prompt injection & injection hardening:** Active goals are injected into the primary `system` message wrapped in XML-escaped `<goal_objective>` tags. The objective is explicitly framed as user-provided task data, never as elevated instructions capable of overriding system, developer, tool, or repository policies. When a goal is **paused**, the plugin injects a system guard that omits the objective and requires an explicit `/goal resume`, preventing command text routed through chat on v1 hosts from being mistaken for active work.
+1. **System prompt injection & injection hardening:** Active goals are injected into the primary `system` message wrapped in XML-escaped `<goal_objective>` tags. The objective is explicitly framed as user-provided task data, never as elevated instructions capable of overriding system, developer, tool, or repository policies. When a goal is **paused**, the plugin injects a system guard that omits the objective and requires an explicit `/goal resume`, so command text routed through chat on 1.x is not mistaken for active work.
 2. **Steering templates:**
    - `continuation.md` — Injected on every idle continuation. Carries the completion check, the 3-consecutive-turn blocked rule, verification pressure, fidelity constraints, and work-from-evidence instructions without re-quoting the standing system-prompt objective every turn.
    - `budget_limit.md` — Injected once per goal (advisory, not a hard interrupt) when the explicit API-cost `token_budget` is crossed. In-flight tokens continue accruing until the turn ends.
    - `objective_updated.md` — Injected when `/goal edit` revises the objective.
-3. **Idle pre-flight & deduplication:** Continuations preserve the initiating turn's agent, provider/model, and variant. After `minDelayMs`, the plugin re-verifies that the session is still idle and that no human message, newer assistant turn, Plan-agent switch, rejected permission, abort, or provider error has intervened. A durable claim on the source assistant turn prevents duplicate continuations across distinct idle events. If the host reports itself busy, the continuation is *deferred* without consuming turn budget and retried on the next idle, bounded by `maxPromptFailures`.
+3. **Idle pre-flight & deduplication:** Continuations preserve the initiating turn's agent, provider/model, and variant. After `minDelayMs`, the plugin re-verifies that the session is still idle and that no human message, newer assistant turn, Plan-agent switch, rejected permission, abort, or provider error has intervened. A durable claim on the source assistant turn prevents duplicate continuations across distinct idle events. If OpenCode reports itself busy, the continuation is *deferred* without consuming turn budget and retried on the next idle, bounded by `maxPromptFailures`.
 4. **Yield, then re-arm:** Sending a human message while a goal is active aborts any in-flight continuation and pauses active goals for the duration of your turn. When your turn goes idle, goals paused by this conversational interjection re-arm automatically. Two cases remain paused:
    - Whole-message stop imperatives (`"stop"`, `"pause"`, `"hold off"` — matched conservatively so mixed instructions like `"stop the server then fix tests"` remain normal steering) pause with `explicit pause` and require `/goal resume`.
    - If a yielded turn never settles within 15 minutes, the goal stops claiming it will auto-resume, surfaces as waiting on you, and accepts `/goal resume`.
-5. **OpenCode v1 kickoff & echo filtering:** Because slash commands on stock v1 do not launch an assistant turn on their own, the plugin schedules a one-shot kickoff probe (`kickoffDelayMs`, default `2500` ms) when a command activates a goal, sending the first continuation only if no turn started organically. It also fingerprints just-dispatched slash arguments so v1's chat echo of `/goal ...` does not trigger a human-interjection pause.
+5. **OpenCode 1.x kickoff & echo filtering:** Because slash commands on stock 1.x do not launch an assistant turn on their own, the plugin schedules a one-shot kickoff probe (`kickoffDelayMs`, default `2500` ms) when a command activates a goal, sending the first continuation only if no turn started organically. It also fingerprints just-dispatched slash arguments so 1.x's chat echo of `/goal ...` does not trigger a human-interjection pause.
 6. **Compaction survival:** When OpenCode compacts a session, the plugin injects a deterministic summary reconstructed from the persisted goal record (objective, status, budget usage, recent progress notes, and lifecycle trail) and disables OpenCode's generic post-compaction auto-continue so it cannot race the plugin's continuation.
-7. **Host token accounting:** On v1, token usage is tracked via `message.updated` events (falling back to fetched session messages when per-message events are absent). On v2, usage is tracked via ephemeral `session.usage.updated` steps. Because session context is shared, token usage accrues to every non-terminal goal in the session. See [Default brakes](#default-brakes) for the ceilings these numbers feed and [`docs/tui-integration.md` → State Synchronization](docs/tui-integration.md#state-synchronization) for how the companion reads them.
+7. **Token accounting by version:** On 1.x, token usage is tracked via `message.updated` events (falling back to fetched session messages when per-message events are absent). On 2.x, usage is tracked via ephemeral `session.usage.updated` steps. Because session context is shared, token usage accrues to every non-terminal goal in the session. See [Default brakes](#default-brakes) for the ceilings these numbers feed and [`docs/tui-integration.md` → State Synchronization](docs/tui-integration.md#state-synchronization) for how the companion reads them.
 
 ---
 
 ## Agent Tools & Goal State Model
 
-Completion and blocking are driven exclusively through the canonical tool surface — never by parsing free-text markers. Six agent-facing tools are registered by default (`registerTools: true`), plus the `goal-command` bridge on OpenCode v2 hosts:
+Completion and blocking are driven exclusively through the canonical tool surface — never by parsing free-text markers. Six agent-facing tools are registered by default (`registerTools: true`), plus the `goal-command` bridge on OpenCode 2.x:
 
 | Tool | Arguments | Behavior |
 |:---|:---|:---|
@@ -246,9 +345,9 @@ Completion and blocking are driven exclusively through the canonical tool surfac
 | `list_goals` | _(none)_ | Lists all goals in the current session. |
 | `focus_goal` | `goal_id` (string) | Changes the focused goal in the current session. |
 | `propose_goal_change` | proposal fields | Records a `pendingProposal` on the goal for human review (agents cannot raise contract-tier turn or token ceilings directly). |
-| `goal-command` | `subcommand` (string) | *(OpenCode v2 only)* Routes `/goal` slash-command invocations into plugin state when wired via `command.goal`. |
+| `goal-command` | `subcommand` (string) | *(OpenCode 2.x only)* Routes `/goal` slash-command invocations into plugin state when wired via `command.goal`. |
 
-Tool schemas are defined with `zod` (a direct dependency). If `registerTools: false` is set or `zod` fails to load at runtime, active goals pause with a visible notice rather than looping on continuation prompts that reference unavailable tools. Legacy tool aliases (`goal_status`, `goal_set`, `goal_pause`, `goal_resume`, `goal_block`, `goal_complete`, `get_goal_history`, `set_goal`, `clear_goal`) are not registered. The same subcommand surface is reachable from the agent side through the [`goal-command` bridge](#goal-on-opencode-v2-hosts) on v2 hosts.
+Tool schemas are defined with `zod` (a direct dependency). If `registerTools: false` is set or `zod` fails to load at runtime, active goals pause with a visible notice rather than looping on continuation prompts that reference unavailable tools. Legacy tool aliases (`goal_status`, `goal_set`, `goal_pause`, `goal_resume`, `goal_block`, `goal_complete`, `get_goal_history`, `set_goal`, `clear_goal`) are not registered. The same subcommand surface is reachable from the agent side through the [`goal-command` bridge](#goal-on-opencode-2x) on 2.x.
 
 **Goal statuses:** `active` · `paused` · `blocked` · `budgetLimited` · `finalizing` · `complete`
 
@@ -271,7 +370,7 @@ The completion gate consults one verifier in the following precedence order:
    `judge: async ({ goal, sessionID, latestText }) => ({ approved, reason })`
    When configured in plugin options, takes precedence over the built-in judge and uses the `{ approved, reason }` return contract.
 2. **Built-in child-session judge (`childSessionJudge`, default `true`):**
-   Spawns an isolated OpenCode child session running the hidden `goal-verify` subagent bound to the goal's workspace directory. The subagent has a default-deny tool policy: only `read`, `glob`, and `grep` are allowed (`bash`, `edit`, and `write` are denied). It emits a structured verdict conforming to `completion-verdict.schema.json` (`COMPLETE`, `WORKING`, `BLOCKED`, `NEEDS_INPUT`, or `CANCELLED`, plus `candidate`, `fingerprint`, `outstanding`, and `evidence`). The host stamps the candidate identity (git `HEAD` + worktree fingerprint) onto the attestation.
+   Spawns an isolated OpenCode child session running the hidden `goal-verify` subagent bound to the goal's workspace directory. The subagent has a default-deny tool policy: only `read`, `glob`, and `grep` are allowed (`bash`, `edit`, and `write` are denied). It emits a structured verdict conforming to `completion-verdict.schema.json` (`COMPLETE`, `WORKING`, `BLOCKED`, `NEEDS_INPUT`, or `CANCELLED`, plus `candidate`, `fingerprint`, `outstanding`, and `evidence`). OpenCode stamps the candidate identity (git `HEAD` + worktree fingerprint) onto the attestation.
 3. **No judge available (`childSessionJudge: false` and no custom `judge`):**
    The gate abstains (`unavailable`). To prevent an unendable loop, after a bounded number of attempts the claim is recorded on the `none` check path as `unverifiable-claim` with verdict `NONE` — **never** `verified-complete` — and settles with stop reason `completed (no attestation could be obtained)` so queued sequence goals behind it can proceed.
 
@@ -322,7 +421,7 @@ await GoalsPlugin(
 | No-progress pause | `< 50` output tokens × `3` turns | Pauses after `noProgressTurnsBeforePause` consecutive low-output turns with no meaningful progress-note change. |
 | No-tool-call pause | `3` consecutive turns | Pauses after `noToolCallTurnsBeforePause` consecutive tool-free continuation turns (anti self-chat loop). |
 | Budget wrap-up threshold (`budgetWrapupRatio`) | `80%` (`0.8`) | Sends a wrap-up warning when context tokens reach 80% of `maxTokens`. |
-| Prompt failure pause (`maxPromptFailures`) | `3` consecutive failures | Pauses when host prompt dispatch fails or defers 3 times in a row. |
+| Prompt failure pause (`maxPromptFailures`) | `3` consecutive failures | Pauses when OpenCode prompt dispatch fails or defers 3 times in a row. |
 
 **Wrap-up vs. hard stop:** When a brake is reached, the plugin sends one final prompt asking the assistant to summarize what is done, what remains, and the next concrete step. Because a brake is a budget rather than a verdict, the prompt instructs the assistant to call `update_goal {status: "complete"}` only if the objective is genuinely satisfied, and not to mark it `blocked` merely because a brake fired. Run `/goal resume` to continue with a fresh budget window.
 
@@ -372,7 +471,7 @@ Pass plugin-level defaults in `opencode.json`:
 - `maxRecentMessages` (default `50`) — Number of recent session messages scanned to locate the latest assistant turn before continuing.
 - `noProgressTurnsBeforePause` (default `3`) — Consecutive stalled low-output turns required before pausing.
 - `noToolCallTurnsBeforePause` (default `3`) — Consecutive tool-free continuation turns before pausing; set to `0` for legitimate prose-only workflows.
-- `kickoffDelayMs` (default `2500`) — Delay in milliseconds before the one-shot v1 kickoff probe fires after `/goal` activates a goal.
+- `kickoffDelayMs` (default `2500`) — Delay in milliseconds before the one-shot 1.x kickoff probe fires after `/goal` activates a goal.
 - `warnTurnsRemaining` / `warnDurationMsRemaining` / `warnTokensRemaining` (defaults: `3` turns, `60000` ms, `25000` tokens) — Thresholds at which `continuation.md` appends a "limits are near" warning.
 - `commandName` (default `"goal"`) — Slash command name owned by the plugin (e.g. `"objective"` for `/objective`; leading slash tolerated). All user-facing hints follow the configured name.
 - `registerCommand` (default `true`) — Whether to install the `command.execute.before` hook.
@@ -389,7 +488,7 @@ Pass plugin-level defaults in `opencode.json`:
 | Variable | Effect |
 |:---|:---|
 | `FIXATE_ON_STATE_ROOT` | Overrides the goal state root directory (precedence: `stateRoot` option → `FIXATE_ON_STATE_ROOT` → `<cwd>/.opencode/goals`). Read by both the server plugin and the TUI companion. |
-| `FIXATE_ON_EVENT_LOG` | Opt-in v2 host diagnostic log (unset by default). When set to a writable file path, appends one space-delimited line per v2 adapter event (`<epoch-ms> <event-type> <session-id> <message-id>`) plus `tool-registration-<stage> <error>` on registration failure. Contains live session/message IDs; treat as sensitive and delete after debugging. |
+| `FIXATE_ON_EVENT_LOG` | Opt-in OpenCode 2.x diagnostic log (unset by default). When set to a writable file path, appends one space-delimited line per 2.x adapter event (`<epoch-ms> <event-type> <session-id> <message-id>`) plus `tool-registration-<stage> <error>` on registration failure. Contains live session/message IDs; treat as sensitive and delete after debugging. |
 
 ---
 
@@ -397,11 +496,11 @@ Pass plugin-level defaults in `opencode.json`:
 
 | Area | Status |
 |:---|:---|
-| Runtime & OS | Declared support in `package.json` `engines`: Bun `>=1.0.0`, OpenCode `>=1.17.18`. Tested across Linux, macOS, and Windows. |
-| Package subpaths | `.`, `./server`, and `./tui` load standalone; `./tui-v2` depends on host-supplied modules. TypeScript declarations support `NodeNext` and `Bundler`. |
+| Runtime & OS | Declared support in `package.json` `engines`: Bun `>=1.0.0`, OpenCode `>=1.17.18`. Tested across Linux, macOS, and Windows. The `engines.opencode` range describes the 1.x peer dependency (`@opencode-ai/plugin < 2`); the published bundle's default export is the 2.x `{ id, setup }` plugin, which does not import that SDK at runtime, so 2.x loads it outside the range. |
+| Package subpaths | `.` and `./server` load the dual-version server bundle (1.x via the `server` export, 2.x via the default `{ id, setup }`); `./tui` is the 1.x companion (load it from `tui.json`); `./tui-v2` is the 2.x companion (load it from `cli.json`) and depends on host-supplied modules. TypeScript declarations support `NodeNext` and `Bundler`. |
 | Provider templates | Strict-template backends require the goal block to merge into the primary `system` message (covered by regression tests). |
 | Static built-in verifier | The built-in `goal-verify` subagent is read-only (`read`, `glob`, `grep`); it cannot run shell commands itself and relies on workspace inspection plus evidence cited by the primary agent. |
-| OpenCode v2 TUI plugins | Stock released v2 binaries do not load external TUI plugins; v2 TUI e2e campaigns under `hack/e2e-harness/` run against a from-source host. See [Host API Requirements](docs/tui-integration.md#host-api-requirements). |
+| OpenCode 2.x TUI plugins | On the 2.x build used by this repo's e2e harness (installed release 2.0.27, cross-referenced against upstream tag v2.0.27 / commit `1f4d07a`), the TUI loads CLI plugins from `cli.json`, including `file://` entries, but never registers their palette entries, and the server rejects a configured plugin **file** target (`configured plugin path must be a directory`). Both deficiencies are fixed in the 2.x source after that tag (commits `0dfcb30d71`, `359c501ceb`), so the harness runs a from-source 2.x build (`hack/e2e-harness/opencode2-from-source.sh`); newer released 2.x builds may already include those fixes. For the companion either install `fixate-on/tui-v2` from npm or point `cli.json` at a `file://` bundle. See [Host API Requirements](docs/tui-integration.md#host-api-requirements). |
 
 ---
 
@@ -409,7 +508,19 @@ Pass plugin-level defaults in `opencode.json`:
 
 Start with `/goal status --full` (or `--verbose`) and `/goal history --verbose` to inspect the active state, stop reason, brake usage, and recent lifecycle trail. For the full lifecycle of a goal see [Multi-Goal & Session-Scoped Behavior](#multi-goal--session-scoped-behavior) and [Completion Verification](#completion-verification); for persistence layout see [Persistence and state root](#persistence-and-state-root).
 
-If a goal does not continue:
+### Host / install problems
+
+| Symptom | Cause | Fix |
+|:---|:---|:---|
+| `configured plugin path must be a directory` | OpenCode 2.x was given a plugin **file** path | point `plugins[].package` at the adapter directory (see [Loading from local source](#loading-from-local-source)) |
+| 1.x loads but `/goal` is absent, no error | `plugins` (plural) was used in a 1.x-read config; 1.x drops it | use `plugin` (singular); 2.x migrates it |
+| 1.x refuses to start with a permissions error | a 2.x-style `permissions` key in a shared config | use the 1.x `permission` map; 2.x migrates it |
+| 2.x `/goal foo` becomes plain chat | missing bridge template | declare `command.goal` with the `goal-command` template and `$ARGUMENTS` (see [`/goal` on OpenCode 2.x](#goal-on-opencode-2x)) |
+| 2.x TUI shows the plugin failed to load | released 2.x builds before the upstream fixes reject `file://` plugin URLs / never register palette entries | install `fixate-on` from npm, or run a from-source 2.x build; see [Compatibility & Known Limits](#compatibility--known-limits) |
+| 1.x TUI companion never appears | the companion was placed in `opencode.json` instead of `tui.json` | 1.x loads the companion only from `tui.json` (see [TUI companion setup](#tui-companion-setup)) |
+| dashboard shows a different state than `/goal status` | server plugin and companion resolved different state roots | set the same `stateRoot` on both entries or `FIXATE_ON_STATE_ROOT` (see [TUI companion setup](#tui-companion-setup)) |
+
+### When a goal does not continue
 
 1. **Distinguish self-resolving pauses from stops that wait on you:** Goals paused for `user intervention`, `recovery`, or `queued` sequence ordering resume automatically (unless a `user intervention` yield exceeds 15 minutes without settling, at which point `/goal status` flags that it did not re-arm and offers `/goal resume`). Deliberate pauses (`explicit pause`), hard brakes, no-progress/no-tool-call pauses, prompt failures, and `recovery exhausted` require human action.
 2. **Resume after resolving the cause:** Run `/goal resume` to start a fresh local budget window and reset the turn count without losing the objective or history.
@@ -427,7 +538,7 @@ If a goal does not continue:
 # Lifecycle event trail for the focused goal
 /goal history --verbose
 
-# The same subcommands, routed through the agent tool on v2 hosts
+# The same subcommands, routed through the agent tool on OpenCode 2.x
 # (the goal-command bridge takes the subcommand line verbatim)
 ```
 
