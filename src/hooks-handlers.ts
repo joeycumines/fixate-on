@@ -380,6 +380,52 @@ export function createEventHook(
       string | undefined;
     const runtime = deps.runtime;
 
+    // Record inbox delivery mode so the idle path can tell interrupting ("steer")
+    // input from queued ("queue") input. OpenCode 2.x emits session.inbox.enqueued
+    // (item.delivery) and session.inbox.delivery.changed (delivery); newer hosts
+    // emit session.input.queued / session.input.steered. The id field is inboxID on
+    // the inbox events and inputID on the input events.
+    if (
+      sessionID &&
+      (eventType === 'session.inbox.enqueued' ||
+        eventType === 'session.inbox.delivery.changed' ||
+        eventType === 'session.input.queued' ||
+        eventType === 'session.input.steered')
+    ) {
+      const props = (event?.properties ?? {}) as Record<string, unknown>;
+      const itemID = String(props.inboxID ?? props.inputID ?? '');
+      const item = props.item as {delivery?: unknown} | undefined;
+      const delivery =
+        eventType === 'session.input.queued'
+          ? 'queue'
+          : eventType === 'session.input.steered'
+            ? 'steer'
+            : eventType === 'session.inbox.delivery.changed'
+              ? props.delivery
+              : item?.delivery;
+      if (itemID && (delivery === 'queue' || delivery === 'steer') && runtime) {
+        const target =
+          delivery === 'queue'
+            ? runtime.queuedInputMessageIDs
+            : runtime.steeredInputMessageIDs;
+        const other =
+          delivery === 'queue'
+            ? runtime.steeredInputMessageIDs
+            : runtime.queuedInputMessageIDs;
+        let set = target.get(sessionID);
+        if (!set) {
+          set = new Set<string>();
+          target.set(sessionID, set);
+        }
+        set.add(itemID);
+        // A delivery.changed event moves the id from one mode to the other.
+        other.get(sessionID)?.delete(itemID);
+        if (set.size > 256) {
+          set.delete(set.values().next().value!);
+        }
+      }
+    }
+
     // Guard against modifying sessions not owned by this process host instance.
     // Unchecked state mutations would otherwise overwrite valid session token metrics.
     if (

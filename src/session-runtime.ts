@@ -104,6 +104,21 @@ export interface RuntimeState {
   liveSessions: Set<string>;
   pendingIntents: Map<string, PendingIntent>;
   /**
+   * Message ids known to arrive as non-interrupting inbox input (delivery
+   * "queue"): the host parks them for the next turn boundary instead of waking
+   * execution mid-turn. Recorded from `session.inbox.enqueued` /
+   * `session.inbox.delivery.changed` events (OpenCode 2.x) and the
+   * `session.prompt` hook payload (OpenCode 1.x), keyed by `${sessionID}` to a
+   * set of message ids. A queued message must not yield the goal; it is surfaced
+   * to the user as a notice instead.
+   */
+  queuedInputMessageIDs: Map<string, Set<string>>;
+  /**
+   * Message ids observed as interrupting inbox input (delivery "steer") while the
+   * turn was running. Recorded from the same channels as `queuedInputMessageIDs`.
+   */
+  steeredInputMessageIDs: Map<string, Set<string>>;
+  /**
    * Determines whether this process is permitted to drive a session's goals.
    * Prevents competing instances from dispatching actions on owned sessions.
    */
@@ -134,6 +149,8 @@ export function createRuntimeState(): RuntimeState {
     hasTuiCompanion: false,
     liveSessions: new Set(),
     pendingIntents: new Map(),
+    queuedInputMessageIDs: new Map(),
+    steeredInputMessageIDs: new Map(),
     drainPersistence: null,
     disposed: false,
   };

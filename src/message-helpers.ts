@@ -193,6 +193,35 @@ export function getMessageID(message: unknown): string {
 }
 
 /**
+ * The host's inbox delivery mode for a user-role message, read structurally.
+ *
+ * OpenCode (both 1.x and 2.x through v2.2.5) distinguishes "steer" input — which
+ * wakes execution mid-turn and therefore genuinely interrupts the running agent —
+ * from "queue" input, which waits for the turn boundary and does not interrupt.
+ * The mode lives on the session inbox, not on the persisted message Info, so a
+ * message read back from `session.messages` carries it only when the host or an
+ * event payload annotates it (v2 `session.inbox.enqueued`/`delivery.changed`
+ * events, the v1 `session.prompt` hook payload). This reader accepts any of the
+ * structural placements: top-level `delivery`, `info.delivery`, or a nested
+ * `inbox`/`pending` object. It returns undefined when nothing carries the mode,
+ * which callers treat as "unknown" rather than as "steer".
+ */
+export function getMessageDelivery(message: unknown): string | undefined {
+  if (!message || typeof message !== 'object') return undefined;
+  const msg = message as Record<string, unknown>;
+  const candidates: unknown[] = [
+    msg.delivery,
+    (msg.info as Record<string, unknown> | undefined)?.delivery,
+    (msg.inbox as Record<string, unknown> | undefined)?.delivery,
+    (msg.pending as Record<string, unknown> | undefined)?.delivery,
+  ];
+  for (const candidate of candidates) {
+    if (candidate === 'steer' || candidate === 'queue') return candidate;
+  }
+  return undefined;
+}
+
+/**
  * Extract the reasoning/thinking token count from a message.
  *
  * Reads `usage.reasoning` (or `reasoning_tokens`) first, then falls back to

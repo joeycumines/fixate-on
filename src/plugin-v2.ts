@@ -194,6 +194,56 @@ export function v1PartsToV2Text(input: Record<string, unknown>): {
 }
 
 /**
+ * Records the delivery mode of admitted v2 input into the runtime's delivery
+ * tracking, so the idle path can tell interrupting ("steer") input from queued
+ * ("queue") input when it later reads the message back from `session.messages`.
+ *
+ * v2.2.5 exposes the mode on `session.inbox.enqueued` (item.delivery) and
+ * `session.inbox.delivery.changed`; newer hosts expose `session.input.admitted`
+ * with `input.delivery`. All three shapes are accepted here.
+ */
+export function recordV2InputDelivery(
+  runtime:
+    | {
+        queuedInputMessageIDs: Map<string, Set<string>>;
+        steeredInputMessageIDs: Map<string, Set<string>>;
+      }
+    | undefined,
+  data: Record<string, unknown>,
+): void {
+  if (!runtime) return;
+  const sessionID = getV2EventSessionID(data);
+  if (!sessionID) return;
+  const pendingInput = data.input as
+    {type?: string; delivery?: unknown; data?: unknown} | undefined;
+  const item = data.item as {delivery?: unknown} | undefined;
+  const delivery = pendingInput?.delivery ?? item?.delivery ?? data.delivery;
+  if (delivery !== 'queue' && delivery !== 'steer') return;
+  const id = String(
+    (data as {inputID?: unknown}).inputID ??
+      (data as {inboxID?: unknown}).inboxID ??
+      '',
+  );
+  if (!id) return;
+  const target =
+    delivery === 'queue'
+      ? runtime.queuedInputMessageIDs
+      : runtime.steeredInputMessageIDs;
+  const other =
+    delivery === 'queue'
+      ? runtime.steeredInputMessageIDs
+      : runtime.queuedInputMessageIDs;
+  let set = target.get(sessionID);
+  if (!set) {
+    set = new Set<string>();
+    target.set(sessionID, set);
+  }
+  set.add(id);
+  other.get(sessionID)?.delete(id);
+  if (set.size > 256) set.delete(set.values().next().value!);
+}
+
+/**
  * Feeds a v2 `session.input.admitted` event into the v1 `chat.message` steering hook.
  *
  * Preserves steering guards (slash commands, mode headers, stop-intent detection)
@@ -430,6 +480,7 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
   const hooks = v1Result as PluginHooks & {
     tool?: Record<string, unknown>;
     dispose?: () => Promise<void>;
+    runtime?: import('./session-state-manager.ts').RuntimeState;
   };
 
   const disposers: Array<() => Promise<void> | void> = [];
@@ -552,6 +603,7 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
         // v2 hosts do not trigger the v1 `chat.message` hook. Synthesize the hook call
         // from `session.input.admitted` so user steering commands (e.g. pause/stop) are respected.
         if (ev.type === 'session.input.admitted' && sessionID) {
+          recordV2InputDelivery(hooks.runtime, data);
           try {
             await synthesizeChatMessageFromAdmitted(
               hooks['chat.message'],
@@ -560,6 +612,15 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
           } catch {
             /* steering failures must not break the event loop */
           }
+        }
+        // Record inbox delivery mode on released 2.x (through v2.2.5), which emits
+        // session.inbox.enqueued / delivery.changed instead of session.input.*.
+        if (
+          (ev.type === 'session.inbox.enqueued' ||
+            ev.type === 'session.inbox.delivery.changed') &&
+          sessionID
+        ) {
+          recordV2InputDelivery(hooks.runtime, data);
         }
         try {
           await hooks.event?.({

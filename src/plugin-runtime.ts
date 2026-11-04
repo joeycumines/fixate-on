@@ -915,6 +915,8 @@ export async function GoalsPlugin(
         if (runtime.disposed) return;
         runtime.disposed = true;
         runtime.recoveryPendingSessions.clear();
+        runtime.queuedInputMessageIDs.clear();
+        runtime.steeredInputMessageIDs.clear();
         for (const controller of runtime.continuationControllers.values())
           controller.abort();
         for (const timer of kickoffTimers.values()) clearTimeout(timer);
@@ -940,6 +942,10 @@ export async function GoalsPlugin(
         heldLeases.clear();
         sessionOwnership.clear();
       };
+
+    // The runtime is exposed on the returned hooks object so host adapters
+    // (e.g. plugin-v2.ts) can record host-side delivery evidence into it.
+    (hooks as PluginHooks & {runtime?: typeof runtime}).runtime = runtime;
 
     return hooks;
   });

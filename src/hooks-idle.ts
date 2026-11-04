@@ -13,6 +13,7 @@ import {
   assistantTurnKey,
   detectRepetitiveDegeneration,
   findLatestAssistantMessage,
+  getMessageDelivery,
   getMessageID,
   getTextFromParts,
   getThinkingTokens,
@@ -253,7 +254,17 @@ export async function processIdleEvent(
   // Detect pending user interventions: if a user submits input and the host delays or
   // drops the chat.message hook, avoid continuation so the human turn is respected.
   // Injected plugin prompts, command echoes, and mode headers are excluded.
+  //
+  // Only INTERRUPTING input yields the goal. OpenCode's inbox distinguishes "steer"
+  // (wakes execution mid-turn) from "queue" (waits for the turn boundary); a queued
+  // message — e.g. one sent by another agent while this turn runs — must not pause
+  // the goal, it is surfaced as a notice instead (see below). When the host exposes
+  // no delivery distinction (delivery undefined), a user message after the last
+  // assistant message is treated as interrupting, preserving the v1 behavior.
   let latestHumanIntervention: string | null = null;
+  let queuedNotice: string | null = null;
+  const runtimeQueued = deps.runtime?.queuedInputMessageIDs.get(sessionID);
+  const runtimeSteered = deps.runtime?.steeredInputMessageIDs.get(sessionID);
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i] as {info?: {role?: string}; role?: string} | null;
     if (!msg) continue;
@@ -281,8 +292,48 @@ export async function processIdleEvent(
       continue;
     if (isCommandTemplateEcho(text)) continue;
     if (matchSlashEcho(sessionID, text)) continue;
-    latestHumanIntervention = text;
-    break;
+    const messageID = getMessageID(msg);
+    const delivery = getMessageDelivery(msg);
+    const knownQueued =
+      delivery === 'queue' ||
+      (messageID !== '' && runtimeQueued?.has(messageID) === true);
+    const knownSteered =
+      delivery === 'steer' ||
+      (messageID !== '' && runtimeSteered?.has(messageID) === true);
+    if (knownQueued && !knownSteered) {
+      // Non-interrupting input: keep the goal running, but make the message
+      // visible to the user through the goal notice channel. The newest queued
+      // message is the one surfaced; keep scanning so an interrupting message
+      // further back still wins.
+      if (queuedNotice === null) queuedNotice = text;
+      continue;
+    }
+    // The newest interrupting message wins; keep scanning older messages only
+    // to surface queued ones as notices before the assistant-role break.
+    if (latestHumanIntervention === null) latestHumanIntervention = text;
+  }
+  if (queuedNotice !== null) {
+    const noticeText = `Queued message received while the goal was running (it did not interrupt the turn): ${queuedNotice.slice(0, 200)}`;
+    for (const m of session.listMachines?.() ?? [machine]) {
+      if (m.isTerminal()) continue;
+      await m.addNotice('user-intervention', noticeText);
+    }
+    // Record in the lifecycle trail (type 'notice', not 'tracking', so the
+    // signal-filtered history view keeps it) — the ledger then carries why the
+    // goal did not yield despite a user-role message being present.
+    await machine.mutate(() => {}, {
+      source: 'idle-handler',
+      detail: noticeText,
+      historyType: 'notice',
+      skipRevision: true,
+    });
+    if (deps.announceGoalDecision) {
+      await deps.announceGoalDecision(
+        sessionID,
+        `A message was queued for this session without interrupting the running turn; the goal keeps running. Queued text: ${queuedNotice.slice(0, 200)}`,
+      );
+    }
+    await session.persist();
   }
   if (latestHumanIntervention !== null) {
     if (isExplicitStopMessage(latestHumanIntervention)) {
