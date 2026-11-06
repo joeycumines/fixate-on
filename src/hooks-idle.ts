@@ -262,9 +262,11 @@ export async function processIdleEvent(
   // no delivery distinction (delivery undefined), a user message after the last
   // assistant message is treated as interrupting, preserving the v1 behavior.
   let latestHumanIntervention: string | null = null;
-  let queuedNotice: string | null = null;
-  const runtimeQueued = deps.runtime?.queuedInputMessageIDs.get(sessionID);
-  const runtimeSteered = deps.runtime?.steeredInputMessageIDs.get(sessionID);
+  const queuedNotices: string[] = [];
+  const queuedIDs: string[] = [];
+  const runtimeQueued = deps.runtime?.queuedInputMessageIDs?.get(sessionID);
+  const runtimeSteered = deps.runtime?.steeredInputMessageIDs?.get(sessionID);
+  const surfacedQueued = deps.runtime?.surfacedQueuedMessageIDs?.get(sessionID);
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i] as {info?: {role?: string}; role?: string} | null;
     if (!msg) continue;
@@ -293,45 +295,69 @@ export async function processIdleEvent(
     if (isCommandTemplateEcho(text)) continue;
     if (matchSlashEcho(sessionID, text)) continue;
     const messageID = getMessageID(msg);
-    const delivery = getMessageDelivery(msg);
-    const knownQueued =
-      delivery === 'queue' ||
-      (messageID !== '' && runtimeQueued?.has(messageID) === true);
-    const knownSteered =
-      delivery === 'steer' ||
-      (messageID !== '' && runtimeSteered?.has(messageID) === true);
-    if (knownQueued && !knownSteered) {
+    // Runtime event sets carry the host's latest delivery observation, so they
+    // take precedence over a (possibly stale) static annotation on the message.
+    const inRuntimeQueued =
+      messageID !== '' && runtimeQueued?.has(messageID) === true;
+    const inRuntimeSteered =
+      messageID !== '' && runtimeSteered?.has(messageID) === true;
+    const effectiveDelivery = inRuntimeSteered
+      ? 'steer'
+      : inRuntimeQueued
+        ? 'queue'
+        : getMessageDelivery(msg);
+    if (effectiveDelivery === 'queue') {
       // Non-interrupting input: keep the goal running, but make the message
-      // visible to the user through the goal notice channel. The newest queued
-      // message is the one surfaced; keep scanning so an interrupting message
-      // further back still wins.
-      if (queuedNotice === null) queuedNotice = text;
+      // visible to the user through the goal notice channel. Skip ids already
+      // surfaced on an earlier idle pass, and keep scanning so an interrupting
+      // message further back still wins.
+      if (messageID !== '' && surfacedQueued?.has(messageID) === true) continue;
+      queuedNotices.push(text);
+      queuedIDs.push(messageID);
       continue;
     }
     // The newest interrupting message wins; keep scanning older messages only
     // to surface queued ones as notices before the assistant-role break.
     if (latestHumanIntervention === null) latestHumanIntervention = text;
   }
-  if (queuedNotice !== null) {
-    const noticeText = `Queued message received while the goal was running (it did not interrupt the turn): ${queuedNotice.slice(0, 200)}`;
+  if (queuedNotices.length > 0) {
+    // Collect every unsurfaced queued message in chronological order (the scan
+    // walked newest-first, so reverse) and surface them as one notice.
+    const ordered = queuedNotices.slice().reverse();
+    const orderedIDs = queuedIDs.slice().reverse();
+    const slice = (s: string) => Array.from(s).slice(0, 200).join('');
+    const noticeText = `Queued message(s) received while the goal was running (they did not interrupt the turn): ${ordered
+      .map(slice)
+      .join(' | ')}`;
     for (const m of session.listMachines?.() ?? [machine]) {
       if (m.isTerminal()) continue;
       await m.addNotice('user-intervention', noticeText);
     }
     // Record in the lifecycle trail (type 'notice', not 'tracking', so the
     // signal-filtered history view keeps it) — the ledger then carries why the
-    // goal did not yield despite a user-role message being present.
-    await machine.mutate(() => {}, {
-      source: 'idle-handler',
-      detail: noticeText,
-      historyType: 'notice',
-      skipRevision: true,
-    });
-    if (deps.announceGoalDecision) {
-      await deps.announceGoalDecision(
-        sessionID,
-        `A message was queued for this session without interrupting the running turn; the goal keeps running. Queued text: ${queuedNotice.slice(0, 200)}`,
-      );
+    // goal did not yield despite a user-role message being present. Guarded by
+    // isTerminal because mutate throws on terminal machines.
+    if (!machine.isTerminal()) {
+      await machine.mutate(() => {}, {
+        source: 'idle-handler',
+        detail: noticeText,
+        historyType: 'notice',
+        skipRevision: true,
+      });
+    }
+    // Mark surfaced only after the notice/history landed, so a failure retries
+    // on the next idle instead of silently dropping the message.
+    if (deps.runtime) {
+      let set = deps.runtime.surfacedQueuedMessageIDs.get(sessionID);
+      if (!set) {
+        set = new Set<string>();
+        deps.runtime.surfacedQueuedMessageIDs.set(sessionID, set);
+      }
+      for (const id of orderedIDs) {
+        if (id === '') continue;
+        set.add(id);
+        if (set.size > 256) set.delete(set.values().next().value!);
+      }
     }
     await session.persist();
   }
@@ -383,6 +409,35 @@ export async function processIdleEvent(
     session.getPendingIntent(machine.snapshot().goalId)
   ) {
     session.setPendingIntent(machine.snapshot().goalId, null);
+  }
+  // The queued-notice announcement is only truthful when this idle actually
+  // commits to continuing. Announce here — after the decision — rather than
+  // before the intervention check, so a pause/stop/brake on the same turn can
+  // never be preceded by a false "the goal keeps running".
+  if (
+    queuedNotices.length > 0 &&
+    deps.announceGoalDecision &&
+    (decision.type === 'continue' || decision.type === 'apply-pending-intent')
+  ) {
+    const slice = (s: string) => Array.from(s).slice(0, 200).join('');
+    await deps.announceGoalDecision(
+      sessionID,
+      `A message was queued for this session without interrupting the running turn; the goal keeps running. Queued text: ${queuedNotices
+        .slice()
+        .reverse()
+        .map(slice)
+        .join(' | ')}`,
+    );
+  } else if (queuedNotices.length > 0 && deps.announceGoalDecision) {
+    const slice = (s: string) => Array.from(s).slice(0, 200).join('');
+    await deps.announceGoalDecision(
+      sessionID,
+      `A message was queued for this session without interrupting the running turn, but a newer interrupting message (or a brake) takes precedence. Queued text: ${queuedNotices
+        .slice()
+        .reverse()
+        .map(slice)
+        .join(' | ')}`,
+    );
   }
   await executeDecision(decision, sessionID, session, machine, deps, {
     repetitionWarning:

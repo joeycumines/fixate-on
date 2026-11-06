@@ -12,6 +12,10 @@ import {GoalsPlugin, type PluginOptions} from './plugin-runtime.ts';
 import type {PluginHooks} from './hooks.ts';
 import {GOAL_COMMAND_TEMPLATE_PREFIX} from './native-agent-config.ts';
 import {
+  recordEventInputDelivery,
+  resolveInputDeliveryFields,
+} from './session-runtime.ts';
+import {
   createBufferingTransport,
   encodeGoalToolMetadata,
   GOAL_TUI_METADATA_KEY,
@@ -194,13 +198,15 @@ export function v1PartsToV2Text(input: Record<string, unknown>): {
 }
 
 /**
- * Records the delivery mode of admitted v2 input into the runtime's delivery
- * tracking, so the idle path can tell interrupting ("steer") input from queued
- * ("queue") input when it later reads the message back from `session.messages`.
+ * Records the delivery mode of a v2 input/inbox event into the runtime's
+ * delivery tracking, via the shared helper in session-runtime.ts (the single
+ * implementation used by both the v1 event hook and this adapter).
  *
  * v2.2.5 exposes the mode on `session.inbox.enqueued` (item.delivery) and
  * `session.inbox.delivery.changed`; newer hosts expose `session.input.admitted`
- * with `input.delivery`. All three shapes are accepted here.
+ * with `input.delivery`, and `session.input.queued`/`steered` imply the mode.
+ * The caller-known sessionID is passed as a fallback so a payload without its
+ * own session id is still recorded.
  */
 export function recordV2InputDelivery(
   runtime:
@@ -210,37 +216,10 @@ export function recordV2InputDelivery(
       }
     | undefined,
   data: Record<string, unknown>,
+  eventType?: string,
+  fallbackSessionID?: string,
 ): void {
-  if (!runtime) return;
-  const sessionID = getV2EventSessionID(data);
-  if (!sessionID) return;
-  const pendingInput = data.input as
-    {type?: string; delivery?: unknown; data?: unknown} | undefined;
-  const item = data.item as {delivery?: unknown} | undefined;
-  const delivery = pendingInput?.delivery ?? item?.delivery ?? data.delivery;
-  if (delivery !== 'queue' && delivery !== 'steer') return;
-  const id = String(
-    (data as {inputID?: unknown}).inputID ??
-      (data as {inboxID?: unknown}).inboxID ??
-      '',
-  );
-  if (!id) return;
-  const target =
-    delivery === 'queue'
-      ? runtime.queuedInputMessageIDs
-      : runtime.steeredInputMessageIDs;
-  const other =
-    delivery === 'queue'
-      ? runtime.steeredInputMessageIDs
-      : runtime.queuedInputMessageIDs;
-  let set = target.get(sessionID);
-  if (!set) {
-    set = new Set<string>();
-    target.set(sessionID, set);
-  }
-  set.add(id);
-  other.get(sessionID)?.delete(id);
-  if (set.size > 256) set.delete(set.values().next().value!);
+  recordEventInputDelivery(runtime, data, eventType, fallbackSessionID);
 }
 
 /**
@@ -601,16 +580,25 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
         }
 
         // v2 hosts do not trigger the v1 `chat.message` hook. Synthesize the hook call
-        // from `session.input.admitted` so user steering commands (e.g. pause/stop) are respected.
+        // from `session.input.admitted` so user steering commands (e.g. pause/stop) are
+        // respected. Queued input (delivery "queue") is NOT synthesized: it waits for
+        // the turn boundary by definition and is surfaced as a notice by the idle path.
         if (ev.type === 'session.input.admitted' && sessionID) {
-          recordV2InputDelivery(hooks.runtime, data);
-          try {
-            await synthesizeChatMessageFromAdmitted(
-              hooks['chat.message'],
-              data,
-            );
-          } catch {
-            /* steering failures must not break the event loop */
+          const {delivery} = resolveInputDeliveryFields(
+            data,
+            ev.type,
+            sessionID,
+          );
+          recordV2InputDelivery(hooks.runtime, data, ev.type, sessionID);
+          if (delivery !== 'queue') {
+            try {
+              await synthesizeChatMessageFromAdmitted(
+                hooks['chat.message'],
+                data,
+              );
+            } catch {
+              /* steering failures must not break the event loop */
+            }
           }
         }
         // Record inbox delivery mode on released 2.x (through v2.2.5), which emits
@@ -620,7 +608,7 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
             ev.type === 'session.inbox.delivery.changed') &&
           sessionID
         ) {
-          recordV2InputDelivery(hooks.runtime, data);
+          recordV2InputDelivery(hooks.runtime, data, ev.type, sessionID);
         }
         try {
           await hooks.event?.({

@@ -201,8 +201,8 @@ export function getMessageID(message: unknown): string {
  * The mode lives on the session inbox, not on the persisted message Info, so a
  * message read back from `session.messages` carries it only when the host or an
  * event payload annotates it (v2 `session.inbox.enqueued`/`delivery.changed`
- * events, the v1 `session.prompt` hook payload). This reader accepts any of the
- * structural placements: top-level `delivery`, `info.delivery`, or a nested
+ * and `session.input.*` events). This reader accepts any of the structural
+ * placements: top-level `delivery`, `info.delivery`, or a nested
  * `inbox`/`pending` object. It returns undefined when nothing carries the mode,
  * which callers treat as "unknown" rather than as "steer".
  */

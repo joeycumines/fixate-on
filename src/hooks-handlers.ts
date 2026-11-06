@@ -30,6 +30,7 @@ import {getTextFromParts} from './message-helpers.ts';
 import {isInternalAgent} from './agent-resolve.ts';
 import {brakeCeiling, brakeCeilingFormatted} from './brake-format.ts';
 import {copyGoalsToForkedSession, extractForkParentID} from './fork-bind.ts';
+import {recordEventInputDelivery} from './session-runtime.ts';
 import {
   COMPACTION_LOOP_STOP_REASON,
   COMPACTION_LOOP_THRESHOLD,
@@ -380,60 +381,39 @@ export function createEventHook(
       string | undefined;
     const runtime = deps.runtime;
 
-    // Record inbox delivery mode so the idle path can tell interrupting ("steer")
-    // input from queued ("queue") input. OpenCode 2.x emits session.inbox.enqueued
-    // (item.delivery) and session.inbox.delivery.changed (delivery); newer hosts
-    // emit session.input.queued / session.input.steered. The id field is inboxID on
-    // the inbox events and inputID on the input events.
-    if (
-      sessionID &&
-      (eventType === 'session.inbox.enqueued' ||
-        eventType === 'session.inbox.delivery.changed' ||
-        eventType === 'session.input.queued' ||
-        eventType === 'session.input.steered')
-    ) {
-      const props = (event?.properties ?? {}) as Record<string, unknown>;
-      const itemID = String(props.inboxID ?? props.inputID ?? '');
-      const item = props.item as {delivery?: unknown} | undefined;
-      const delivery =
-        eventType === 'session.input.queued'
-          ? 'queue'
-          : eventType === 'session.input.steered'
-            ? 'steer'
-            : eventType === 'session.inbox.delivery.changed'
-              ? props.delivery
-              : item?.delivery;
-      if (itemID && (delivery === 'queue' || delivery === 'steer') && runtime) {
-        const target =
-          delivery === 'queue'
-            ? runtime.queuedInputMessageIDs
-            : runtime.steeredInputMessageIDs;
-        const other =
-          delivery === 'queue'
-            ? runtime.steeredInputMessageIDs
-            : runtime.queuedInputMessageIDs;
-        let set = target.get(sessionID);
-        if (!set) {
-          set = new Set<string>();
-          target.set(sessionID, set);
-        }
-        set.add(itemID);
-        // A delivery.changed event moves the id from one mode to the other.
-        other.get(sessionID)?.delete(itemID);
-        if (set.size > 256) {
-          set.delete(set.values().next().value!);
-        }
-      }
-    }
-
     // Guard against modifying sessions not owned by this process host instance.
     // Unchecked state mutations would otherwise overwrite valid session token metrics.
+    // Delivery recording also stays below this guard: unowned sessions must not
+    // allocate entries in the runtime's per-session delivery sets.
     if (
       sessionID &&
       runtime?.canDriveSession &&
       !runtime.canDriveSession(sessionID)
     )
       return;
+
+    // Record inbox delivery mode so the idle path can tell interrupting ("steer")
+    // input from queued ("queue") input. OpenCode 2.x emits session.inbox.enqueued
+    // (item.delivery) and session.inbox.delivery.changed (delivery); newer hosts
+    // emit session.input.admitted (input.delivery) / session.input.queued /
+    // session.input.steered (mode implied by the event type). One shared helper
+    // resolves the fields; the id field is inboxID on the inbox events and
+    // inputID on the input events.
+    if (
+      sessionID &&
+      (eventType === 'session.inbox.enqueued' ||
+        eventType === 'session.inbox.delivery.changed' ||
+        eventType === 'session.input.admitted' ||
+        eventType === 'session.input.queued' ||
+        eventType === 'session.input.steered')
+    ) {
+      recordEventInputDelivery(
+        runtime,
+        (event?.properties ?? event ?? {}) as Record<string, unknown>,
+        eventType,
+        sessionID,
+      );
+    }
 
     // Track liveness for sessions delivered directly by the host in this process.
     // Exclude synthetic poller IDs so stale sessions are not inadvertently marked live.

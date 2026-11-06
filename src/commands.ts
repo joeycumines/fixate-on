@@ -217,25 +217,13 @@ export async function handleCommand(
     return `No goal history recorded yet. Set a goal with \`/${commandName} <condition>\`.`;
   }
 
-  if (LIST_COMMANDS.has(trimmed.toLowerCase())) {
-    const goals = session.listActiveGoals();
-    const archived = session.listArchivedResults();
-    const focusedMachine = session.getMachine();
-    const focusedId = focusedMachine?.snapshot().goalId ?? null;
-    return formatGoalList(
-      goals,
-      archived,
-      focusedId,
-      commandName,
-      session.isOrdered(),
-    );
-  }
-
-  // `list all` is the documented explicit form of the same listing: live goals
-  // plus the settled archive. Anything else after `list` is rejected rather
-  // than treated as an objective.
-  const listAllMatch = /^(?:list|ls)\s+all$/i.exec(trimmed);
-  if (listAllMatch) {
+  // `list` (and `list all` / `ls all`, the documented explicit form of the same
+  // listing: live goals plus the settled archive) share one body. Anything
+  // else after `list` is rejected rather than treated as an objective.
+  if (
+    LIST_COMMANDS.has(trimmed.toLowerCase()) ||
+    /^(?:list|ls)\s+all$/i.test(trimmed)
+  ) {
     const goals = session.listActiveGoals();
     const archived = session.listArchivedResults();
     const focusedMachine = session.getMachine();

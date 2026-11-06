@@ -8,6 +8,7 @@ import {
 import {serializeGoal, serializeResult} from './persistence.ts';
 import {appendWalEntry, createCommittedEntry} from './persistence-wal.ts';
 import {ensureSessionDir, sessionStatePaths} from './session-paths.ts';
+import {clearSessionDeliveryState} from './session-runtime.ts';
 import type {CreateGoalOptions} from './tools.ts';
 import type {SessionLifecycleHost} from './session-lifecycle-types.ts';
 
@@ -416,6 +417,9 @@ export async function clearSessionOwned(
   mgr.runtime.focusedGoalId.delete(sessionID);
   mgr.runtime.sessionOrdered.delete(sessionID);
   mgr.runtime.compactionTimestamps.delete(sessionID);
+  // Delivery-tracking keys are per-session too: prune them so a reused session
+  // id cannot classify messages with another session's recorded deliveries.
+  clearSessionDeliveryState(mgr.runtime, sessionID);
   for (const key of [...mgr.runtime.deferCounts.keys()]) {
     if (key.startsWith(`${sessionID}:`)) mgr.runtime.deferCounts.delete(key);
   }

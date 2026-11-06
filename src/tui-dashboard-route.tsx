@@ -14,6 +14,7 @@ import type {DashboardSection} from './tui-views.ts';
 import {goalCardLines} from './tui-views.ts';
 import type {GoalTuiSnapshot} from './tui-state.ts';
 import {PRODUCT_DISPLAY_NAME} from './tui-components.ts';
+import {createMemo} from 'solid-js';
 // Type-only import: erased at build time, and @opentui/core is external in the
 // bundle anyway, so the host supplies the real RGBA class at runtime.
 import type {RGBA} from '@opentui/core';
@@ -123,10 +124,25 @@ export function createScrollHandlers(
     viewport?: {height: number};
   } | null,
 ): ScrollHandlers {
-  const byLines = (n: number) => getEl()?.scrollBy(n);
+  // A scrollbox ref whose scrollBy throws (detached element, host guard) must
+  // not propagate into the keymap command's run — swallow it at the source.
+  const safeScrollBy = (
+    el: {scrollBy: (n: number) => void} | null,
+    n: number,
+  ) => {
+    try {
+      el?.scrollBy(n);
+    } catch {
+      // Scroll failure is a no-op, not an error the keymap engine should see.
+    }
+  };
+  const byLines = (n: number) => safeScrollBy(getEl(), n);
   const page = (dir: 1 | -1) => {
-    const h = getEl()?.viewport?.height ?? 10;
-    getEl()?.scrollBy(dir * Math.max(1, Math.floor(h / 2)));
+    const h = getEl()?.viewport?.height;
+    // NaN or non-positive heights (host reporting before layout) fall back to
+    // a 10-line page rather than scrolling by NaN/0.
+    const page = h !== undefined && h > 0 && Number.isFinite(h) ? h : 10;
+    safeScrollBy(getEl(), dir * Math.max(1, Math.floor(page / 2)));
   };
   return {
     up: () => byLines(-1),
@@ -154,7 +170,12 @@ export interface DashboardRouteProps {
   onClear: () => void;
   onFocus: (goalId: string) => void;
   onClose: () => void;
-  theme: HostTheme;
+  /**
+   * The host theme, or a getter for it. A getter is read reactively inside the
+   * route so a host theme swap repaints the dashboard instead of freezing the
+   * colors captured at mount.
+   */
+  theme: HostTheme | (() => HostTheme);
   footer: string;
   hydrationText?: string;
   /**
@@ -171,8 +192,13 @@ export interface DashboardRouteProps {
 }
 
 export function DashboardRoute(props: DashboardRouteProps) {
-  const theme: HostTheme = props.theme ?? {};
-  const palette = resolveDashboardPalette(theme);
+  // Resolve the theme through a reactive read when the caller passed a getter,
+  // so theme changes flow into the palette on re-render.
+  const palette = createMemo(() =>
+    resolveDashboardPalette(
+      typeof props.theme === 'function' ? props.theme() : props.theme,
+    ),
+  );
   const snaps = props.snapshots;
   const focused = props.focusedGoalId;
 
@@ -190,15 +216,15 @@ export function DashboardRoute(props: DashboardRouteProps) {
       flexDirection="column"
       width="100%"
       height="100%"
-      backgroundColor={palette.background}
+      backgroundColor={palette().background}
     >
       <box
         flexShrink={0}
         paddingLeft={1}
         paddingRight={1}
-        backgroundColor={palette.panel}
+        backgroundColor={palette().panel}
       >
-        <text fg={palette.accent} attributes={ATTR_BOLD}>
+        <text fg={palette().accent} attributes={ATTR_BOLD}>
           {PRODUCT_DISPLAY_NAME}
         </text>
       </box>
@@ -214,14 +240,14 @@ export function DashboardRoute(props: DashboardRouteProps) {
         verticalScrollbarOptions={{
           visible: true,
           trackOptions: {
-            backgroundColor: palette.background,
-            foregroundColor: palette.scrollbar,
+            backgroundColor: palette().background,
+            foregroundColor: palette().scrollbar,
           },
         }}
       >
         {snaps().length === 0 ? (
           <box paddingLeft={1} paddingRight={1} paddingTop={1}>
-            <text fg={palette.muted}>
+            <text fg={palette().muted}>
               {props.hydrationText ??
                 'No active goals. Use /goal <condition> to set one.'}
             </text>
@@ -233,13 +259,15 @@ export function DashboardRoute(props: DashboardRouteProps) {
               <box
                 flexDirection="column"
                 paddingBottom={1}
-                backgroundColor={isFocused ? palette.panel : undefined}
+                backgroundColor={isFocused ? palette().panel : undefined}
                 borderStyle={isFocused ? 'rounded' : undefined}
-                borderColor={isFocused ? palette.accent : undefined}
+                borderColor={
+                  isFocused ? (palette().border ?? palette().accent) : undefined
+                }
                 onMouseUp={() => props.onSelectGoal(snap.goalId)}
               >
                 <box paddingLeft={1} paddingRight={1} flexDirection="row">
-                  <text fg={palette.accent} attributes={ATTR_BOLD}>
+                  <text fg={palette().accent} attributes={ATTR_BOLD}>
                     {isFocused ? '▸ ' : '  '}
                     {'Goal: '}
                     {snap.goalId.substring(0, 8)}
@@ -248,7 +276,7 @@ export function DashboardRoute(props: DashboardRouteProps) {
                 <box paddingLeft={1} paddingRight={1} flexDirection="column">
                   {goalCardLines(snap, props.activeSessionID()).map(
                     (line, i) => (
-                      <text fg={cardLineColor(line, i, snap.status, palette)}>
+                      <text fg={cardLineColor(line, i, snap.status, palette())}>
                         {line.text}
                       </text>
                     ),
@@ -261,15 +289,15 @@ export function DashboardRoute(props: DashboardRouteProps) {
         {props.sections().map(section => (
           <box flexDirection="column" paddingBottom={1}>
             <box
-              backgroundColor={palette.panel}
+              backgroundColor={palette().panel}
               paddingLeft={1}
               paddingRight={1}
             >
-              <text fg={palette.accent}>{section.title}</text>
+              <text fg={palette().accent}>{section.title}</text>
             </box>
             <box paddingLeft={1} paddingRight={1} flexDirection="column">
               {section.text.split('\n').map(line => (
-                <text fg={palette.text}>{line}</text>
+                <text fg={palette().text}>{line}</text>
               ))}
             </box>
           </box>
@@ -279,10 +307,10 @@ export function DashboardRoute(props: DashboardRouteProps) {
         flexShrink={0}
         paddingLeft={1}
         paddingRight={1}
-        backgroundColor={palette.panel}
+        backgroundColor={palette().panel}
         flexDirection="row"
       >
-        <text fg={palette.muted}>{props.footer}</text>
+        <text fg={palette().muted}>{props.footer}</text>
       </box>
     </box>
   );

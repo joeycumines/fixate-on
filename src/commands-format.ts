@@ -291,7 +291,9 @@ export function formatHistoryRaw(history: GoalLifecycleEvent[]): string {
   const lines: string[] = [];
   for (const entry of history) {
     lines.push(
-      `[${formatRelativeTime(entry.timestamp)}] ${entry.type}: ${entry.detail}`,
+      `[${formatRelativeTime(entry.timestamp)}] ${entry.type}: ${String(
+        entry.detail ?? '',
+      )}`,
     );
   }
   return lines.join('\n');

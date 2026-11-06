@@ -578,17 +578,25 @@ export const GoalTuiPluginV2 = {
       dashboardRouteDispose = context.ui.router.register({
         name: dashboardRouteName,
         render: () => {
-          const theme = dialogTheme();
           // SolidJS reactivity: trigger view updates on store events without route re-navigation.
           const [rev, setRev] = createSignal(0);
           const unsub = store.subscribe(() => setRev(r => r + 1));
           onCleanup(() => {
+            // Route unmount without onClose must not leave the global scroll
+            // binds armed: they would shadow host arrow/page keys while the
+            // dashboard is gone.
+            dashboardOpen = false;
+            dashboardSessionID = null;
+            scrollHandlers = null;
             try {
               unsub();
             } catch {
               // Teardown is best-effort.
             }
           });
+          // The theme is read reactively (not hoisted out of the render) so a
+          // host theme swap repaints the dashboard with the new dialog surface.
+          const theme = () => dialogTheme();
           const sections = () => {
             rev();
             return dashboardSections();
@@ -702,7 +710,6 @@ export const GoalTuiPluginV2 = {
     const repaintDashboard = (): void => {
       if (!dashboardOpen) return;
       const generation = ++dashboardGeneration;
-      const theme = dialogTheme();
 
       const renderContent = () =>
         DashboardRoute({
@@ -750,7 +757,7 @@ export const GoalTuiPluginV2 = {
           registerScrollCommands: handlers => {
             scrollHandlers = handlers;
           },
-          theme,
+          theme: () => dialogTheme(),
           footer: dashboardFooter(
             () => dashboardSessionID ?? activeSessionID(),
           ),
@@ -1051,9 +1058,13 @@ export const GoalTuiPluginV2 = {
           description: 'Scroll the goal dashboard up one line',
           group: PRODUCT_DISPLAY_NAME,
           bind: 'up',
-          enabled: () => dashboardOpen,
+          enabled: () => dashboardOpen && scrollHandlers !== null,
           run: () => {
-            scrollHandlers?.up();
+            try {
+              scrollHandlers?.up();
+            } catch {
+              // A throwing scrollbox ref must not escape into the keymap engine.
+            }
           },
         },
         {
@@ -1062,9 +1073,13 @@ export const GoalTuiPluginV2 = {
           description: 'Scroll the goal dashboard down one line',
           group: PRODUCT_DISPLAY_NAME,
           bind: 'down',
-          enabled: () => dashboardOpen,
+          enabled: () => dashboardOpen && scrollHandlers !== null,
           run: () => {
-            scrollHandlers?.down();
+            try {
+              scrollHandlers?.down();
+            } catch {
+              // See scroll.up.
+            }
           },
         },
         {
@@ -1073,9 +1088,13 @@ export const GoalTuiPluginV2 = {
           description: 'Scroll the goal dashboard up one page',
           group: PRODUCT_DISPLAY_NAME,
           bind: 'pageup',
-          enabled: () => dashboardOpen,
+          enabled: () => dashboardOpen && scrollHandlers !== null,
           run: () => {
-            scrollHandlers?.pageUp();
+            try {
+              scrollHandlers?.pageUp();
+            } catch {
+              // See scroll.up.
+            }
           },
         },
         {
@@ -1084,9 +1103,13 @@ export const GoalTuiPluginV2 = {
           description: 'Scroll the goal dashboard down one page',
           group: PRODUCT_DISPLAY_NAME,
           bind: 'pagedown',
-          enabled: () => dashboardOpen,
+          enabled: () => dashboardOpen && scrollHandlers !== null,
           run: () => {
-            scrollHandlers?.pageDown();
+            try {
+              scrollHandlers?.pageDown();
+            } catch {
+              // See scroll.up.
+            }
           },
         },
       ],

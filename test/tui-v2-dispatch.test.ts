@@ -18,6 +18,9 @@ import {describe, expect, test} from 'bun:test';
 import {mkdtemp} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+// Type-only import: erased at runtime, so the test never loads @opentui/core's
+// native loader (see the palette test's comment below for why that matters).
+import type {RGBA as RgbaLike} from '@opentui/core';
 import GoalTuiPluginV2 from '../src/tui-v2.ts';
 import {createGoalState} from '../src/state-machine.ts';
 import {writeStateFile} from '../src/persistence-wal.ts';
@@ -191,6 +194,7 @@ function createMockContext() {
   const dialogs: {kind: string; title: string; value?: string}[] = [];
   let capturedCommands: V2Command[] = [];
   let capturedLayerMode: string | undefined;
+  let registeredRoute: {name: string; render: () => unknown} | null = null;
   let location: {directory: string; workspaceID?: string} | undefined;
   let tabsEnabled = false;
   let failNextSynthetic = false;
@@ -278,7 +282,12 @@ function createMockContext() {
         },
       },
       router: {
-        register: () => () => {},
+        register: (routeDef: {name: string; render: () => unknown}) => {
+          registeredRoute = routeDef;
+          return () => {
+            registeredRoute = null;
+          };
+        },
         navigate: () => {},
         current: () => route,
       },
@@ -309,6 +318,7 @@ function createMockContext() {
     stub,
     getCommands: () => capturedCommands,
     getLayerMode: () => capturedLayerMode,
+    getRoute: () => registeredRoute,
     find: (id: string) => capturedCommands.find(c => c.id === id),
     synthetics,
     commands,
@@ -431,36 +441,55 @@ test('scroll commands exist, are bound to arrow/page keys, and gate on dashboard
 // The route must pass those RGBA objects through to the renderer unchanged: the
 // props accept RGBA natively, and RGBA.toString() yields "rgba(1.00, 0.00, ...)"
 // floats that the renderer's hex parser rejects, falling back to magenta.
+//
+// The test builds its own structural RGBA-shaped double instead of importing
+// @opentui/core at runtime: the package is only a transitive dependency here
+// (via @opentui/solid), and its native loader double-registers environment
+// variables in the test process — the exact hazard the route file documents and
+// inlines ATTR_BOLD to avoid. The palette contract under test is identity
+// pass-through, so a structurally identical object pins it just as well.
+function fakeRgba(hex: string): RgbaLike {
+  const n = Number.parseInt(hex.slice(1), 16);
+  return {
+    r: (n >> 16) & 0xff,
+    g: (n >> 8) & 0xff,
+    b: n & 0xff,
+    a: 255,
+    toString: () =>
+      `rgba(${(n >> 16) & 0xff}, ${(n >> 8) & 0xff}, ${n & 0xff}, 1)`,
+  } as unknown as RgbaLike;
+}
+
 test('the dashboard palette passes v2 RGBA tokens through, never stringified', async () => {
   const {resolveDashboardPalette} =
     await import('../src/tui-dashboard-route.tsx');
-  // Real RGBA objects, as the host hands over.
-  const {RGBA} = await import('@opentui/core');
+  // Real RGBA-shaped objects, as the host hands over.
   const theme = {
     text: {
-      base: RGBA.fromHex('#eeeeee'),
-      muted: RGBA.fromHex('#999999'),
+      base: fakeRgba('#eeeeee'),
+      muted: fakeRgba('#999999'),
       feedback: {
-        success: {base: RGBA.fromHex('#00ff00')},
-        warning: {base: RGBA.fromHex('#ffaa00')},
-        error: {base: RGBA.fromHex('#ff0000')},
-        info: {base: RGBA.fromHex('#00aaff')},
+        success: {base: fakeRgba('#00ff00')},
+        warning: {base: fakeRgba('#ffaa00')},
+        error: {base: fakeRgba('#ff0000')},
+        info: {base: fakeRgba('#00aaff')},
       },
     },
     background: {
-      base: RGBA.fromHex('#111111'),
-      raised: {base: RGBA.fromHex('#222222')},
+      base: fakeRgba('#111111'),
+      raised: {base: fakeRgba('#222222')},
     },
-    border: {base: RGBA.fromHex('#444444')},
-    scrollbar: {base: RGBA.fromHex('#555555')},
-    hue: {accent: {500: RGBA.fromHex('#7777ff')}},
+    border: {base: fakeRgba('#444444')},
+    scrollbar: {base: fakeRgba('#555555')},
+    hue: {accent: {500: fakeRgba('#7777ff')}},
   };
   const p = resolveDashboardPalette(theme as never);
-  // Identity, not stringification: the exact RGBA object must come out.
+  // Identity, not stringification: the exact token object must come out.
   expect(p.text).toBe(theme.text.base);
   expect(p.muted).toBe(theme.text.muted);
   expect(p.panel).toBe(theme.background.raised.base); // raised.base, not old background.panel
   expect(p.background).toBe(theme.background.base);
+  expect(p.border).toBe(theme.border.base); // border token resolved and exposed
   expect(p.accent).toBe(theme.hue.accent[500]); // hue.accent[500], not text.accent.default
   expect(p.scrollbar).toBe(theme.scrollbar.base);
   expect(p.status.active).toBe(theme.text.feedback.success.base);
@@ -473,6 +502,7 @@ test('the dashboard palette passes v2 RGBA tokens through, never stringified', a
     p.muted,
     p.panel,
     p.background,
+    p.border,
     p.accent,
     p.scrollbar,
     ...Object.values(p.status),
@@ -483,6 +513,7 @@ test('the dashboard palette passes v2 RGBA tokens through, never stringified', a
   // Missing tokens fall back to undefined (renderer default), never to a string.
   const bare = resolveDashboardPalette({} as never);
   expect(bare.text).toBeUndefined();
+  expect(bare.border).toBeUndefined();
   expect(bare.status.active).toBeUndefined();
 });
 
@@ -507,6 +538,135 @@ test('dashboard scroll handlers drive the scrollbox ref by lines and half-pages'
   h.pageUp();
   h.pageDown();
   expect(calls).toEqual([-1, 1, -20, 20]); // page = half of viewport height 40
+});
+
+test('scroll handlers swallow a throwing scrollBy and fall back on a NaN viewport', async () => {
+  const {createScrollHandlers} = await import('../src/tui-dashboard-route.tsx');
+  // A detached/throwing element ref must not propagate into the keymap run.
+  const throwing = {
+    scrollBy: () => {
+      throw new Error('element detached');
+    },
+    viewport: {height: 40},
+  };
+  const h = createScrollHandlers(() => throwing);
+  expect(() => h.up()).not.toThrow();
+  expect(() => h.down()).not.toThrow();
+  expect(() => h.pageUp()).not.toThrow();
+  expect(() => h.pageDown()).not.toThrow();
+
+  // NaN or non-positive viewport heights page by the 10-line fallback (±5).
+  const nanCalls: number[] = [];
+  let el: {scrollBy: (n: number) => void; viewport?: {height: number}} = {
+    scrollBy: (n: number) => nanCalls.push(n),
+    viewport: {height: Number.NaN},
+  };
+  const hn = createScrollHandlers(() => el);
+  hn.pageUp();
+  hn.pageDown();
+  expect(nanCalls).toEqual([-5, 5]);
+  el = {scrollBy: (n: number) => nanCalls.push(n), viewport: {height: 0}};
+  hn.pageUp();
+  expect(nanCalls).toEqual([-5, 5, -5]);
+  // No viewport at all: same fallback.
+  el = {scrollBy: (n: number) => nanCalls.push(n)};
+  hn.pageDown();
+  expect(nanCalls).toEqual([-5, 5, -5, 5]);
+});
+
+test('scroll commands stay disabled until the dashboard route registers handlers, and never throw', async () => {
+  const h = createMockContext();
+  const workspace = await makeGoalFixture('a goal for the scroll-gate test');
+  h.setLocation({directory: workspace});
+  const dispose = await GoalTuiPluginV2.setup(h.stub);
+  try {
+    await flush();
+    const scrollIds = [
+      'fixate-on.scroll.up',
+      'fixate-on.scroll.down',
+      'fixate-on.scroll.page-up',
+      'fixate-on.scroll.page-down',
+    ] as const;
+    const enabledOf = (id: string) => {
+      const cmd = h.find(id) as unknown as {
+        enabled?: () => boolean;
+        run: () => void;
+      };
+      return cmd;
+    };
+    // Closed dashboard: disabled.
+    for (const id of scrollIds) expect(enabledOf(id).enabled!()).toBe(false);
+    // Open the dashboard (dialog path): dashboardOpen is true but no route has
+    // registered scroll handlers yet, so the binds must STILL be disabled —
+    // gating on dashboardOpen alone would shadow host arrow keys here.
+    await h.find('fixate-on.dashboard')!.run();
+    await flush();
+    for (const id of scrollIds) {
+      expect(enabledOf(id).enabled!()).toBe(false);
+      expect(() => enabledOf(id).run()).not.toThrow();
+    }
+  } finally {
+    await dispose();
+  }
+});
+
+test('route unmount resets dashboardOpen so scroll binds disarm without an onClose', async () => {
+  const {createRoot} = await import('solid-js');
+  const h = createMockContext();
+  const workspace = await makeGoalFixture('a goal for the unmount test');
+  h.setLocation({directory: workspace});
+  const dispose = await GoalTuiPluginV2.setup(h.stub);
+  try {
+    await flush();
+    // Open the dialog dashboard so dashboardOpen is true.
+    await h.find('fixate-on.dashboard')!.run();
+    await flush();
+    const route = h.getRoute();
+    expect(route, 'the companion should register a plugin route').toBeTruthy();
+    // Invoke the route render inside a reactive root, exactly as the host would,
+    // then unmount. The headless render throws at the JSX renderer, but the
+    // onCleanup registered before it still runs on dispose — that is the reset
+    // under test. registerScrollCommands fires before the JSX, so the handlers
+    // are armed while the route lives.
+    const scrollIds = [
+      'fixate-on.scroll.up',
+      'fixate-on.scroll.down',
+      'fixate-on.scroll.page-up',
+      'fixate-on.scroll.page-down',
+    ] as const;
+    const enabledNow = (id: string) =>
+      (h.find(id) as unknown as {enabled?: () => boolean}).enabled!();
+    let threw = false;
+    createRoot(disposeRoot => {
+      try {
+        route!.render!();
+      } catch {
+        threw = true;
+      }
+      // Route mounted: dashboardOpen && handlers set => binds armed.
+      for (const id of scrollIds) expect(enabledNow(id)).toBe(true);
+      disposeRoot();
+    });
+    expect(threw).toBe(true); // proves we reached the JSX (host renderer absent headless)
+    // After unmount the scroll commands must report disabled even though no
+    // onClose ever fired.
+    for (const id of scrollIds) expect(enabledNow(id)).toBe(false);
+  } finally {
+    await dispose();
+  }
+});
+
+test('DashboardRouteProps accepts a theme getter for reactive repaint', async () => {
+  // Compile-time pin: the props union must accept () => HostTheme so the v2
+  // companion can pass a getter and a host theme swap repaints the dashboard.
+  const {DashboardRoute} = await import('../src/tui-dashboard-route.tsx');
+  type Props = Parameters<typeof DashboardRoute>[0];
+  const getterTheme: Props['theme'] = () => ({}) as never;
+  const objectTheme: Props['theme'] = {} as never;
+  // Runtime anchor so DashboardRoute is a value use, not only a type use.
+  expect(typeof DashboardRoute).toBe('function');
+  expect(typeof getterTheme).toBe('function');
+  expect(typeof objectTheme).toBe('object');
 });
 
 test('palette actions dispatch via session.synthetic, NOT session.command', async () => {

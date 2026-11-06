@@ -17,7 +17,8 @@ guide covers only the companion's own behavior — see
 `$OPENCODE_TUI_CONFIG`).
 Registering the companion in `opencode.json` does not load it. With the
 companion in `tui.json`, all 11 `Fixate:` palette entries of the 1.x companion render
-(palette filtered on `fixate:`; the 2.x companion registers 13) with chord
+(palette filtered on `fixate:`; the 2.x companion registers 13 palette entries
+plus 4 dashboard-only scroll commands) with chord
 hints shown on the six bound actions. One
 caveat stands: the chords themselves are not byte-deliverable through
 tmux/terminal (`ctrl+shift+g` arrives as `0x07`), so the palette — not the
@@ -172,6 +173,11 @@ action key. The prefix is what keeps these out of the prompt's way.
 | `ctrl+shift+g` `c` | Clear       | Clear the active goal          |
 | `ctrl+shift+g` `e` | Edit        | Edit the goal objective        |
 | `ctrl+shift+g` `k` | Checkpoint  | Add a checkpoint               |
+
+**Dashboard scrolling (2.x):** while the goal dashboard is open, `up`/`down`
+scroll one line and `pageup`/`pagedown` scroll half a page (the four
+`fixate-on.scroll.*` commands; they stay disabled — and do not shadow the
+host's own arrow/page keys — whenever the dashboard is closed).
 
 **The prefix is not universally deliverable.** On some terminals `ctrl+shift+g`
 arrives as `0x07` and the chord never fires. The command palette

@@ -917,6 +917,7 @@ export async function GoalsPlugin(
         runtime.recoveryPendingSessions.clear();
         runtime.queuedInputMessageIDs.clear();
         runtime.steeredInputMessageIDs.clear();
+        runtime.surfacedQueuedMessageIDs.clear();
         for (const controller of runtime.continuationControllers.values())
           controller.abort();
         for (const timer of kickoffTimers.values()) clearTimeout(timer);

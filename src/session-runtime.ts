@@ -107,10 +107,12 @@ export interface RuntimeState {
    * Message ids known to arrive as non-interrupting inbox input (delivery
    * "queue"): the host parks them for the next turn boundary instead of waking
    * execution mid-turn. Recorded from `session.inbox.enqueued` /
-   * `session.inbox.delivery.changed` events (OpenCode 2.x) and the
-   * `session.prompt` hook payload (OpenCode 1.x), keyed by `${sessionID}` to a
-   * set of message ids. A queued message must not yield the goal; it is surfaced
-   * to the user as a notice instead.
+   * `session.inbox.delivery.changed` (OpenCode 2.x through v2.2.5) and
+   * `session.input.admitted` / `session.input.queued` / `session.input.steered`
+   * (newer hosts), keyed by session ID to a set of message ids. On 1.x hosts no
+   * delivery distinction is observable, so queued input still pauses there. A
+   * queued message must not yield the goal; it is surfaced to the user as a
+   * notice instead.
    */
   queuedInputMessageIDs: Map<string, Set<string>>;
   /**
@@ -118,6 +120,12 @@ export interface RuntimeState {
    * turn was running. Recorded from the same channels as `queuedInputMessageIDs`.
    */
   steeredInputMessageIDs: Map<string, Set<string>>;
+  /**
+   * Queued message ids already surfaced to the user as notices by the idle path,
+   * keyed by session ID. Prevents repeated idle passes over the same message
+   * from re-announcing it.
+   */
+  surfacedQueuedMessageIDs: Map<string, Set<string>>;
   /**
    * Determines whether this process is permitted to drive a session's goals.
    * Prevents competing instances from dispatching actions on owned sessions.
@@ -151,9 +159,167 @@ export function createRuntimeState(): RuntimeState {
     pendingIntents: new Map(),
     queuedInputMessageIDs: new Map(),
     steeredInputMessageIDs: new Map(),
+    surfacedQueuedMessageIDs: new Map(),
     drainPersistence: null,
     disposed: false,
   };
+}
+
+/** Cap on ids held per delivery set (insertion-order eviction). */
+const DELIVERY_SET_CAP = 256;
+
+/**
+ * Records one input-delivery observation into the runtime's per-session sets.
+ * Shared by every host event path (v1 event hook and v2 adapter) so the
+ * recording logic lives in exactly one place.
+ *
+ * A `delivery.changed` observation moves the id across sets. Sets are capped
+ * by insertion order. No-op when the runtime, session, id, or delivery is
+ * unusable — an empty id must never win over a valid fallback, which is why
+ * callers pass a resolved id rather than a ?? chain.
+ */
+export function recordInputDelivery(
+  runtime:
+    | {
+        queuedInputMessageIDs: Map<string, Set<string>>;
+        steeredInputMessageIDs: Map<string, Set<string>>;
+      }
+    | undefined,
+  sessionID: string,
+  id: string,
+  delivery: unknown,
+): void {
+  if (!runtime || !sessionID || !id) return;
+  if (delivery !== 'queue' && delivery !== 'steer') return;
+  const target =
+    delivery === 'queue'
+      ? runtime.queuedInputMessageIDs
+      : runtime.steeredInputMessageIDs;
+  const other =
+    delivery === 'queue'
+      ? runtime.steeredInputMessageIDs
+      : runtime.queuedInputMessageIDs;
+  let set = target.get(sessionID);
+  if (!set) {
+    set = new Set<string>();
+    target.set(sessionID, set);
+  }
+  set.add(id);
+  // A delivery change moves the id from one mode to the other.
+  other.get(sessionID)?.delete(id);
+  if (set.size > DELIVERY_SET_CAP) {
+    set.delete(set.values().next().value!);
+  }
+}
+
+/**
+ * Resolves the {sessionID, id, delivery} fields of a host input/inbox event
+ * payload. Every field uses a valid-value check (not `??`) so an empty string
+ * or an invalid literal never wins over a later valid candidate:
+ *
+ * - sessionID: caller-known id first, then a structural search of the payload
+ *   (direct, properties, info, session — mirroring the v2 adapter).
+ * - id: first non-empty string among inputID, inboxID, item.id, message id.
+ * - delivery: first valid 'queue'|'steer' among input.delivery, item.delivery,
+ *   top-level delivery, properties.delivery; when the event type is
+ *   session.input.queued / session.input.steered the type itself implies the
+ *   mode.
+ */
+export function resolveInputDeliveryFields(
+  data: Record<string, unknown>,
+  eventType?: string,
+  fallbackSessionID?: string,
+): {sessionID: string; id: string; delivery: unknown} {
+  const asString = (v: unknown): string =>
+    typeof v === 'string' && v.length > 0 ? v : '';
+  const findSessionID = (value: unknown, depth: number): string => {
+    if (!value || typeof value !== 'object' || depth > 3) return '';
+    const obj = value as Record<string, unknown>;
+    const direct = asString(obj.sessionID);
+    if (direct) return direct;
+    for (const key of ['properties', 'info', 'session']) {
+      const found = findSessionID(obj[key], depth + 1);
+      if (found) return found;
+    }
+    return '';
+  };
+  const sessionID = asString(fallbackSessionID) || findSessionID(data, 0);
+  const props = (data.properties ?? {}) as Record<string, unknown>;
+  const input = (data.input ?? props.input) as
+    {delivery?: unknown; id?: unknown} | undefined;
+  const item = (data.item ?? props.item) as
+    {delivery?: unknown; id?: unknown} | undefined;
+  const id =
+    asString(data.inputID) ||
+    asString(props.inputID) ||
+    asString(data.inboxID) ||
+    asString(props.inboxID) ||
+    asString(input?.id) ||
+    asString(item?.id);
+  const implied =
+    eventType === 'session.input.queued'
+      ? 'queue'
+      : eventType === 'session.input.steered'
+        ? 'steer'
+        : undefined;
+  const delivery =
+    implied ??
+    (input?.delivery === 'queue' || input?.delivery === 'steer'
+      ? input.delivery
+      : undefined) ??
+    (item?.delivery === 'queue' || item?.delivery === 'steer'
+      ? item.delivery
+      : undefined) ??
+    (data.delivery === 'queue' || data.delivery === 'steer'
+      ? data.delivery
+      : undefined) ??
+    (props.delivery === 'queue' || props.delivery === 'steer'
+      ? props.delivery
+      : undefined);
+  return {sessionID, id, delivery};
+}
+
+/**
+ * Records the delivery mode of a host input/inbox event into the runtime sets,
+ * using {@link resolveInputDeliveryFields}. `fallbackSessionID` lets a caller
+ * that already knows the session (e.g. the v2 event loop) record payloads that
+ * carry no session id of their own.
+ */
+export function recordEventInputDelivery(
+  runtime:
+    | {
+        queuedInputMessageIDs: Map<string, Set<string>>;
+        steeredInputMessageIDs: Map<string, Set<string>>;
+      }
+    | undefined,
+  data: Record<string, unknown>,
+  eventType?: string,
+  fallbackSessionID?: string,
+): void {
+  const {sessionID, id, delivery} = resolveInputDeliveryFields(
+    data,
+    eventType,
+    fallbackSessionID,
+  );
+  recordInputDelivery(runtime, sessionID, id, delivery);
+}
+
+/**
+ * Removes every per-session delivery-tracking key. Called on session clear and
+ * on runtime dispose so stale ids cannot classify messages of a reused session.
+ */
+export function clearSessionDeliveryState(
+  runtime: Pick<
+    RuntimeState,
+    | 'queuedInputMessageIDs'
+    | 'steeredInputMessageIDs'
+    | 'surfacedQueuedMessageIDs'
+  >,
+  sessionID: string,
+): void {
+  runtime.queuedInputMessageIDs.delete(sessionID);
+  runtime.steeredInputMessageIDs.delete(sessionID);
+  runtime.surfacedQueuedMessageIDs.delete(sessionID);
 }
 
 export const runtimeStorage = new AsyncLocalStorage<RuntimeState>();
