@@ -19,6 +19,9 @@ import {
   LIST_COMMANDS,
   NO_ARG_SUBCOMMANDS,
   parseGoalArguments,
+  resolveGoalRef,
+  resolveOperandMachine,
+  splitLeadingGoalId,
   splitObjectives,
   STATUS_COMMANDS,
   stripWrappingQuotes,
@@ -75,86 +78,32 @@ export interface CommandSessionContext {
   isOwnedElsewhere?: () => boolean;
 }
 
-/**
- * Resolve a goal reference to exactly one goal: 1-based index, full id, or
- * unique prefix. An ambiguous prefix is an error, never a silent fallback to
- * the first match or the focused goal.
- */
-type GoalRefResolution =
-  | {ok: true; goal: GoalState}
-  | {ok: false; reason: 'none' | 'ambiguous'; matches: number};
-
-function resolveGoalRef(goals: GoalState[], ref: string): GoalRefResolution {
-  const trimmed = ref.trim();
-  if (/^\d+$/.test(trimmed)) {
-    const index = Number.parseInt(trimmed, 10);
-    const goal =
-      index >= 1 && index <= goals.length ? goals[index - 1] : undefined;
-    return goal ? {ok: true, goal} : {ok: false, reason: 'none', matches: 0};
-  }
-  const exact = goals.find(g => g.goalId === trimmed);
-  if (exact) return {ok: true, goal: exact};
-  const prefixed = goals.filter(g => g.goalId.startsWith(trimmed));
-  if (prefixed.length === 1) return {ok: true, goal: prefixed[0]!};
-  if (prefixed.length > 1)
-    return {ok: false, reason: 'ambiguous', matches: prefixed.length};
-  return {ok: false, reason: 'none', matches: 0};
+export interface CommandOutcome {
+  ok: boolean;
+  text: string;
 }
 
-/**
- * Split an optional leading goal ID off a free-text operand (`edit`, `checkpoint`).
- * A leading token counts as a reference when it looks like a goal ID (full UUID),
- * whether or not a goal with that ID is still active.
- *
- * An active ID resolves; a stale or mistyped ID is reported by `resolveOperandMachine`,
- * never folded into the objective text to avoid rewriting the wrong goal with UUID
- * text. Non-UUID tokens remain part of the objective.
- */
-const GOAL_ID_SHAPE =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-function splitLeadingGoalId(
-  goals: GoalState[],
-  operand: string,
-): {goalId: string | null; rest: string} {
-  const space = operand.indexOf(' ');
-  if (space <= 0) return {goalId: null, rest: operand};
-  const candidate = operand.slice(0, space);
-  if (goals.some(g => g.goalId === candidate))
-    return {goalId: candidate, rest: operand.slice(space + 1)};
-  if (GOAL_ID_SHAPE.test(candidate))
-    return {goalId: candidate, rest: operand.slice(space + 1)};
-  return {goalId: null, rest: operand};
-}
-
-/**
- * Resolves the state machine targeted by a free-text verb: either the named goal
- * or the currently focused goal if none was named.
- *
- * Non-UUID tokens remain part of the objective prose. If an explicit goal ID cannot
- * be resolved, an error is reported rather than falling back to the focused goal.
- */
-function resolveOperandMachine(
-  session: CommandSessionContext,
-  named: string | null,
-): {machine: GoalStateMachine | null; error?: string} {
-  if (named === null) return {machine: session.getMachine()};
-  const machine = session.getMachineById?.(named) ?? null;
-  return machine
-    ? {machine}
-    : {
-        machine: null,
-        error: `Goal ${named} could not be resolved in this session.`,
-      };
-}
+const passOutcome = (text: string): CommandOutcome => ({ok: true, text});
+const failOutcome = (text: string): CommandOutcome => ({ok: false, text});
 
 export async function handleCommand(
   args: string,
   session: CommandSessionContext,
   commandName = 'goal',
 ): Promise<string> {
+  const outcome = await handleCommandOutcome(args, session, commandName);
+  return outcome.text;
+}
+
+export async function handleCommandOutcome(
+  args: string,
+  session: CommandSessionContext,
+  commandName = 'goal',
+): Promise<CommandOutcome> {
   if (args.length > MAX_COMMAND_ARGUMENT_LENGTH) {
-    return `Goal command arguments must be ${MAX_COMMAND_ARGUMENT_LENGTH} characters or fewer.`;
+    return failOutcome(
+      `Goal command arguments must be ${MAX_COMMAND_ARGUMENT_LENGTH} characters or fewer.`,
+    );
   }
 
   const trimmed = args.trim();
@@ -172,13 +121,17 @@ export async function handleCommand(
   if (!statusKey || STATUS_COMMANDS.has(statusKey.toLowerCase())) {
     const machine = session.getMachine();
     if (machine) {
-      return formatStatus(machine.snapshot(), commandName, {verbose});
+      return passOutcome(
+        formatStatus(machine.snapshot(), commandName, {verbose}),
+      );
     }
     const archived = session.listArchivedResults();
     if (archived.length > 0) {
-      return formatGoalResult(archived[archived.length - 1]);
+      return passOutcome(formatGoalResult(archived[archived.length - 1]));
     }
-    return `No active goal. Set one with \`/${commandName} <condition>\`.`;
+    return passOutcome(
+      `No active goal. Set one with \`/${commandName} <condition>\`.`,
+    );
   }
 
   // `history [--verbose|--full]`: bare shows signal lifecycle entries; the flag
@@ -191,30 +144,36 @@ export async function handleCommand(
     const machine = session.getMachine();
     if (machine) {
       const goal = machine.snapshot();
-      return [
-        `Goal history for: ${goal.condition}`,
-        '',
-        `Latest checkpoint: ${goal.lastCheckpoint?.summary || 'none yet'}`,
-        '',
-        historyVerbose
-          ? formatHistoryRaw(goal.history)
-          : formatHistory(goal.history),
-      ].join('\n');
+      return passOutcome(
+        [
+          `Goal history for: ${goal.condition}`,
+          '',
+          `Latest checkpoint: ${goal.lastCheckpoint?.summary || 'none yet'}`,
+          '',
+          historyVerbose
+            ? formatHistoryRaw(goal.history)
+            : formatHistory(goal.history),
+        ].join('\n'),
+      );
     }
     const archived = session.listArchivedResults();
     if (archived.length > 0) {
       const last = archived[archived.length - 1];
-      return [
-        `Last goal history for: ${last.condition}`,
-        '',
-        `Latest checkpoint: ${last.lastCheckpoint?.summary || 'none recorded'}`,
-        '',
-        historyVerbose
-          ? formatHistoryRaw(last.history)
-          : formatHistory(last.history),
-      ].join('\n');
+      return passOutcome(
+        [
+          `Last goal history for: ${last.condition}`,
+          '',
+          `Latest checkpoint: ${last.lastCheckpoint?.summary || 'none recorded'}`,
+          '',
+          historyVerbose
+            ? formatHistoryRaw(last.history)
+            : formatHistory(last.history),
+        ].join('\n'),
+      );
     }
-    return `No goal history recorded yet. Set a goal with \`/${commandName} <condition>\`.`;
+    return passOutcome(
+      `No goal history recorded yet. Set a goal with \`/${commandName} <condition>\`.`,
+    );
   }
 
   // `list` (and `list all` / `ls all`, the documented explicit form of the same
@@ -228,12 +187,14 @@ export async function handleCommand(
     const archived = session.listArchivedResults();
     const focusedMachine = session.getMachine();
     const focusedId = focusedMachine?.snapshot().goalId ?? null;
-    return formatGoalList(
-      goals,
-      archived,
-      focusedId,
-      commandName,
-      session.isOrdered(),
+    return passOutcome(
+      formatGoalList(
+        goals,
+        archived,
+        focusedId,
+        commandName,
+        session.isOrdered(),
+      ),
     );
   }
 
@@ -250,25 +211,29 @@ export async function handleCommand(
           g => g.goalId === requestedRef || g.goalId.startsWith(requestedRef),
         );
       if (!target) {
-        return `No active goal matching "${requestedRef}" to clear.`;
+        return failOutcome(
+          `No active goal matching "${requestedRef}" to clear.`,
+        );
       }
       await session.removeGoal(target.goalId);
       await session.persist();
-      return `Goal cleared: ${target.condition}`;
+      return passOutcome(`Goal cleared: ${target.condition}`);
     }
     const activeGoals = session.listActiveGoals();
     if (activeGoals.length === 0) {
-      return 'No active goal to clear.';
+      return passOutcome('No active goal to clear.');
     }
     if (activeGoals.length > 1) {
-      return `This session holds ${activeGoals.length} goals; bare \`/${commandName} clear\` would discard all of them. Name one: \`/${commandName} clear <goalId>\`, or \`/${commandName} list\` to see them.`;
+      return failOutcome(
+        `This session holds ${activeGoals.length} goals; bare \`/${commandName} clear\` would discard all of them. Name one: \`/${commandName} clear <goalId>\`, or \`/${commandName} list\` to see them.`,
+      );
     }
     for (const g of activeGoals) {
       await session.removeGoal(g.goalId);
     }
     await session.clearSession();
     await session.persist();
-    return 'Goal cleared.';
+    return passOutcome('Goal cleared.');
   }
 
   // Bare form targets the focused goal; `pause <ref>` targets an explicit goal.
@@ -281,22 +246,30 @@ export async function handleCommand(
     if (ref) {
       const resolved = resolveGoalRef(session.listActiveGoals(), ref);
       if (!resolved.ok) {
-        return resolved.reason === 'ambiguous'
-          ? `"${ref}" matches ${resolved.matches} goals; use more of the id or the list number.`
-          : `No goal found matching "${ref}". Run \`/${commandName} list\` to see available goals.`;
+        return failOutcome(
+          resolved.reason === 'ambiguous'
+            ? `"${ref}" matches ${resolved.matches} goals; use more of the id or the list number.`
+            : `No goal found matching "${ref}". Run \`/${commandName} list\` to see available goals.`,
+        );
       }
       machine = session.getMachineById?.(resolved.goal.goalId) ?? null;
       if (!machine) {
-        return `Goal "${resolved.goal.goalId.substring(0, 8)}" is not addressable. Run \`/${commandName} list\`.`;
+        return failOutcome(
+          `Goal "${resolved.goal.goalId.substring(0, 8)}" is not addressable. Run \`/${commandName} list\`.`,
+        );
       }
     }
     if (!machine) {
-      return `No active goal. Set one with \`/${commandName} <condition>\`.`;
+      return passOutcome(
+        `No active goal. Set one with \`/${commandName} <condition>\`.`,
+      );
     }
     const goal = machine.snapshot();
     if (goal.status !== 'active') {
       // Render through the shared label so the internal ledger token is not exposed.
-      return `Goal is already paused (${stopReasonLabel(goal.stopReason, goal.status, goal.stoppedAt, Date.now(), goal.updatedAt) || goal.status}).`;
+      return passOutcome(
+        `Goal is already paused (${stopReasonLabel(goal.stopReason, goal.status, goal.stoppedAt, Date.now(), goal.updatedAt) || goal.status}).`,
+      );
     }
     const pauseResult = await machine.transition('paused', {
       source: 'slash-command',
@@ -306,10 +279,10 @@ export async function handleCommand(
         : 'User paused the active goal.',
     });
     if (!pauseResult.ok) {
-      return `Failed to pause goal: ${pauseResult.error}`;
+      return failOutcome(`Failed to pause goal: ${pauseResult.error}`);
     }
     await session.persist();
-    return `Goal paused: ${goal.condition}`;
+    return passOutcome(`Goal paused: ${goal.condition}`);
   }
 
   // Resume follows the same explicit-identifier contract as pause.
@@ -322,24 +295,32 @@ export async function handleCommand(
     if (ref) {
       const resolved = resolveGoalRef(session.listActiveGoals(), ref);
       if (!resolved.ok) {
-        return resolved.reason === 'ambiguous'
-          ? `"${ref}" matches ${resolved.matches} goals; use more of the id or the list number.`
-          : `No goal found matching "${ref}". Run \`/${commandName} list\` to see available goals.`;
+        return failOutcome(
+          resolved.reason === 'ambiguous'
+            ? `"${ref}" matches ${resolved.matches} goals; use more of the id or the list number.`
+            : `No goal found matching "${ref}". Run \`/${commandName} list\` to see available goals.`,
+        );
       }
       machine = session.getMachineById?.(resolved.goal.goalId) ?? null;
       if (!machine) {
-        return `Goal "${resolved.goal.goalId.substring(0, 8)}" is not addressable. Run \`/${commandName} list\`.`;
+        return failOutcome(
+          `Goal "${resolved.goal.goalId.substring(0, 8)}" is not addressable. Run \`/${commandName} list\`.`,
+        );
       }
     }
     if (!machine) {
-      return `No active goal. Set one with \`/${commandName} <condition>\`.`;
+      return failOutcome(
+        `No active goal. Set one with \`/${commandName} <condition>\`.`,
+      );
     }
     const goal = machine.snapshot();
     if (goal.status === 'active') {
-      return 'Goal is already running.';
+      return passOutcome('Goal is already running.');
     }
     if (TERMINAL_STATUSES.has(goal.status)) {
-      return `Goal is ${goal.status} (terminal) and cannot be resumed. Run \`/${commandName} clear\` and create a new goal.`;
+      return failOutcome(
+        `Goal is ${goal.status} (terminal) and cannot be resumed. Run \`/${commandName} clear\` and create a new goal.`,
+      );
     }
     await machine.mutate(
       g => {
@@ -361,10 +342,12 @@ export async function handleCommand(
       detail: 'User resumed the goal.',
     });
     if (!resumeResult.ok) {
-      return `Failed to resume goal: ${resumeResult.error}`;
+      return failOutcome(`Failed to resume goal: ${resumeResult.error}`);
     }
     await session.persist();
-    return `Goal resumed: ${goal.condition} (turn count restarted at 0 for a fresh budget window.)`;
+    return passOutcome(
+      `Goal resumed: ${goal.condition} (turn count restarted at 0 for a fresh budget window.)`,
+    );
   }
 
   if (
@@ -375,16 +358,20 @@ export async function handleCommand(
   ) {
     const machine = session.getMachine();
     if (!machine) {
-      return `No active goal. Set one with \`/${commandName} <condition>\`.`;
+      return failOutcome(
+        `No active goal. Set one with \`/${commandName} <condition>\`.`,
+      );
     }
     const goal = machine.snapshot();
     if (!goal.pendingProposal) {
-      return 'No pending proposal to accept.';
+      return failOutcome('No pending proposal to accept.');
     }
     const proposal = goal.pendingProposal;
     const rawArg = trimmed.replace(/^accept(-proposal)?\s*/i, '').trim();
     if (rawArg && rawArg !== proposal.proposalId) {
-      return `Proposal ID mismatch: pending proposal is "${proposal.proposalId}", but "${rawArg}" was requested.`;
+      return failOutcome(
+        `Proposal ID mismatch: pending proposal is "${proposal.proposalId}", but "${rawArg}" was requested.`,
+      );
     }
     await machine.mutate(
       g => {
@@ -405,7 +392,9 @@ export async function handleCommand(
       },
     );
     await session.persist();
-    return `Accepted proposal [${proposal.proposalId}]: terms updated.\nReason: ${proposal.reason}`;
+    return passOutcome(
+      `Accepted proposal [${proposal.proposalId}]: terms updated.\nReason: ${proposal.reason}`,
+    );
   }
 
   if (
@@ -416,16 +405,20 @@ export async function handleCommand(
   ) {
     const machine = session.getMachine();
     if (!machine) {
-      return `No active goal. Set one with \`/${commandName} <condition>\`.`;
+      return failOutcome(
+        `No active goal. Set one with \`/${commandName} <condition>\`.`,
+      );
     }
     const goal = machine.snapshot();
     if (!goal.pendingProposal) {
-      return 'No pending proposal to reject.';
+      return failOutcome('No pending proposal to reject.');
     }
     const proposal = goal.pendingProposal;
     const rawArg = trimmed.replace(/^reject(-proposal)?\s*/i, '').trim();
     if (rawArg && rawArg !== proposal.proposalId) {
-      return `Proposal ID mismatch: pending proposal is "${proposal.proposalId}", but "${rawArg}" was requested.`;
+      return failOutcome(
+        `Proposal ID mismatch: pending proposal is "${proposal.proposalId}", but "${rawArg}" was requested.`,
+      );
     }
     await machine.mutate(
       g => {
@@ -438,7 +431,7 @@ export async function handleCommand(
       },
     );
     await session.persist();
-    return `Rejected proposal [${proposal.proposalId}].`;
+    return passOutcome(`Rejected proposal [${proposal.proposalId}].`);
   }
 
   if (
@@ -447,21 +440,25 @@ export async function handleCommand(
   ) {
     const machine = session.getMachine();
     if (!machine) {
-      return `No active goal. Set one with \`/${commandName} <condition>\`.`;
+      return failOutcome(
+        `No active goal. Set one with \`/${commandName} <condition>\`.`,
+      );
     }
     const goal = machine.snapshot();
     const deliverable = await buildHandbackDeliverable(
       goal,
       session.workspaceDirectory,
     );
-    return [
-      `# Handback Deliverable for Goal [${deliverable.goalId}]`,
-      `Objective: ${deliverable.condition}`,
-      `Status: ${deliverable.status}`,
-      `Claims: ${deliverable.claims.length} recorded`,
-      '',
-      deliverable.externalReviewPayload,
-    ].join('\n');
+    return passOutcome(
+      [
+        `# Handback Deliverable for Goal [${deliverable.goalId}]`,
+        `Objective: ${deliverable.condition}`,
+        `Status: ${deliverable.status}`,
+        `Claims: ${deliverable.claims.length} recorded`,
+        '',
+        deliverable.externalReviewPayload,
+      ].join('\n'),
+    );
   }
 
   if (
@@ -472,14 +469,16 @@ export async function handleCommand(
   ) {
     const machine = session.getMachine();
     if (!machine) {
-      return `No active goal. Set one with \`/${commandName} <condition>\`.`;
+      return failOutcome(
+        `No active goal. Set one with \`/${commandName} <condition>\`.`,
+      );
     }
     const goal = machine.snapshot();
     const deliverable = await buildHandbackDeliverable(
       goal,
       session.workspaceDirectory,
     );
-    return deliverable.externalReviewPayload;
+    return passOutcome(deliverable.externalReviewPayload);
   }
 
   // Edit objective: accepts either `edit <objective>` (focused goal) or
@@ -493,21 +492,29 @@ export async function handleCommand(
       trimmed.slice('edit'.length).trim(),
     );
     const resolvedEdit = resolveOperandMachine(session, namedGoalId);
-    if (resolvedEdit.error) return resolvedEdit.error;
+    if (resolvedEdit.error) return failOutcome(resolvedEdit.error);
     const machine = resolvedEdit.machine;
     if (!machine) {
-      return `No active goal to edit. Set one with \`/${commandName} <condition>\`.`;
+      return failOutcome(
+        `No active goal to edit. Set one with \`/${commandName} <condition>\`.`,
+      );
     }
     const newObjective = stripWrappingQuotes(editOperand);
     if (!newObjective) {
-      return `No new objective provided. Use \`/${commandName} edit <new objective>\`.`;
+      return failOutcome(
+        `No new objective provided. Use \`/${commandName} edit <new objective>\`.`,
+      );
     }
     if (newObjective.length > MAX_OBJECTIVE_LENGTH) {
-      return `Goal objective must be ${MAX_OBJECTIVE_LENGTH} characters or fewer.`;
+      return failOutcome(
+        `Goal objective must be ${MAX_OBJECTIVE_LENGTH} characters or fewer.`,
+      );
     }
     const editGoal = machine.snapshot();
     if (TERMINAL_STATUSES.has(editGoal.status)) {
-      return `Goal is ${editGoal.status} (terminal) and cannot be edited. Run \`/${commandName} clear\` and create a new goal.`;
+      return failOutcome(
+        `Goal is ${editGoal.status} (terminal) and cannot be edited. Run \`/${commandName} clear\` and create a new goal.`,
+      );
     }
     if (editGoal.status !== 'active') {
       const editTransitionResult = await machine.transition('active', {
@@ -516,7 +523,9 @@ export async function handleCommand(
         detail: 'User edited the goal objective',
       });
       if (!editTransitionResult.ok) {
-        return `Failed to edit goal: ${editTransitionResult.error}`;
+        return failOutcome(
+          `Failed to edit goal: ${editTransitionResult.error}`,
+        );
       }
     }
     await machine.mutate(
@@ -534,14 +543,16 @@ export async function handleCommand(
     const priorStatus = editGoal.status;
     const reactivated = priorStatus !== 'active';
     await session.persist();
-    return [
-      `Goal objective updated: ${newObjective}`,
-      ...(reactivated
-        ? [`The goal was ${priorStatus} and is now active again.`]
-        : []),
-      '',
-      `Budgets and history are preserved. Run \`/${commandName} resume\` for a fresh budget window, or \`/${commandName} status\` to review.`,
-    ].join('\n');
+    return passOutcome(
+      [
+        `Goal objective updated: ${newObjective}`,
+        ...(reactivated
+          ? [`The goal was ${priorStatus} and is now active again.`]
+          : []),
+        '',
+        `Budgets and history are preserved. Run \`/${commandName} resume\` for a fresh budget window, or \`/${commandName} status\` to review.`,
+      ].join('\n'),
+    );
   }
 
   if (
@@ -551,28 +562,36 @@ export async function handleCommand(
     const ref = trimmed.slice('focus'.length).trim();
     const goals = session.listActiveGoals();
     if (goals.length === 0) {
-      return `No goals to focus. Set one with \`/${commandName} <condition>\`.`;
+      return failOutcome(
+        `No goals to focus. Set one with \`/${commandName} <condition>\`.`,
+      );
     }
     if (!ref) {
-      return `Specify which goal to focus:\n\n${formatGoalList(goals, [], session.getMachine()?.snapshot().goalId ?? null, commandName)}`;
+      return failOutcome(
+        `Specify which goal to focus:\n\n${formatGoalList(goals, [], session.getMachine()?.snapshot().goalId ?? null, commandName)}`,
+      );
     }
 
     const resolved = resolveGoalRef(goals, ref);
     if (!resolved.ok) {
-      return resolved.reason === 'ambiguous'
-        ? `"${ref}" matches ${resolved.matches} goals; use more of the id or the list number.`
-        : `No goal found matching "${ref}". Run \`/${commandName} list\` to see available goals.`;
+      return failOutcome(
+        resolved.reason === 'ambiguous'
+          ? `"${ref}" matches ${resolved.matches} goals; use more of the id or the list number.`
+          : `No goal found matching "${ref}". Run \`/${commandName} list\` to see available goals.`,
+      );
     }
 
     const focused = await session.focusGoal(resolved.goal.goalId);
     if (!focused.ok) {
       // Distinguish terminal goals from general resolution failures.
-      return focused.reason === 'terminal'
-        ? `Goal "${resolved.goal.goalId.substring(0, 8)}" is already finished and cannot be focused.`
-        : `Failed to focus goal: ${resolved.goal.condition}`;
+      return failOutcome(
+        focused.reason === 'terminal'
+          ? `Goal "${resolved.goal.goalId.substring(0, 8)}" is already finished and cannot be focused.`
+          : `Failed to focus goal: ${resolved.goal.condition}`,
+      );
     }
     await session.persist();
-    return `Focused goal: ${resolved.goal.condition}`;
+    return passOutcome(`Focused goal: ${resolved.goal.condition}`);
   }
 
   // Checkpoint: supports optional leading goal ID addressing, matching `edit`.
@@ -585,18 +604,24 @@ export async function handleCommand(
       trimmed.slice('checkpoint'.length).trim(),
     );
     const resolvedCheckpoint = resolveOperandMachine(session, namedGoalId);
-    if (resolvedCheckpoint.error) return resolvedCheckpoint.error;
+    if (resolvedCheckpoint.error) return failOutcome(resolvedCheckpoint.error);
     const machine = resolvedCheckpoint.machine;
     if (!machine) {
-      return `No active goal. Set one with \`/${commandName} <condition>\`.`;
+      return failOutcome(
+        `No active goal. Set one with \`/${commandName} <condition>\`.`,
+      );
     }
     const summary = checkpointOperand;
     if (!summary) {
-      return `Provide a checkpoint summary: \`/${commandName} checkpoint <summary>\``;
+      return failOutcome(
+        `Provide a checkpoint summary: \`/${commandName} checkpoint <summary>\``,
+      );
     }
     const checkpointGoal = machine.snapshot();
     if (TERMINAL_STATUSES.has(checkpointGoal.status)) {
-      return `Goal is ${checkpointGoal.status} (terminal) and cannot be checkpointed. Run \`/${commandName} clear\` and create a new goal.`;
+      return failOutcome(
+        `Goal is ${checkpointGoal.status} (terminal) and cannot be checkpointed. Run \`/${commandName} clear\` and create a new goal.`,
+      );
     }
     await machine.mutate(
       goal => {
@@ -614,7 +639,7 @@ export async function handleCommand(
       {source: 'slash-command', detail: 'User saved a checkpoint'},
     );
     await session.persist();
-    return `Checkpoint saved: ${summary}`;
+    return passOutcome(`Checkpoint saved: ${summary}`);
   }
 
   if (
@@ -624,13 +649,17 @@ export async function handleCommand(
     const createArgs = trimmed.slice('add'.length).trim();
     const parsed = parseGoalArguments(createArgs);
     if (parsed.errors.length > 0) {
-      return parsed.errors.join('\n');
+      return failOutcome(parsed.errors.join('\n'));
     }
     if (!parsed.condition) {
-      return `No objective provided. Use \`/${commandName} add <condition>\`.`;
+      return failOutcome(
+        `No objective provided. Use \`/${commandName} add <condition>\`.`,
+      );
     }
     if (parsed.condition.length > MAX_OBJECTIVE_LENGTH) {
-      return `Goal objective must be ${MAX_OBJECTIVE_LENGTH} characters or fewer.`;
+      return failOutcome(
+        `Goal objective must be ${MAX_OBJECTIVE_LENGTH} characters or fewer.`,
+      );
     }
 
     const activeGoals = session.listActiveGoals();
@@ -638,7 +667,9 @@ export async function handleCommand(
       g => !TERMINAL_STATUSES.has(g.status),
     );
     if (unfinishedGoals.length >= MAX_LIVE_GOALS) {
-      return `A session may contain at most ${MAX_LIVE_GOALS} live goals.`;
+      return failOutcome(
+        `A session may contain at most ${MAX_LIVE_GOALS} live goals.`,
+      );
     }
 
     // Adding a goal does not pause running work; all unfinished goals continue
@@ -657,13 +688,15 @@ export async function handleCommand(
       const cause = session.isOwnedElsewhere?.()
         ? "NOT SAVED — this host could not write this session's file, because another process owns it."
         : "NOT SAVED — this host would not write this session's file. No other process owns it; see the host log for the cause.";
-      return [
-        cause,
-        'The goal is live in memory for this process only and will be gone on restart.',
-        `Objective: ${parsed.condition}`,
-      ].join('\n');
+      return passOutcome(
+        [
+          cause,
+          'The goal is live in memory for this process only and will be gone on restart.',
+          `Objective: ${parsed.condition}`,
+        ].join('\n'),
+      );
     }
-    return `Added and focused new goal: ${parsed.condition}`;
+    return passOutcome(`Added and focused new goal: ${parsed.condition}`);
   }
 
   if (
@@ -674,13 +707,19 @@ export async function handleCommand(
     const objectives = splitObjectives(rest);
 
     if (!objectives.length) {
-      return `No objectives provided. Use \`/${commandName} sequence <objective 1>; <objective 2>; …\` (separate with \`;\` or newlines).`;
+      return failOutcome(
+        `No objectives provided. Use \`/${commandName} sequence <objective 1>; <objective 2>; …\` (separate with \`;\` or newlines).`,
+      );
     }
     if (objectives.length > MAX_LIVE_GOALS) {
-      return `An ordered sequence may contain at most ${MAX_LIVE_GOALS} goals.`;
+      return failOutcome(
+        `An ordered sequence may contain at most ${MAX_LIVE_GOALS} goals.`,
+      );
     }
     if (objectives.some(objective => objective.length > MAX_OBJECTIVE_LENGTH)) {
-      return `Each goal objective must be ${MAX_OBJECTIVE_LENGTH} characters or fewer.`;
+      return failOutcome(
+        `Each goal objective must be ${MAX_OBJECTIVE_LENGTH} characters or fewer.`,
+      );
     }
 
     const existingGoals = session.listActiveGoals();
@@ -719,23 +758,29 @@ export async function handleCommand(
       '',
       `Focused goal 1: ${objectives[0]}`,
     ];
-    return lines.join('\n');
+    return passOutcome(lines.join('\n'));
   }
 
   const firstWord = trimmed.toLowerCase().split(/\s+/)[0];
   if (NO_ARG_SUBCOMMANDS.has(firstWord)) {
-    return `\`/${commandName} ${firstWord}\` does not accept additional arguments. Run \`/${commandName} ${firstWord}\` without extra text.`;
+    return failOutcome(
+      `\`/${commandName} ${firstWord}\` does not accept additional arguments. Run \`/${commandName} ${firstWord}\` without extra text.`,
+    );
   }
 
   const parsed = parseGoalArguments(trimmed);
   if (parsed.errors.length > 0) {
-    return parsed.errors.join('\n');
+    return failOutcome(parsed.errors.join('\n'));
   }
   if (!parsed.condition) {
-    return `No objective provided. Use \`/${commandName} <condition>\` to set a goal.`;
+    return failOutcome(
+      `No objective provided. Use \`/${commandName} <condition>\` to set a goal.`,
+    );
   }
   if (parsed.condition.length > MAX_OBJECTIVE_LENGTH) {
-    return `Goal objective must be ${MAX_OBJECTIVE_LENGTH} characters or fewer.`;
+    return failOutcome(
+      `Goal objective must be ${MAX_OBJECTIVE_LENGTH} characters or fewer.`,
+    );
   }
 
   const machine = await session.replaceGoals(parsed.condition, parsed.options);
@@ -781,7 +826,7 @@ export async function handleCommand(
   lines.push(
     'When the goal is fully satisfied, call update_goal with status "complete". If you are truly blocked and need the user, call update_goal with status "blocked".',
   );
-  return lines.join('\n');
+  return passOutcome(lines.join('\n'));
 }
 
 // Re-export formatters and parsers for backwards compatibility with existing consumers.

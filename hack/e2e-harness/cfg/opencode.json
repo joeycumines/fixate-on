@@ -24,7 +24,7 @@
   },
   "plugins": [
     {
-      "package": "file://__BUNDLE_DIR__/hack/e2e-harness/plugin-dir/server.js",
+      "package": "file://__BUNDLE_DIR__/hack/e2e-harness/plugin-dir",
       "options": {
         "stateRoot": ".opencode/goals",
         "workspaceDirectory": "__WORK_DIR__",

@@ -4356,3 +4356,101 @@ test('a judge that OMITS the identity fields still settles', async () => {
 
   expect(machine.snapshot().status).toBe('complete');
 });
+
+test('NO-TOOL-CALL-BRAKE: historical tool calls do not suppress noToolCallTurns on subsequent tool-free turns', async () => {
+  const goal = makeGoal({
+    turnCount: 1,
+    noToolCallTurns: 0,
+    noToolCallTurnsBeforePause: 3,
+    minDelayMs: 0,
+  });
+  const machine = new GoalStateMachine(goal, {
+    onCommit: async () => {},
+  });
+  const session = makeSessionContext({machine});
+  let list: unknown[] = [
+    {
+      info: {id: 'msg-001', role: 'user', time: {created: 1000}},
+      parts: [{type: 'text', text: '/goal do work'}],
+    },
+    {
+      info: {
+        id: 'msg-tool-1',
+        role: 'assistant',
+        time: {created: 1100, completed: 1150},
+        finish: 'tool-calls',
+        tokens: {input: 1000, output: 100},
+      },
+      parts: [
+        {type: 'tool', tool: 'goal-command', state: {status: 'completed'}},
+      ],
+    },
+    {
+      info: {
+        id: 'msg-002',
+        role: 'assistant',
+        time: {created: 1200, completed: 1250},
+        finish: 'stop',
+        tokens: {input: 1000, output: 100},
+      },
+      parts: [{type: 'text', text: 'Turn 1 complete.'}],
+    },
+  ];
+  const sessionApi = makeMockSessionApi();
+  // Emulate descending host ordering while testing chronological normalization too.
+  sessionApi.messages = async () => [...list].reverse();
+  const hooks = createHooks(makeDeps({session, sessionApi}));
+
+  await hooks.event!({
+    type: 'session.idle',
+    sessionID: 'session-1',
+    id: 'cycle-1',
+  });
+  expect(machine.snapshot().noToolCallTurns).toBe(0);
+  expect(machine.snapshot().status).toBe('active');
+
+  for (let n = 1; n <= 3; n++) {
+    list = [
+      ...list,
+      {
+        info: {
+          id: `msg-00${n + 2}u`,
+          role: 'user',
+          synthetic: true,
+          time: {created: 1250 + n * 100},
+        },
+        parts: [{type: 'text', text: 'Continue.', synthetic: true}],
+      },
+      {
+        info: {
+          // Prefix before 'msg-tool-1' lexicographically ('e' < 'o') to verify
+          // repeated idle polling cannot falsely resurrect the historical tool call.
+          id: `msg-e-prose-${n}`,
+          role: 'assistant',
+          time: {created: 1300 + n * 100, completed: 1350 + n * 100},
+          finish: 'stop',
+          tokens: {input: 1000, output: 200},
+        },
+        parts: [{type: 'text', text: `No tools on follow-up ${n}.`}],
+      },
+    ];
+    await hooks.event!({
+      type: 'session.idle',
+      sessionID: 'session-1',
+      id: `cycle-prose-${n}-a`,
+    });
+    if (n === 1) {
+      await hooks.event!({
+        type: 'session.idle',
+        sessionID: 'session-1',
+        id: `cycle-prose-${n}-b`,
+      });
+      expect(machine.snapshot().noToolCallTurns).toBe(1);
+    }
+  }
+
+  const snap = machine.snapshot();
+  expect(snap.noToolCallTurns).toBe(3);
+  expect(snap.status).toBe('paused');
+  expect(snap.stopReason).toBe('no tool calls');
+});

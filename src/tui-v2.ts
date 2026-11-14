@@ -391,14 +391,17 @@ export const GoalTuiPluginV2 = {
     // Eagerly hydrate from disk to prevent initial views from displaying empty state.
     const eagerHydrateDir =
       opts.workspaceDirectory ?? context.location?.directory;
-    if (eagerHydrateDir) {
-      void hydrateStoreFromDisk(
-        store,
-        eagerHydrateDir,
-        undefined,
-        opts.stateRoot,
-      ).catch(() => {});
-    }
+    const initialHydration: Promise<void> | null = eagerHydrateDir
+      ? hydrateStoreFromDisk(
+          store,
+          eagerHydrateDir,
+          undefined,
+          opts.stateRoot,
+        ).then(
+          () => {},
+          () => {},
+        )
+      : null;
 
     const lastHydration: {dir?: string; count: number; evidence?: string} = {
       count: 0,
@@ -834,7 +837,11 @@ export const GoalTuiPluginV2 = {
         await sendGoalCommand(bare);
         return;
       }
-      const goalId = resolveFocusedGoalId(store, sid);
+      let goalId = resolveFocusedGoalId(store, sid);
+      if (goalId === null && initialHydration) {
+        await initialHydration;
+        goalId = resolveFocusedGoalId(store, sid);
+      }
       if (goalId === null) return;
       await sendGoalCommand(targeted(goalId));
     };
@@ -849,7 +856,11 @@ export const GoalTuiPluginV2 = {
       prompt: () => Promise<string | undefined>,
     ): Promise<void> => {
       const sid = dashboardSession();
-      const goalId = sid === null ? null : resolveFocusedGoalId(store, sid);
+      let goalId = sid === null ? null : resolveFocusedGoalId(store, sid);
+      if (sid !== null && goalId === null && initialHydration) {
+        await initialHydration;
+        goalId = resolveFocusedGoalId(store, sid);
+      }
       if (sid !== null && goalId === null) return;
       const operand = await prompt();
       if (!operand) return;

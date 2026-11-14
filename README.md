@@ -40,12 +40,12 @@ Throughout this section, "OpenCode 1.x" means the `opencode` binary and "OpenCod
 |:---|:---|:---|
 | Server plugin key | `plugin` (bare string or `[spec, options]`) | `plugins` (string or `{package, options}`) |
 | Local-checkout target | a file works (`.../plugin/fixate-on/plugin.js`) | a directory is required; released 2.x builds reject a file target with `configured plugin path must be a directory` |
-| `/goal` registration | `command.execute.before` intercepts the auto-registered command; the `config` hook also installs a bridge `command.goal` template | no `command.execute.before`; declare `command.goal` with the `goal-command` bridge template and `$ARGUMENTS` (below), or rely on the plugin's `command.transform` rewrite |
-| Native agents (`goal`, `goal-verify`) | registered by the `config` hook | not created; the 2.x adapter registers tools and the command transform only |
+| `/goal` registration | `command.execute.before` intercepts the auto-registered command; the `config` hook also installs a bridge `command.goal` template | no `command.execute.before`; the plugin's `command.transform` registers its own `goal` command (overriding the built-in `opencode.goal`), and an explicit `command.goal` config still works alongside it |
+| Native agents (`goal`, `goal-verify`) | registered by the `config` hook | registered by the plugin's `agent.transform` bridge (the 2.x host does not call the 1.x `config` hook) |
 | TUI companion | `tui.json` `plugin` array → `fixate-on/tui` | `cli.json` `plugins` array → `fixate-on/tui-v2` (a `file://` entry pointing at the bundle) |
 | Permission key in a shared config | `permission` (a map) | `permissions`; 2.x also accepts the 1.x spelling, 1.x does not accept the 2.x one |
 
-A bridge `command.goal` template is harmless on 1.x (the hook still intercepts first) and required on 2.x, so one config document can serve both versions.
+A bridge `command.goal` template is a fallback on 2.x, not a requirement: the plugin's `command.transform` registers `/goal` itself when the host exposes the transform, so zero-config works there too.
 
 <details>
 <summary>Optional: customize <code>command.goal</code> on OpenCode 1.x</summary>
@@ -68,7 +68,7 @@ A user-defined `command.goal` is preserved via `??=` semantics, except for its `
 
 ### `/goal` on OpenCode 2.x
 
-On OpenCode 2.x (`opencode2`), plugins cannot intercept slash-command execution via `command.execute.before`, and a command template without `$ARGUMENTS` appends raw arguments as chat text. For `/goal` submissions to reach goal state rather than plain chat, configure `command.goal` to route through the plugin's `goal-command` bridge tool:
+On OpenCode 2.x (`opencode2`), plugins cannot intercept slash-command execution via `command.execute.before`, and a command template without `$ARGUMENTS` appends raw arguments as chat text. The plugin's `command.transform` registers its own `goal` command, which overrides the built-in `opencode.goal`, so `/goal` reaches goal state with zero configuration. Where the transform is unavailable (older 2.x builds), declare `command.goal` to route through the plugin's `goal-command` bridge tool:
 
 ```json
 {
@@ -82,11 +82,11 @@ On OpenCode 2.x (`opencode2`), plugins cannot intercept slash-command execution 
 }
 ```
 
-The same template text is installed automatically: on 2.x the plugin's `command.transform` rewrites any registered `goal`/`goal <sub>` commands to this shape and deletes their `agent` field, so a hand-written `command.goal` is only needed where the transform is unavailable. On 1.x the `config` hook installs it too, and `command.execute.before` still intercepts first; the template is a harmless fallback there.
+The same template text is installed automatically: on 2.x the plugin's `command.transform` registers the `goal` command directly (overriding the built-in), so a hand-written `command.goal` is only needed where the transform is unavailable. On 1.x the `config` hook installs it too, and `command.execute.before` still intercepts first; the template is a harmless fallback there.
 
-With this template wired, `/goal <objective> --pointer SPEC.md --max-turns 10` creates the goal with artifact pointers on disk, drives continuations, and settles through the claim ledger. On stock OpenCode 1.x this template is unnecessary because the plugin intercepts the auto-registered command directly.
+With `/goal` wired, `/goal <objective> --pointer SPEC.md --max-turns 10` creates the goal with artifact pointers on disk, drives continuations, and settles through the claim ledger. On stock OpenCode 1.x this template is unnecessary because the plugin intercepts the auto-registered command directly.
 
-**What each version registers:** on 1.x the `config` hook registers the `/goal` slash command (plus `goal <sub>` subcommands), the `goal` agent, and the hidden read-only `goal-verify` subagent. On 2.x the adapter registers the goal tools and rewrites command templates, but does not create the `goal`/`goal-verify` agents; the built-in judge there runs through a child session bound to the workspace, so agent selection and `/goal status` output are unaffected, but any config that references a `goal` agent by name only applies on 1.x.
+**What each version registers:** on 1.x the `config` hook registers the `/goal` slash command (plus `goal <sub>` subcommands), the `goal` agent, and the hidden read-only `goal-verify` subagent. On 2.x the adapter registers the goal tools, registers the same `goal`/`goal-verify` agents through its `agent.transform` bridge, and registers the `/goal` command through `command.transform`; the built-in judge there runs through a child session bound to the workspace, so agent selection and `/goal status` output behave the same on both versions.
 
 ### TUI companion setup
 
@@ -214,7 +214,7 @@ Do not rename `plugin` to `plugins` or `permission` to `permissions` in a shared
 
 **Quick smoke test:**
 
-1. Load the plugin in a scratch OpenCode config and configure `command.goal` if running OpenCode 2.x (see [`/goal` on OpenCode 2.x](#goal-on-opencode-2x)).
+1. Load the plugin in a scratch OpenCode config (on 2.x no `command.goal` hand-wiring is needed; see [`/goal` on OpenCode 2.x](#goal-on-opencode-2x)).
 2. Run `/goal status` and confirm no active goal is reported.
 3. Run `/goal inspect this repo and call update_goal with status "blocked" if you need user input`.
 4. Verify `/goal status`, `/goal pause`, `/goal resume`, and `/goal clear` transition state as expected (see [Subcommands](#subcommands)).
@@ -500,7 +500,7 @@ Pass plugin-level defaults in `opencode.json`:
 | Package subpaths | `.` and `./server` load the dual-version server bundle (1.x via the `server` export, 2.x via the default `{ id, setup }`); `./tui` is the 1.x companion (load it from `tui.json`); `./tui-v2` is the 2.x companion (load it from `cli.json`) and depends on host-supplied modules. TypeScript declarations support `NodeNext` and `Bundler`. |
 | Provider templates | Strict-template backends require the goal block to merge into the primary `system` message (covered by regression tests). |
 | Static built-in verifier | The built-in `goal-verify` subagent is read-only (`read`, `glob`, `grep`); it cannot run shell commands itself and relies on workspace inspection plus evidence cited by the primary agent. |
-| OpenCode 2.x TUI plugins | On the 2.x build used by this repo's e2e harness (installed release 2.0.27, cross-referenced against upstream tag v2.0.27 / commit `1f4d07a`; re-checked against tag v2.2.5), the TUI loads CLI plugins from `cli.json`, including `file://` entries, but never registers their palette entries, and the server rejects a configured plugin **file** target (`configured plugin path must be a directory`). Both deficiencies are fixed in later 2.x source (commits `0dfcb30d71`, `359c501ceb`), so the harness runs a from-source 2.x build (`hack/e2e-harness/opencode2-from-source.sh`); newer released 2.x builds may already include those fixes. Separately, on every released 2.x through v2.2.5 a plugin keymap layer defaults to base mode, so its palette entries vanish the moment the palette opens its own mode — the v2 companion declares `mode: "global"` itself to stay reachable. For the companion either install `fixate-on/tui-v2` from npm or point `cli.json` at a `file://` bundle. See [Host API Requirements](docs/tui-integration.md#host-api-requirements). |
+| OpenCode 2.x TUI plugins | Measured on the installed 2.x release v2.2.7 (the build this repo's e2e harness runs): the server still rejects a configured plugin **file** target with `configured plugin path must be a directory` (point at an adapter directory — see [Loading from local source](#loading-from-local-source)), but the TUI does load `cli.json` plugins and register their palette entries, so `ctrl+p` → `fixate:` works. Older 2.x builds (through v2.2.5) never registered CLI-plugin palette entries and defaulted plugin keymap layers to base mode, which made palette entries vanish the moment the palette opened; the v2 companion declares `mode: "global"` itself to stay reachable on those builds. For the companion either install `fixate-on/tui-v2` from npm or point `cli.json` at a `file://` bundle. See [Host API Requirements](docs/tui-integration.md#host-api-requirements). |
 
 ---
 
@@ -515,8 +515,8 @@ Start with `/goal status --full` (or `--verbose`) and `/goal history --verbose` 
 | `configured plugin path must be a directory` | OpenCode 2.x was given a plugin **file** path | point `plugins[].package` at the adapter directory (see [Loading from local source](#loading-from-local-source)) |
 | 1.x loads but `/goal` is absent, no error | `plugins` (plural) was used in a 1.x-read config; 1.x drops it | use `plugin` (singular); 2.x migrates it |
 | 1.x refuses to start with a permissions error | a 2.x-style `permissions` key in a shared config | use the 1.x `permission` map; 2.x migrates it |
-| 2.x `/goal foo` becomes plain chat | missing bridge template | declare `command.goal` with the `goal-command` template and `$ARGUMENTS` (see [`/goal` on OpenCode 2.x](#goal-on-opencode-2x)) |
-| 2.x TUI shows the plugin failed to load | released 2.x builds before the upstream fixes reject `file://` plugin URLs / never register palette entries | install `fixate-on` from npm, or run a from-source 2.x build; see [Compatibility & Known Limits](#compatibility--known-limits) |
+| 2.x `/goal foo` becomes plain chat | no `goal` command reached the session (transform unavailable and no bridge template) | on 2.x builds with `command.transform` this should not happen; on older builds declare `command.goal` with the `goal-command` template and `$ARGUMENTS` (see [`/goal` on OpenCode 2.x](#goal-on-opencode-2x)) |
+| 2.x TUI shows the plugin failed to load | older 2.x builds (through v2.2.5) rejected `file://` plugin URLs / never registered palette entries; all 2.x builds reject a plugin **file** target | install `fixate-on` from npm, use an adapter directory for a local checkout, and on v2.2.7+ `cli.json` `file://` entries work; see [Compatibility & Known Limits](#compatibility--known-limits) |
 | 1.x TUI companion never appears | the companion was placed in `opencode.json` instead of `tui.json` | 1.x loads the companion only from `tui.json` (see [TUI companion setup](#tui-companion-setup)) |
 | dashboard shows a different state than `/goal status` | server plugin and companion resolved different state roots | set the same `stateRoot` on both entries or `FIXATE_ON_STATE_ROOT` (see [TUI companion setup](#tui-companion-setup)) |
 

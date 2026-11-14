@@ -3,6 +3,7 @@ import {readFile} from 'node:fs/promises';
 import {join} from 'node:path';
 import {
   assistantTurnKey,
+  chronologicalMessages,
   findLatestAssistantMessage,
   findNewestMessage,
   getMessageID,
@@ -487,4 +488,33 @@ describe('windowHasToolCallNewerThan tolerates a `#` turn key as the reference',
       );
     });
   }
+});
+
+describe('chronologicalMessages and findNewestMessage id comparison guard', () => {
+  test('untimestamped mixed-prefix equal-width custom ids preserve array order', () => {
+    const messages = [
+      {id: 'u0', role: 'user'},
+      {id: 'm1', role: 'assistant'},
+      {id: 'm2', role: 'user'},
+    ];
+    expect(chronologicalMessages(messages).map(getMessageID)).toEqual([
+      'u0',
+      'm1',
+      'm2',
+    ]);
+    expect(getMessageID(findNewestMessage(messages))).toBe('m2');
+  });
+
+  test('untimestamped descending msg_ ids with matching length normalize oldest-first', () => {
+    const messages = [
+      {id: 'msg_0000000003', role: 'user'},
+      {id: 'msg_0000000002', role: 'assistant'},
+      {id: 'msg_0000000001', role: 'user'},
+    ];
+    expect(chronologicalMessages(messages).map(getMessageID)).toEqual([
+      'msg_0000000001',
+      'msg_0000000002',
+      'msg_0000000003',
+    ]);
+  });
 });

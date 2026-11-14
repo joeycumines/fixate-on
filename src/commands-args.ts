@@ -4,7 +4,7 @@
  * Pure parsing with no session context.
  */
 
-import type {GoalMode} from './state-machine.ts';
+import type {GoalMode, GoalState, GoalStateMachine} from './state-machine.ts';
 import type {CreateGoalOptions} from './tools.ts';
 
 export const CLEAR_COMMANDS = new Set([
@@ -451,6 +451,75 @@ export function readQuotedValue(
     return {text: '', nextIndex: startIndex, error: 'Missing value for flag'};
   }
   return {text: first, nextIndex: startIndex + 1};
+}
+
+export type GoalRefResolution =
+  | {ok: true; goal: GoalState}
+  | {ok: false; reason: 'none' | 'ambiguous'; matches: number};
+
+/**
+ * Resolve a goal reference to exactly one goal: 1-based index, full id, or
+ * unique prefix. An ambiguous prefix is an error, never a silent fallback.
+ */
+export function resolveGoalRef(
+  goals: GoalState[],
+  ref: string,
+): GoalRefResolution {
+  const trimmed = ref.trim();
+  if (/^\d+$/.test(trimmed)) {
+    const index = Number.parseInt(trimmed, 10);
+    const goal =
+      index >= 1 && index <= goals.length ? goals[index - 1] : undefined;
+    return goal ? {ok: true, goal} : {ok: false, reason: 'none', matches: 0};
+  }
+  const exact = goals.find(g => g.goalId === trimmed);
+  if (exact) return {ok: true, goal: exact};
+  const prefixed = goals.filter(g => g.goalId.startsWith(trimmed));
+  if (prefixed.length === 1) return {ok: true, goal: prefixed[0]!};
+  if (prefixed.length > 1)
+    return {ok: false, reason: 'ambiguous', matches: prefixed.length};
+  return {ok: false, reason: 'none', matches: 0};
+}
+
+const GOAL_ID_SHAPE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Split an optional leading goal ID off a free-text operand (`edit`, `checkpoint`).
+ */
+export function splitLeadingGoalId(
+  goals: GoalState[],
+  operand: string,
+): {goalId: string | null; rest: string} {
+  const space = operand.indexOf(' ');
+  if (space <= 0) return {goalId: null, rest: operand};
+  const candidate = operand.slice(0, space);
+  if (goals.some(g => g.goalId === candidate))
+    return {goalId: candidate, rest: operand.slice(space + 1)};
+  if (GOAL_ID_SHAPE.test(candidate))
+    return {goalId: candidate, rest: operand.slice(space + 1)};
+  return {goalId: null, rest: operand};
+}
+
+/**
+ * Resolves the state machine targeted by a free-text verb: either the named goal
+ * or the currently focused goal if none was named.
+ */
+export function resolveOperandMachine(
+  session: {
+    getMachine: () => GoalStateMachine | null;
+    getMachineById?: (goalId: string) => GoalStateMachine | null;
+  },
+  named: string | null,
+): {machine: GoalStateMachine | null; error?: string} {
+  if (named === null) return {machine: session.getMachine()};
+  const machine = session.getMachineById?.(named) ?? null;
+  return machine
+    ? {machine}
+    : {
+        machine: null,
+        error: `Goal ${named} could not be resolved in this session.`,
+      };
 }
 
 export {parseGoalArguments};

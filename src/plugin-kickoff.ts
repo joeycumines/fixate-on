@@ -20,10 +20,29 @@ import type {SessionStateManager} from './session-state-manager.ts';
 import type {OpenCodeSessionApi} from './session-api.ts';
 import type {GoalState} from './state-machine.ts';
 
+export interface SlashCommandResult {
+  handled: boolean;
+  ok: boolean;
+  sessionID: string;
+  args: string;
+  subcmd: string;
+  text: string;
+  receipt: string;
+  rendered: string;
+  before: GoalState | null;
+  after: GoalState | null;
+  enteredActive: boolean;
+  error?: string;
+}
+
 export interface KickoffWiring {
   kickoffTimers: Map<string, ReturnType<typeof setTimeout>>;
   clearKickoffTimer: (sessionID: string) => void;
   scheduleKickoff: (sessionID: string, goalId: string, runId: string) => void;
+  executeSlashCommand: (
+    input: {sessionID?: string; command?: string; arguments?: string},
+    options?: {skipKickoff?: boolean},
+  ) => Promise<SlashCommandResult>;
   commandExecuteBefore: (
     input: {sessionID?: string; command?: string; arguments?: string},
     output: {parts: unknown[]},
@@ -185,21 +204,41 @@ export function createKickoffWiring(args: {
     }
   };
 
-  const commandExecuteBefore = async (
+  const executeSlashCommand = async (
     input: {sessionID?: string; command?: string; arguments?: string},
-    output: {parts: unknown[]},
-  ): Promise<void> => {
-    if (!input || !input.command || !output) return;
-    if (runtime.disposed) return;
+    options?: {skipKickoff?: boolean},
+  ): Promise<SlashCommandResult> => {
+    const emptyResult = (
+      overrides: Partial<SlashCommandResult>,
+    ): SlashCommandResult => ({
+      handled: false,
+      ok: true,
+      sessionID: input?.sessionID ?? '',
+      args: '',
+      subcmd: '',
+      text: '',
+      receipt: '',
+      rendered: '',
+      before: null,
+      after: null,
+      enteredActive: false,
+      ...overrides,
+    });
+
+    if (!input || !input.command || runtime.disposed) {
+      return emptyResult({});
+    }
     if (
       typeof input.arguments !== 'string' &&
       input.arguments !== undefined &&
       input.arguments !== null
     ) {
-      output.parts = [
-        {type: 'text', text: 'Goal command arguments must be text.'},
-      ];
-      return;
+      return emptyResult({
+        handled: true,
+        ok: false,
+        rendered: 'Goal command arguments must be text.',
+        error: 'Goal command arguments must be text.',
+      });
     }
     const cmd = input.command.trim();
     let commandArgs = '';
@@ -212,7 +251,7 @@ export function createKickoffWiring(args: {
         typeof input.arguments === 'string' ? input.arguments.trim() : '';
       commandArgs = extra ? `${sub} ${extra}` : sub;
     } else {
-      return;
+      return emptyResult({});
     }
     const args = commandArgs.trim();
     const sessionID = input.sessionID ?? '';
@@ -222,14 +261,16 @@ export function createKickoffWiring(args: {
 
     const session = getSessionContext(sessionID);
     if (!session) {
-      output.parts = [
-        {
-          type: 'text',
-          text:
-            'No active goal. Set one with `/' + commandName + ' <condition>`.',
-        },
-      ];
-      return;
+      const msg =
+        'No active goal. Set one with `/' + commandName + ' <condition>`.';
+      return emptyResult({
+        handled: true,
+        ok: false,
+        sessionID,
+        args,
+        rendered: msg,
+        error: msg,
+      });
     }
 
     const beforeMachine = session.getMachine();
@@ -237,10 +278,12 @@ export function createKickoffWiring(args: {
     // Mark slash dispatch so that v1 replaying the command as a chat message can be suppressed.
     markSlashDispatch(sessionID, args);
 
-    const subcmd = args.toLowerCase().split(/\s+/)[0];
-    const {handleCommand, formatCommandHeader} = await import('./commands.ts');
+    const subcmd = args.toLowerCase().split(/\s+/)[0] ?? '';
+    const {handleCommandOutcome, formatCommandHeader} =
+      await import('./commands.ts');
     try {
-      const text = await handleCommand(args, session, commandName);
+      const outcome = await handleCommandOutcome(args, session, commandName);
+      const text = outcome.text;
       const afterCommand = session.getMachine()?.snapshot() ?? null;
       const {receipt, changed: dispatchChanged} = await transitionReceipt(
         sessionID,
@@ -251,41 +294,72 @@ export function createKickoffWiring(args: {
       // Record dispatch to prevent duplicate mutations if the host also invokes the command template.
       markCommandDispatch(sessionID, args, text, receipt, dispatchChanged);
       const header = formatCommandHeader(runtime.hasTuiCompanion, subcmd);
-      output.parts = [
-        {
-          type: 'text',
-          text: `${header}\n${text}${receipt ? `\n\n${receipt}` : ''}`,
-        },
-      ];
+      const rendered = `${header}\n${text}${receipt ? `\n\n${receipt}` : ''}`;
       // Trigger kickoff if this command transitioned the goal into an active status.
       const afterMachine = session.getMachine();
       const after = afterMachine?.snapshot() ?? null;
       const enteredActive =
+        outcome.ok &&
         after !== null &&
         after.status === 'active' &&
         (before === null ||
           before.goalId !== after.goalId ||
           before.runId !== after.runId ||
           before.status !== 'active');
-      if (enteredActive && registerCommand) {
+      if (enteredActive && registerCommand && !options?.skipKickoff) {
         scheduleKickoff(sessionID, after!.goalId, after!.runId);
+      } else if (options?.skipKickoff || after?.status !== 'active') {
+        clearKickoffTimer(sessionID);
       }
+      return {
+        handled: true,
+        ok: outcome.ok,
+        sessionID,
+        args,
+        subcmd,
+        text,
+        receipt,
+        rendered,
+        before,
+        after,
+        enteredActive,
+        ...(outcome.ok ? {} : {error: text}),
+      };
     } catch (err) {
-      output.parts = [
-        {
-          type: 'text',
-          text:
-            'Goal command error: ' +
-            (err instanceof Error ? err.message : String(err)),
-        },
-      ];
+      const message = err instanceof Error ? err.message : String(err);
+      return {
+        handled: true,
+        ok: false,
+        sessionID,
+        args,
+        subcmd,
+        text: message,
+        receipt: '',
+        rendered: 'Goal command error: ' + message,
+        before,
+        after: before,
+        enteredActive: false,
+        error: message,
+      };
     }
+  };
+
+  const commandExecuteBefore = async (
+    input: {sessionID?: string; command?: string; arguments?: string},
+    output: {parts: unknown[]},
+  ): Promise<void> => {
+    if (!input || !input.command || !output) return;
+    if (runtime.disposed) return;
+    const res = await executeSlashCommand(input, {skipKickoff: false});
+    if (!res.handled || !res.rendered) return;
+    output.parts = [{type: 'text', text: res.rendered}];
   };
 
   return {
     kickoffTimers,
     clearKickoffTimer,
     scheduleKickoff,
+    executeSlashCommand,
     commandExecuteBefore,
   };
 }

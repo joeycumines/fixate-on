@@ -6,7 +6,11 @@
  */
 
 import {AsyncLocalStorage} from 'node:async_hooks';
-import type {GoalStateMachine, PendingIntent} from './state-machine.ts';
+import type {
+  GoalState,
+  GoalStateMachine,
+  PendingIntent,
+} from './state-machine.ts';
 import type {GoalResult} from './persistence.ts';
 import type {UsageSnapshot} from './accounting.ts';
 
@@ -131,6 +135,26 @@ export interface RuntimeState {
    * Prevents competing instances from dispatching actions on owned sessions.
    */
   canDriveSession?: (sessionID: string) => boolean;
+  /** Clears any pending delayed kickoff timer for a session. */
+  clearKickoffTimer?: (sessionID: string) => void;
+  /** Executes the plugin's parsed `/goal` slash command without going through v1 chat parts. */
+  executeSlashCommand?: (
+    input: {sessionID?: string; command?: string; arguments?: string},
+    options?: {skipKickoff?: boolean},
+  ) => Promise<{
+    handled: boolean;
+    ok: boolean;
+    sessionID: string;
+    args: string;
+    subcmd: string;
+    text: string;
+    receipt: string;
+    rendered: string;
+    before: GoalState | null;
+    after: GoalState | null;
+    enteredActive: boolean;
+    error?: string;
+  }>;
   drainPersistence: (() => Promise<boolean>) | null;
   disposed: boolean;
 }

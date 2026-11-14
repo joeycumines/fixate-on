@@ -8,6 +8,45 @@
  * Dependency DAG: plugin-v2.ts -> plugin-runtime.ts (GoalsPlugin) -> hooks/loop/gate.
  */
 
+import {
+  type IdleHandledRecord,
+  type MessageBuffer,
+  type NativeAgentSpec,
+  type V2Context,
+  type V2SessionOp,
+  appendUniqueCompactionSystemParts,
+  applyV2AgentTransforms,
+  canonicalPath,
+  extractSystemPartText,
+  extractV2CreatePayload,
+  extractV2SessionIDArg,
+  extractV2UpdatePatch,
+  hasAssistantReplyContent,
+  hasBlockingBackgroundJobs,
+  isSameWorkspaceLocation,
+  latestTurnSignatureFromMessages,
+  loadZodV2,
+  normalizeV2Messages,
+  reconcileSystemParts,
+  registerV2GoalTools,
+  shouldSuppressTrailingIdle,
+  unwrapV2Data,
+} from './plugin-v2-helpers.ts';
+import {
+  type RecentKickoffTextTracker,
+  applyV2LegacyCommandUpdates,
+  assertV2CommandCanDispatch,
+  buildV2CommandKickoffDispatch,
+  createRecentKickoffTextTracker,
+  logV2DiagnosticEvent,
+  markRecentKickoffMessages,
+  validateV2CommandExecutionInput,
+} from './plugin-v2-command.ts';
+import {
+  normalizeInheritedAgentForPrompt,
+  stripAgentListSortPrefix,
+} from './agent-resolve.ts';
+import {buildContinueMessage} from './steering.ts';
 import {GoalsPlugin, type PluginOptions} from './plugin-runtime.ts';
 import type {PluginHooks} from './hooks.ts';
 import {GOAL_COMMAND_TEMPLATE_PREFIX} from './native-agent-config.ts';
@@ -20,98 +59,6 @@ import {
   encodeGoalToolMetadata,
   GOAL_TUI_METADATA_KEY,
 } from './tui-state.ts';
-
-// Define the minimal Context surface consumed from the unpublished v2 plugin SDK
-// (@opencode-ai/plugin/promise). Unknown fields are typed as `unknown` and narrowed at call sites.
-
-/** A v2 session operation: a method taking a flat input object. */
-type V2SessionOp = (input: Record<string, unknown>) => Promise<unknown>;
-
-interface V2SessionDomain {
-  prompt: V2SessionOp;
-  synthetic: V2SessionOp;
-  command: V2SessionOp;
-  create: V2SessionOp;
-  get: V2SessionOp;
-  interrupt: V2SessionOp;
-  generate: V2SessionOp;
-  hook: <N extends 'context'>(
-    name: N,
-    cb: (input: V2SessionContext) => Promise<void> | void,
-  ) => Promise<{dispose: () => Promise<void>}>;
-}
-
-/** The mutable per-turn context handed to session.hook("context"). */
-interface V2SessionContext {
-  readonly sessionID: string;
-  readonly agent: string;
-  readonly model: {id: string; providerID: string} | string;
-  system: unknown[];
-  messages: unknown[];
-  tools: Record<string, unknown>;
-}
-
-interface V2ToolDraft {
-  add(info: {
-    name: string;
-    description: string;
-    input: unknown;
-    output?: unknown;
-    options?: {codemode?: boolean; permission?: string};
-    execute: (input: unknown, ctx: unknown) => Promise<unknown> | unknown;
-  }): void;
-}
-
-interface V2ToolDomain {
-  transform: (
-    cb: (draft: V2ToolDraft) => void,
-  ) => Promise<{dispose: () => Promise<void>}>;
-}
-
-interface V2CommandDraft {
-  add?: (cmd: {name: string; template?: string; description?: string}) => void;
-
-  list(): ReadonlyArray<{name: string}>;
-
-  update(
-    name: string,
-    update: (cmd: {
-      name: string;
-      template?: string;
-      description?: string;
-      agent?: string;
-    }) => void,
-  ): void;
-}
-
-interface V2CommandDomain {
-  transform: (
-    cb: (draft: V2CommandDraft) => void,
-  ) => Promise<{dispose: () => Promise<void>}>;
-}
-
-interface V2EventDomain {
-  subscribe: () => AsyncIterable<{
-    id?: string;
-    type: string;
-    data?: Record<string, unknown>;
-  }>;
-}
-
-interface V2App {
-  readonly name?: string;
-  readonly version?: string;
-  readonly channel?: string;
-}
-
-interface V2Context {
-  readonly app: V2App;
-  readonly options: Readonly<Record<string, unknown>>;
-  readonly session: V2SessionDomain;
-  readonly event: V2EventDomain;
-  readonly tool: V2ToolDomain;
-  readonly command: V2CommandDomain;
-}
 
 /**
  * Extract the authoritative session identity from v2 event payloads.
@@ -136,37 +83,21 @@ export function getV2EventSessionID(data: unknown): string | undefined {
   return find(data, 0);
 }
 
-/**
- * In-memory message cache per session, populated by `session.hook("context")`.
- * Used because the v2 Context lacks a `message` domain or `message.list` API.
- */
-interface MessageBuffer {
-  readonly bySession: Map<string, unknown[]>;
-}
-
-/**
- * Translates v1 `{ parts: [...] }` inputs to v2 prompt formats (`{ sessionID, text, metadata? }`).
- *
- * Joins text parts with newlines and hoists `metadata["fixate-on"]` to message-level
- * metadata so it propagates across tool events and stream listeners.
- */
 export function v1PartsToV2Text(input: Record<string, unknown>): {
   sessionID?: string;
   text: string;
   metadata?: Record<string, unknown>;
   agent?: string;
 } {
-  const sessionID =
-    typeof input.sessionID === 'string' ? input.sessionID : undefined;
-  const agent =
-    typeof (input as {agent?: unknown}).agent === 'string'
-      ? (
-          input as {
-            agent: string;
-          }
-        ).agent
-      : undefined;
-  const parts = Array.isArray(input.parts) ? input.parts : [];
+  const sessionID = extractV2SessionIDArg(input);
+  const body =
+    input.body && typeof input.body === 'object' && !Array.isArray(input.body)
+      ? (input.body as Record<string, unknown>)
+      : input;
+  const rawAgent = body.agent ?? input.agent;
+  const agent = typeof rawAgent === 'string' ? rawAgent : undefined;
+  const rawParts = body.parts ?? input.parts;
+  const parts = Array.isArray(rawParts) ? rawParts : [];
   const texts: string[] = [];
   let metadata: Record<string, unknown> | undefined;
   for (const part of parts) {
@@ -231,6 +162,7 @@ export function recordV2InputDelivery(
 export async function synthesizeChatMessageFromAdmitted(
   chatMessageHook: PluginHooks['chat.message'] | undefined,
   data: Record<string, unknown>,
+  recentKickoffTexts?: RecentKickoffTextTracker,
 ): Promise<void> {
   if (typeof chatMessageHook !== 'function') return;
   const sessionID = getV2EventSessionID(data);
@@ -238,6 +170,7 @@ export async function synthesizeChatMessageFromAdmitted(
   const pendingInput = data.input as
     | {
         type?: string;
+        metadata?: Record<string, unknown>;
         data?: {text?: unknown; metadata?: Record<string, unknown>};
       }
     | undefined;
@@ -245,6 +178,11 @@ export async function synthesizeChatMessageFromAdmitted(
   const pendingData = pendingInput?.data;
   const text = typeof pendingData?.text === 'string' ? pendingData.text : '';
   if (!pendingData || !text) return;
+  const metadata = pendingData.metadata ?? pendingInput?.metadata;
+  const isSynthetic =
+    pendingType === 'synthetic' ||
+    Boolean(metadata?.[GOAL_TUI_METADATA_KEY]) ||
+    Boolean(recentKickoffTexts?.matches(sessionID, text));
   await chatMessageHook(
     {sessionID},
     {
@@ -252,8 +190,8 @@ export async function synthesizeChatMessageFromAdmitted(
         {
           type: 'text',
           text,
-          synthetic: pendingType === 'synthetic' ? true : undefined,
-          metadata: pendingData.metadata,
+          synthetic: isSynthetic ? true : undefined,
+          metadata,
         },
       ],
     },
@@ -266,6 +204,8 @@ export async function synthesizeChatMessageFromAdmitted(
 export function createV2ClientShim(
   ctx: V2Context,
   buffer: MessageBuffer,
+  onMessagesObserved?: (sessionID: string, signature: string) => void,
+  recentKickoffTexts?: RecentKickoffTextTracker,
 ): {
   session: Record<string, V2SessionOp | undefined>;
 } {
@@ -283,55 +223,149 @@ export function createV2ClientShim(
     });
   };
 
-  // Regular prompt used for genuine turns, such as child session verifiers.
+  // Regular prompt used for synchronous turns such as child-session verifiers.
+  // On v2.2.7, session.prompt admits input and runs asynchronously; wait for idle
+  // when no assistant reply parts are present and the host exposes session.wait.
   const prompt: V2SessionOp = async input => {
     const translated = v1PartsToV2Text(input);
-    return session.prompt({
-      sessionID: translated.sessionID ?? '',
+    const targetSessionID = translated.sessionID ?? '';
+    if (
+      translated.agent &&
+      targetSessionID &&
+      typeof session.switchAgent === 'function'
+    ) {
+      await session
+        .switchAgent({sessionID: targetSessionID, agent: translated.agent})
+        .catch(() => {});
+    }
+    const res = await session.prompt({
+      sessionID: targetSessionID,
       text: translated.text,
       ...(translated.metadata ? {metadata: translated.metadata} : {}),
       ...(translated.agent ? {agent: translated.agent} : {}),
     });
+    if (
+      !hasAssistantReplyContent(res) &&
+      targetSessionID &&
+      typeof session.wait === 'function'
+    ) {
+      await session.wait({sessionID: targetSessionID});
+    }
+    return res;
   };
 
   const abort: V2SessionOp = async input => {
-    const sessionID = (input as {sessionID?: string})?.sessionID;
+    const sessionID = extractV2SessionIDArg(input);
     if (!sessionID) return {};
     return session.interrupt({sessionID});
   };
 
   const create: V2SessionOp = async input => {
-    // The v2 host strips parentID during session creation. Fail fast rather than
-    // silently creating an unparented session that callers assume is a fork.
-    if (typeof input.parentID === 'string' && input.parentID.length > 0) {
-      throw new Error(
-        'parent-bound session creation unsupported by v2 host; no fork performed',
-      );
+    const createInput = extractV2CreatePayload(input);
+    const hasParentID =
+      typeof createInput.parentID === 'string' &&
+      createInput.parentID.length > 0;
+    const locationDir =
+      typeof ctx.location?.directory === 'string' &&
+      ctx.location.directory.trim()
+        ? ctx.location.directory.trim()
+        : undefined;
+    const payload =
+      !hasParentID && createInput.location === undefined && locationDir
+        ? {...createInput, location: {directory: locationDir}}
+        : {...createInput};
+    const raw = await session.create(payload);
+    if (hasParentID) {
+      const created = unwrapV2Data(raw);
+      const createdParentID =
+        created && typeof created === 'object'
+          ? (created as {parentID?: unknown}).parentID
+          : undefined;
+      if (createdParentID !== createInput.parentID) {
+        const createdID =
+          created && typeof created === 'object'
+            ? (created as {id?: unknown}).id
+            : undefined;
+        if (
+          typeof createdID === 'string' &&
+          createdID &&
+          typeof session.remove === 'function'
+        ) {
+          await session.remove({sessionID: createdID}).catch(() => {});
+        }
+        throw new Error(
+          'parent-bound session creation unsupported by v2 host; no fork performed',
+        );
+      }
     }
-    return session.create({...input});
+    return raw;
   };
 
-  const get: V2SessionOp = async input => session.get({...input});
-
-  // Destructive deletion is not exposed in the v2 pick; throw rather than aliasing interrupt.
-  const remove: V2SessionOp = async () => {
-    throw new Error('session deletion unsupported by v2 host');
+  const get: V2SessionOp = async input => {
+    const sessionID = extractV2SessionIDArg(input);
+    return session.get(sessionID ? {sessionID} : {...input});
   };
 
-  const unsupported: V2SessionOp = async () => {
-    throw new Error('session operation unsupported by v2 adapter');
+  const remove: V2SessionOp = async input => {
+    if (typeof session.remove !== 'function') {
+      throw new Error('session deletion unsupported by v2 host');
+    }
+    const sessionID = extractV2SessionIDArg(input);
+    if (!sessionID) {
+      throw new TypeError('sessionID is required for session deletion');
+    }
+    const res = await session.remove({sessionID});
+    return res ?? {};
+  };
+
+  const update: V2SessionOp = async input => {
+    if (typeof session.update !== 'function') {
+      throw new Error('session operation unsupported by v2 adapter');
+    }
+    const sessionID = extractV2SessionIDArg(input);
+    if (!sessionID) {
+      throw new TypeError('sessionID is required for session update');
+    }
+    const patch = extractV2UpdatePatch(input);
+    const res = await session.update({...patch, sessionID});
+    return res ?? {};
   };
 
   const messages: V2SessionOp = async input => {
-    const sessionID = (input as {sessionID?: string})?.sessionID;
-    const limit = (input as {limit?: number})?.limit;
+    const sessionID = extractV2SessionIDArg(input);
+    const rawLimit =
+      (input as {limit?: unknown; query?: {limit?: unknown}})?.limit ??
+      (input as {query?: {limit?: unknown}})?.query?.limit;
+    const limit = typeof rawLimit === 'number' ? rawLimit : undefined;
     if (!sessionID) return [];
-    const all = buffer.bySession.get(sessionID) ?? [];
+    let rawList: unknown[] | undefined;
+    if (typeof session.context === 'function') {
+      try {
+        const ctxResult = await session.context({sessionID});
+        const unwrapped = unwrapV2Data(ctxResult);
+        if (Array.isArray(unwrapped)) {
+          rawList = unwrapped;
+        }
+      } catch {
+        /* fall back to pre-turn buffer if context endpoint is unavailable */
+      }
+    }
+    const sourceList = rawList ?? buffer.bySession.get(sessionID) ?? [];
+    const normalized = markRecentKickoffMessages(
+      normalizeV2Messages(sourceList),
+      sessionID,
+      GOAL_TUI_METADATA_KEY,
+      recentKickoffTexts,
+    );
+    onMessagesObserved?.(
+      sessionID,
+      latestTurnSignatureFromMessages(normalized),
+    );
     const start =
       typeof limit === 'number' && limit > 0
-        ? Math.max(0, all.length - limit)
+        ? Math.max(0, normalized.length - limit)
         : 0;
-    return all.slice(start);
+    return normalized.slice(start);
   };
 
   return {
@@ -342,40 +376,13 @@ export function createV2ClientShim(
       create,
       get,
       delete: remove,
-      update: unsupported,
+      update,
       messages,
     },
   };
 }
 
 const MESSAGE_BUFFER_CAP = 100;
-
-type ZodModule = typeof import('zod');
-
-async function logToolRegistrationFailure(
-  stage: string,
-  error: unknown,
-): Promise<void> {
-  const eventLogPath = process.env.FIXATE_ON_EVENT_LOG;
-  if (!eventLogPath) return;
-  try {
-    const {appendFileSync} = await import('node:fs');
-    appendFileSync(
-      eventLogPath,
-      `${Date.now()} tool-registration-${stage} ${error instanceof Error ? `${error.name}: ${error.message}` : String(error)}\n`,
-    );
-  } catch {
-    /* diagnostics must never throw */
-  }
-}
-
-async function loadZodV2(): Promise<ZodModule | null> {
-  try {
-    return await import('zod');
-  } catch {
-    return null;
-  }
-}
 
 /**
  * Normalizes tool execution results into opencode v2's `Tool.Result` schema.
@@ -407,35 +414,15 @@ export function shapeToolResult(
   return goalMetadata ? {content: '', metadata: goalMetadata} : {content: ''};
 }
 
-/**
- * Builds a v2 `Tool.Info.input` ValueSchema from a v1 Zod field map.
- *
- * Core checks for Standard Schema (`"~standard" in schema`) when generating JSON
- * Schema for models. Wrapping raw Zod field maps in `z.object(...)` prevents core
- * from exposing raw Zod internals (`_def`, `_parse`) to the model.
- */
-function buildToolInputSchema(
-  z: ZodModule | null,
-  args: Record<string, unknown> | undefined,
-): unknown {
-  const hasFieldMap =
-    args && typeof args === 'object' && Object.keys(args).length > 0;
-  if (z && hasFieldMap) {
-    return z.object(args);
-  }
-  if (z) {
-    return z.object({});
-  }
-  return {type: 'object', properties: {}};
-}
-
 export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
   // Bridge TUI sync over tool execution results. Since v2 lacks a direct server-to-TUI
   // push channel, buffered state events are drained into Result.metadata, which
   // core broadcasts over `session.tool.success`.
   const tuiTransport = createBufferingTransport();
+  const rawOptions = ctx.options as PluginOptions;
   const pluginOptions: PluginOptions = {
-    ...(ctx.options as PluginOptions),
+    ...rawOptions,
+    sdkShape: rawOptions?.sdkShape ?? 'flat',
     tuiTransport: tuiTransport.publish,
   };
 
@@ -447,14 +434,28 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
     buffer.bySession.set(sessionID, next);
   };
 
-  // Fall back to cwd only if workspaceDirectory is omitted. The v2 plugin Context
-  // omits the host workspace directory, so using cwd directly when running from source
-  // risks targeting the repository checkout instead of the campaign directory.
-  const client = createV2ClientShim(ctx, buffer);
+  // Track per-session idle turn state across experimental.idle and event streams.
+  const idleStateBySession = new Map<string, IdleHandledRecord>();
+  const lastObservedTurnBySession = new Map<string, string>();
+  const recentKickoffTexts = createRecentKickoffTextTracker();
+  let idleSeq = 0;
+
+  // Resolve workspace directory: explicit plugin option > host ctx.location.directory > cwd.
+  const client = createV2ClientShim(
+    ctx,
+    buffer,
+    (sessionID, signature) => {
+      lastObservedTurnBySession.set(sessionID, signature);
+    },
+    recentKickoffTexts,
+  );
   const directory =
     (typeof pluginOptions.workspaceDirectory === 'string' &&
       pluginOptions.workspaceDirectory.trim()) ||
+    (typeof ctx.location?.directory === 'string' &&
+      ctx.location.directory.trim()) ||
     (typeof process.cwd === 'function' ? process.cwd() : undefined);
+  const resolvedDirectory = directory ? canonicalPath(directory) : undefined;
   const v1Result = await GoalsPlugin({client, directory}, pluginOptions);
   const hooks = v1Result as PluginHooks & {
     tool?: Record<string, unknown>;
@@ -489,38 +490,23 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
           /* best-effort diagnostics */
         }
 
-        // Apply system transformations through v1 hooks and reconstruct structured SystemPart objects.
+        // Apply system transformations through v1 hooks and reconcile back onto native SystemPart objects.
         try {
           const nativeSystem = Array.isArray(input.system)
             ? input.system.slice()
             : [];
-          const v1System = nativeSystem.map(part => {
-            if (typeof part === 'string') return part;
-            if (
-              part &&
-              typeof part === 'object' &&
-              typeof (part as {text?: unknown}).text === 'string'
-            ) {
-              return (part as {text: string}).text;
-            }
-            return '';
-          });
+          const systemOutput = {
+            system: nativeSystem.map(extractSystemPartText),
+          };
           await hooks['experimental.chat.system.transform']?.(
             {sessionID},
-            {system: v1System},
+            systemOutput,
           );
-          if (v1System.length > nativeSystem.length) {
-            const injected = v1System
-              .slice(0, v1System.length - nativeSystem.length)
-              .filter(text => text.length > 0);
-            input.system = [
-              ...injected.map(text => ({type: 'text', text})),
-              ...nativeSystem,
-            ];
-          } else if (v1System.length !== nativeSystem.length) {
-            input.system = v1System.map(text => ({type: 'text', text}));
-          } else {
-            input.system = nativeSystem;
+          if (Array.isArray(systemOutput.system)) {
+            input.system = reconcileSystemParts(
+              nativeSystem,
+              systemOutput.system,
+            );
           }
         } catch {
           /* best-effort system prompt injection */
@@ -529,6 +515,77 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
       disposers.push(() => reg.dispose());
     } catch {
       /* context hook unavailable; fallback to event subscription */
+    }
+
+    // Bridge 1b: session.hook("compaction") -> experimental.session.compacting
+    try {
+      const reg = await ctx.session.hook('compaction', async input => {
+        if (!input?.sessionID) return;
+        try {
+          const compactOutput: {parts: unknown[]} = {parts: []};
+          await hooks['experimental.session.compacting']?.(
+            {sessionID: input.sessionID},
+            compactOutput,
+          );
+          const candidateTexts = compactOutput.parts
+            .map(extractSystemPartText)
+            .filter(text => text.length > 0);
+          if (candidateTexts.length === 0) return;
+          const nativeSystem = Array.isArray(input.system)
+            ? input.system.slice()
+            : [];
+          input.system = appendUniqueCompactionSystemParts(
+            nativeSystem,
+            candidateTexts,
+          );
+        } catch {
+          /* best-effort compaction context injection */
+        }
+      });
+      disposers.push(() => reg.dispose());
+    } catch {
+      /* compaction hook unavailable on older hosts */
+    }
+
+    // Bridge 1c: session.hook("experimental.idle") -> in-loop continuation before host Complete()
+    try {
+      const reg = await ctx.session.hook('experimental.idle', async input => {
+        if (!input?.sessionID) return;
+        const sessionID = input.sessionID;
+        if (hasBlockingBackgroundJobs(input.background, sessionID)) {
+          idleStateBySession.set(sessionID, {
+            turnSignature: lastObservedTurnBySession.get(sessionID) ?? '',
+            ts: Date.now(),
+            backgroundBlocked: true,
+          });
+          return;
+        }
+        const preSignature = lastObservedTurnBySession.get(sessionID) ?? '';
+        idleStateBySession.set(sessionID, {
+          turnSignature: preSignature,
+          ts: Date.now(),
+          backgroundBlocked: false,
+        });
+        try {
+          await hooks.event?.({
+            type: 'session.idle',
+            sessionID,
+            id: `v2-exp-idle:${sessionID}:${++idleSeq}`,
+            properties: {},
+          });
+        } finally {
+          const postSignature =
+            lastObservedTurnBySession.get(sessionID) ?? preSignature;
+          idleStateBySession.set(sessionID, {
+            turnSignature: postSignature,
+            ts: Date.now(),
+            backgroundBlocked: false,
+          });
+        }
+      });
+      disposers.push(() => reg.dispose());
+    } catch {
+      /* experimental.idle unavailable on older hosts; event stream handles fallback */
     }
   }
 
@@ -539,7 +596,12 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
     stopEventLoopResolve = resolve;
   });
   let eventIterator:
-    | AsyncIterator<{id?: string; type: string; data?: Record<string, unknown>}>
+    | AsyncIterator<{
+        id?: string;
+        type: string;
+        location?: {directory?: string; workspaceID?: string} | null;
+        data?: Record<string, unknown>;
+      }>
     | undefined;
   const eventLoop = (async () => {
     if (typeof ctx.event?.subscribe !== 'function') return;
@@ -557,6 +619,7 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
               ({done: true, value: undefined}) as IteratorResult<{
                 id?: string;
                 type: string;
+                location?: {directory?: string; workspaceID?: string} | null;
                 data?: Record<string, unknown>;
               }>,
           ),
@@ -564,6 +627,7 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
         if (result.done) break;
         const ev = result.value;
         if (!ev || typeof ev.type !== 'string') continue;
+        if (!isSameWorkspaceLocation(ev.location, resolvedDirectory)) continue;
         const data = ev.data ?? {};
         const sessionID = getV2EventSessionID(data);
         if (eventLogPath) {
@@ -595,12 +659,33 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
               await synthesizeChatMessageFromAdmitted(
                 hooks['chat.message'],
                 data,
+                recentKickoffTexts,
               );
             } catch {
               /* steering failures must not break the event loop */
             }
           }
         }
+        if (
+          (ev.type === 'session.step.started' ||
+            ev.type === 'session.execution.started') &&
+          sessionID
+        ) {
+          idleStateBySession.delete(sessionID);
+        }
+        if (
+          ev.type === 'session.execution.succeeded' &&
+          sessionID &&
+          shouldSuppressTrailingIdle(
+            idleStateBySession,
+            sessionID,
+            lastObservedTurnBySession.get(sessionID) ?? '',
+            Date.now(),
+          )
+        ) {
+          continue;
+        }
+
         // Record inbox delivery mode on released 2.x (through v2.2.5), which emits
         // session.inbox.enqueued / delivery.changed instead of session.input.*.
         if (
@@ -633,125 +718,141 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
     hooks.tool &&
     typeof hooks.tool === 'object'
   ) {
-    const registeredNames = new Set<string>();
-    const registerTools = async (): Promise<void> => {
-      const attemptNames = new Set<string>();
-      const reg = await ctx.tool.transform(draft => {
-        for (const [name, def] of Object.entries(
-          hooks.tool as Record<string, unknown>,
-        )) {
-          if (!def || typeof def !== 'object') continue;
-          if (registeredNames.has(name)) continue;
-          const tool = def as {
-            description?: string;
-            args?: Record<string, unknown>;
-            execute?: (
-              args: Record<string, unknown>,
-              ctx: {sessionID: string},
-            ) => Promise<unknown> | unknown;
-          };
-          if (typeof tool.execute !== 'function') continue;
-          try {
-            draft.add({
-              name,
-              description:
-                typeof tool.description === 'string'
-                  ? tool.description
-                  : `${name} (fixate-on)`,
-              input: buildToolInputSchema(z, tool.args),
-              // Mark tools codemode:false so agents can execute them directly rather
-              // than through the CodeMode wrapper.
-              options: {codemode: false},
-              execute: async (input: unknown, execCtx: unknown) => {
-                const sid =
-                  (execCtx as {sessionID?: string} | null)?.sessionID ?? '';
-                const result = await tool.execute!(
-                  (input ?? {}) as Record<string, unknown>,
-                  {sessionID: sid},
-                );
-                const events = sid ? tuiTransport.drain(sid) : [];
-                const goalMeta = encodeGoalToolMetadata(events);
-                return shapeToolResult(result, goalMeta);
-              },
-            });
-            attemptNames.add(name);
-          } catch (error) {
-            console.error(
-              `[fixate-on] failed to register tool "${name}":`,
-              error instanceof Error ? error.message : error,
-            );
-          }
-        }
-      });
-      disposers.push(() => reg.dispose());
-      for (const name of attemptNames) registeredNames.add(name);
-    };
-
-    try {
-      await registerTools();
-    } catch (error) {
-      console.error(
-        '[fixate-on] tool registration failed (attempt 1):',
-        error instanceof Error ? error.message : error,
-      );
-      await logToolRegistrationFailure('attempt-1', error);
-      try {
-        await registerTools();
-        console.error('[fixate-on] tool registration succeeded on retry');
-      } catch (retryError) {
-        console.error(
-          '[fixate-on] tool registration FAILED after retry — goal tools are UNAVAILABLE:',
-          retryError instanceof Error ? retryError.message : retryError,
-        );
-        await logToolRegistrationFailure('retry-exhausted', retryError);
-      }
-    }
+    await registerV2GoalTools({
+      toolTransform: ctx.tool.transform,
+      tools: hooks.tool as Record<string, unknown>,
+      z,
+      drainTuiEvents: sid => tuiTransport.drain(sid),
+      encodeMetadata: events =>
+        encodeGoalToolMetadata(
+          events as Parameters<typeof encodeGoalToolMetadata>[0],
+        ),
+      shapeResult: shapeToolResult,
+      disposers,
+    });
   }
 
-  // Bridge 4: Route generated `/goal` command templates through deterministic goal tools.
-  if (typeof ctx.command?.transform === 'function') {
+  // Bridge 4: Register native `/goal` command on add-only CommandEditor hosts (overriding
+  // built-in `opencode.goal`, while letting post-plugin `commands.goal` config take precedence
+  // when configured), or fall back to template rewriting on older `update`-only hosts.
+  const commandName =
+    (typeof pluginOptions.commandName === 'string' &&
+      pluginOptions.commandName.trim().replace(/^\/+/, '').trim()) ||
+    'goal';
+  if (
+    pluginOptions.registerCommand !== false &&
+    typeof ctx.command?.transform === 'function'
+  ) {
     try {
       const reg = await ctx.command.transform(draft => {
-        // Skip silently if the host uses an add-only CommandEditor without an update API.
-        if (typeof (draft as {update?: unknown}).update !== 'function') return;
-        const commandNames = [
-          'goal',
-          'goal status',
-          'goal history',
-          'goal pause',
-          'goal resume',
-          'goal clear',
-          'goal list',
-          'goal focus',
-          'goal edit',
-          'goal checkpoint',
-          'goal add',
-          'goal sequence',
-        ];
-        for (const name of commandNames) {
-          (
-            draft as {
-              update: (
-                name: string,
-                edit: (command: Record<string, unknown>) => void,
-              ) => void;
-            }
-          ).update(name, command => {
-            const argument =
-              name === 'goal'
-                ? '$ARGUMENTS'
-                : `${name.slice(5)} $ARGUMENTS`.trim();
-            command.template =
-              `${GOAL_COMMAND_TEMPLATE_PREFIX} ${argument}\n` +
-              'Do not summarize, do not ask for confirmation, and do not perform any other work. Reply with only the tool output.';
-            delete command.agent;
+        if (typeof draft.add === 'function') {
+          draft.add({
+            name: commandName,
+            description:
+              'Set or manage the persistent thread goal [status|pause|resume|clear|list|history]',
+            execute: async input => {
+              const {sessionID, rawArgs, prompt, hasAttachments, delivery} =
+                validateV2CommandExecutionInput(input);
+              if (!rawArgs && hasAttachments) {
+                throw new Error(
+                  `No objective provided. Use \`/${commandName} <condition>\` to set a goal.`,
+                );
+              }
+              const runner = hooks.runtime?.executeSlashCommand;
+              if (typeof runner !== 'function') {
+                throw new Error('Goal command runner is unavailable.');
+              }
+              const res = await runner(
+                {sessionID, command: commandName, arguments: rawArgs},
+                {skipKickoff: true},
+              );
+              hooks.runtime?.clearKickoffTimer?.(sessionID);
+              assertV2CommandCanDispatch({
+                sessionID,
+                rawArgs,
+                hasAttachments,
+                commandName,
+                res,
+                canDriveSession: hooks.runtime?.canDriveSession?.(sessionID),
+              });
+              logV2DiagnosticEvent(
+                `command.transform ${sessionID} cmd=${res.subcmd || 'status'} enteredActive=${String(res.enteredActive)}`,
+              );
+              if (!res.enteredActive || !res.after) return;
+              const inherited = normalizeInheritedAgentForPrompt(
+                res.after.executionContext?.agent,
+              );
+              const dispatch = buildV2CommandKickoffDispatch({
+                sessionID,
+                goalID: res.after.goalId,
+                condition: res.after.condition,
+                kickoffText: buildContinueMessage(res.after, {}),
+                tuiMetadataKey: GOAL_TUI_METADATA_KEY,
+                prompt,
+                hasAttachments,
+                delivery,
+                resolvedAgent: inherited
+                  ? stripAgentListSortPrefix(inherited)
+                  : undefined,
+              });
+              if (dispatch.method === 'prompt') {
+                recentKickoffTexts.record(
+                  sessionID,
+                  String(dispatch.payload.text ?? ''),
+                );
+                await ctx.session.prompt(dispatch.payload);
+                return;
+              }
+              await ctx.session.synthetic(dispatch.payload);
+            },
           });
+          return;
         }
+        if (typeof (draft as {update?: unknown}).update !== 'function') return;
+        applyV2LegacyCommandUpdates(
+          draft as {
+            update: (
+              name: string,
+              edit: (command: Record<string, unknown>) => void,
+            ) => void;
+          },
+          commandName,
+          GOAL_COMMAND_TEMPLATE_PREFIX,
+        );
       });
       disposers.push(() => reg.dispose());
     } catch {
       /* optional command transform on older hosts */
     }
+  }
+
+  // Bridge 5: Register `goal` and read-only `goal-verify` agents on OpenCode v2 so
+  // child-session completion verification has its dedicated hidden subagent without
+  // manual opencode.json agent configuration.
+  if (typeof ctx.agent?.transform === 'function') {
+    const configDraft: Record<string, unknown> = {};
+    await hooks.config?.(configDraft);
+    const goalAgentName =
+      (typeof pluginOptions.goalAgentName === 'string' &&
+        pluginOptions.goalAgentName.trim()) ||
+      'goal';
+    const verifierAgentName =
+      (typeof pluginOptions.verifierAgentName === 'string' &&
+        pluginOptions.verifierAgentName.trim()) ||
+      'goal-verify';
+    const agentReg = await ctx.agent.transform(draft =>
+      applyV2AgentTransforms(
+        draft,
+        configDraft.agent as Record<string, NativeAgentSpec> | undefined,
+        {
+          goalAgentName,
+          verifierAgentName,
+          registerAgents: pluginOptions.registerAgents !== false,
+          requireVerifierOwnership: pluginOptions.childSessionJudge !== false,
+        },
+      ),
+    );
+    disposers.push(() => agentReg.dispose());
   }
 
   // Teardown: stop event loop, deregister v2 extensions, then run v1 disposal (draining WAL and releasing leases).
@@ -765,6 +866,7 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
     }
     try {
       tuiTransport.clear();
+      recentKickoffTexts.clear();
     } catch {
       /* best-effort transport cleanup */
     }

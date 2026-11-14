@@ -11,6 +11,7 @@ import {trackTokenUsage} from './hooks-usage.ts';
 import {executeDecision} from './hooks-decision.ts';
 import {
   assistantTurnKey,
+  chronologicalMessages,
   detectRepetitiveDegeneration,
   findLatestAssistantMessage,
   getMessageDelivery,
@@ -18,6 +19,7 @@ import {
   getTextFromParts,
   getThinkingTokens,
   messageHasToolCall,
+  sliceCurrentCycleMessages,
   windowHasToolCallNewerThan,
 } from './message-helpers.ts';
 import {
@@ -90,7 +92,9 @@ export async function processIdleEvent(
     const hostMessages = await deps.sessionApi.messages(sessionID, {
       limit: deps.defaultOpts?.maxRecentMessages ?? 50,
     });
-    messages = Array.isArray(hostMessages) ? hostMessages : [];
+    messages = chronologicalMessages(
+      Array.isArray(hostMessages) ? hostMessages : [],
+    );
   } catch (error) {
     await deps.logError(
       'Failed to fetch session messages for continuation',
@@ -134,27 +138,30 @@ export async function processIdleEvent(
   const latestOutputTokens = latestAssistant
     ? outputTokensForMessage(latestAssistant)
     : null;
-
-  // Evaluate whether the agent executed any tools during this cycle.
-  // On v1, tool-using cycles conclude with a text-only summary, so inspecting
-  // only the newest message can yield a false negative. We inspect recent messages
-  // since the last counted turn to detect any intermediate tool calls.
-  // On ID-less hosts, `lastNoToolCallMessageID` is a `#<created>` turn key; the helper
-  // handles this gracefully by accepting the tool call if either identifier is unusable.
-  const windowHasToolCall = windowHasToolCallNewerThan(
-    messages,
-    goal.lastNoToolCallMessageID ?? '',
-  );
-  const latestHasToolCall =
-    messageHasToolCall(latestAssistant) || windowHasToolCall;
   const latestHasThinkingTokens = getThinkingTokens(latestAssistant) > 0;
   const previousAssistantText = goal.lastAssistantText;
   const assistantChanged =
     summarizeText(latestText, 200) !==
     summarizeText(previousAssistantText, 200);
   const latestAssistantID = getMessageID(latestAssistant);
-  const assistantRepeated =
-    latestAssistantID && latestAssistantID === goal.lastAssistantMessageID;
+  const assistantRepeated = Boolean(
+    latestAssistantID && latestAssistantID === goal.lastAssistantMessageID,
+  );
+
+  // Evaluate whether the agent executed any tools during THIS cycle only.
+  // Restricting the scan to messages after the prior turn / prompt boundary
+  // ensures a historical tool call cannot suppress `noToolCallTurns` forever.
+  const cycleMessages = sliceCurrentCycleMessages(messages, {
+    lastNoToolCallMessageID: goal.lastNoToolCallMessageID,
+    lastAssistantMessageID: goal.lastAssistantMessageID,
+    assistantRepeated,
+  });
+  const windowHasToolCall = windowHasToolCallNewerThan(
+    cycleMessages,
+    goal.lastNoToolCallMessageID ?? '',
+  );
+  const latestHasToolCall =
+    messageHasToolCall(latestAssistant) || windowHasToolCall;
 
   // Track turns rather than raw idle ticks. The idle handler fires repeatedly on the
   // same message during polling cycles, so state changes are keyed by turn identity
@@ -268,7 +275,16 @@ export async function processIdleEvent(
   const runtimeSteered = deps.runtime?.steeredInputMessageIDs?.get(sessionID);
   const surfacedQueued = deps.runtime?.surfacedQueuedMessageIDs?.get(sessionID);
   for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i] as {info?: {role?: string}; role?: string} | null;
+    const msg = messages[i] as {
+      info?: {
+        role?: string;
+        synthetic?: boolean;
+        metadata?: Record<string, unknown>;
+      };
+      role?: string;
+      synthetic?: boolean;
+      metadata?: Record<string, unknown>;
+    } | null;
     if (!msg) continue;
     const role = msg.info?.role ?? msg.role;
     if (role === 'assistant' || role === 'agent') break;
@@ -277,16 +293,23 @@ export async function processIdleEvent(
       (msg as {parts?: unknown[]}).parts ??
       (msg.info as {parts?: unknown[]} | undefined)?.parts ??
       [];
-    const injected = parts.some(p => {
-      const part = p as {
-        synthetic?: boolean;
-        metadata?: Record<string, unknown>;
-      } | null;
-      return (
-        part?.synthetic === true ||
-        Boolean(part?.metadata?.[GOAL_TUI_METADATA_KEY])
-      );
-    });
+    const msgInjected =
+      msg.synthetic === true ||
+      msg.info?.synthetic === true ||
+      Boolean(msg.metadata?.[GOAL_TUI_METADATA_KEY]) ||
+      Boolean(msg.info?.metadata?.[GOAL_TUI_METADATA_KEY]);
+    const injected =
+      msgInjected ||
+      parts.some(p => {
+        const part = p as {
+          synthetic?: boolean;
+          metadata?: Record<string, unknown>;
+        } | null;
+        return (
+          part?.synthetic === true ||
+          Boolean(part?.metadata?.[GOAL_TUI_METADATA_KEY])
+        );
+      });
     if (injected) continue;
     const text = getTextFromParts(parts);
     if (!text) continue;

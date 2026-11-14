@@ -765,7 +765,11 @@ export async function GoalsPlugin(
       registerCommand,
       kickoffDelayMs: pluginOptions.kickoffDelayMs,
     });
-    const {kickoffTimers, scheduleKickoff} = kickoff;
+    const {kickoffTimers, scheduleKickoff, clearKickoffTimer} = kickoff;
+    runtime.clearKickoffTimer = kickoff.clearKickoffTimer;
+    if (registerCommand) {
+      runtime.executeSlashCommand = kickoff.executeSlashCommand;
+    }
 
     const hooks = createHooks({
       getSessionContext,
@@ -902,6 +906,8 @@ export async function GoalsPlugin(
                 before.status !== 'active');
             if (enteredActive) {
               scheduleKickoff(sessionID, after.goalId, after.runId);
+            } else if (after?.status !== 'active') {
+              clearKickoffTimer(sessionID);
             }
             return receipt ? `${result}\n\n${receipt}` : result;
           },
@@ -914,6 +920,8 @@ export async function GoalsPlugin(
       async () => {
         if (runtime.disposed) return;
         runtime.disposed = true;
+        runtime.executeSlashCommand = undefined;
+        runtime.clearKickoffTimer = undefined;
         runtime.recoveryPendingSessions.clear();
         runtime.queuedInputMessageIDs.clear();
         runtime.steeredInputMessageIDs.clear();

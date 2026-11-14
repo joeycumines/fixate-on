@@ -1,0 +1,345 @@
+/**
+ * Bridge 4 command/kickoff dispatch helpers for the OpenCode v2 plugin adapter.
+ *
+ * Kept as a leaf module (depends only on node:fs) so `plugin-v2.ts` and
+ * `plugin-v2-helpers.ts` stay focused and cohesive without circular imports.
+ */
+
+import {appendFileSync} from 'node:fs';
+
+export interface V2CommandExecutionInput {
+  readonly sessionID: string;
+  readonly prompt?: {
+    readonly text?: unknown;
+    readonly files?: unknown[];
+    readonly agents?: unknown[];
+    readonly skills?: unknown[];
+  };
+  readonly delivery?: unknown;
+}
+
+/** Validates and extracts command input passed by v2 `CommandEditor.add` `execute`. */
+export function validateV2CommandExecutionInput(input: unknown): {
+  sessionID: string;
+  rawArgs: string;
+  prompt?: Record<string, unknown>;
+  hasAttachments: boolean;
+  delivery?: string;
+} {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    throw new Error('Goal command input is required.');
+  }
+  const obj = input as V2CommandExecutionInput;
+  const sessionID =
+    typeof obj.sessionID === 'string' ? obj.sessionID.trim() : '';
+  if (!sessionID) {
+    throw new Error('Goal command requires an active session.');
+  }
+  let promptObj: Record<string, unknown> | undefined;
+  if (obj.prompt !== undefined && obj.prompt !== null) {
+    if (typeof obj.prompt !== 'object' || Array.isArray(obj.prompt)) {
+      throw new Error('Goal command prompt must be an object.');
+    }
+    promptObj = obj.prompt as Record<string, unknown>;
+  }
+  const rawText = promptObj?.text;
+  if (
+    rawText !== undefined &&
+    rawText !== null &&
+    typeof rawText !== 'string'
+  ) {
+    throw new Error('Goal command arguments must be text.');
+  }
+  const rawArgs = typeof rawText === 'string' ? rawText.trim() : '';
+  let hasAttachments = false;
+  if (promptObj) {
+    for (const key of ['files', 'agents', 'skills'] as const) {
+      const items = promptObj[key];
+      if (items === undefined || items === null) continue;
+      if (!Array.isArray(items)) {
+        throw new Error(`Goal command prompt.${key} must be an array.`);
+      }
+      if (items.length > 0) hasAttachments = true;
+    }
+  }
+  const delivery =
+    typeof obj.delivery === 'string' && obj.delivery.length > 0
+      ? obj.delivery
+      : undefined;
+  return {sessionID, rawArgs, prompt: promptObj, hasAttachments, delivery};
+}
+
+/** Command names rewritten by the legacy `CommandEditor.update` fallback. */
+export function buildV2CommandLegacyNames(commandName: string): string[] {
+  return [
+    commandName,
+    `${commandName} status`,
+    `${commandName} history`,
+    `${commandName} pause`,
+    `${commandName} resume`,
+    `${commandName} clear`,
+    `${commandName} list`,
+    `${commandName} focus`,
+    `${commandName} edit`,
+    `${commandName} checkpoint`,
+    `${commandName} add`,
+    `${commandName} sequence`,
+  ];
+}
+
+/** Appends a diagnostic line to `FIXATE_ON_EVENT_LOG` when configured. */
+export function logV2DiagnosticEvent(line: string): void {
+  const eventLogPath = process.env.FIXATE_ON_EVENT_LOG;
+  if (!eventLogPath) return;
+  try {
+    appendFileSync(eventLogPath, `${Date.now()} ${line}\n`);
+  } catch {
+    /* diagnostics must never throw */
+  }
+}
+
+/**
+ * Builds the `session.prompt` or `session.synthetic` dispatch payload for an
+ * activating `/goal` command run via v2 `CommandEditor.add`.
+ */
+export function buildV2CommandKickoffDispatch(args: {
+  sessionID: string;
+  goalID: string;
+  condition: string;
+  kickoffText: string;
+  tuiMetadataKey: string;
+  prompt?: Record<string, unknown>;
+  hasAttachments: boolean;
+  delivery?: string;
+  resolvedAgent?: string;
+}): {
+  method: 'prompt' | 'synthetic';
+  payload: Record<string, unknown>;
+} {
+  const kickoffMetadata = {
+    [args.tuiMetadataKey]: {kind: 'kickoff', goalID: args.goalID},
+    source: 'goal',
+    goalID: args.goalID,
+  };
+  const deliveryOpt = args.delivery ? {delivery: args.delivery} : {};
+  const agentOpt = args.resolvedAgent ? {agent: args.resolvedAgent} : {};
+  if (args.hasAttachments) {
+    const filesOpt =
+      Array.isArray(args.prompt?.files) && args.prompt.files.length > 0
+        ? {files: args.prompt.files}
+        : {};
+    const agentsOpt =
+      Array.isArray(args.prompt?.agents) && args.prompt.agents.length > 0
+        ? {agents: args.prompt.agents}
+        : {};
+    const skillsOpt =
+      Array.isArray(args.prompt?.skills) && args.prompt.skills.length > 0
+        ? {skills: args.prompt.skills}
+        : {};
+    return {
+      method: 'prompt',
+      payload: {
+        ...filesOpt,
+        ...agentsOpt,
+        ...skillsOpt,
+        sessionID: args.sessionID,
+        text: args.kickoffText,
+        metadata: kickoffMetadata,
+        ...deliveryOpt,
+        ...agentOpt,
+      },
+    };
+  }
+  const summary = args.condition.replace(/\s+/g, ' ').trim();
+  const description =
+    summary.length > 119
+      ? `Goal: ${summary.slice(0, 118)}…`
+      : `Goal: ${summary}`;
+  return {
+    method: 'synthetic',
+    payload: {
+      sessionID: args.sessionID,
+      text: args.kickoffText,
+      description,
+      metadata: kickoffMetadata,
+      ...deliveryOpt,
+      ...agentOpt,
+    },
+  };
+}
+
+export interface RecentKickoffTextTracker {
+  record(sessionID: string, text: string, now?: number): void;
+  matches(sessionID: string, text: string, now?: number): boolean;
+  clear(): void;
+}
+
+/**
+ * Tracks exact kickoff prompt texts recently dispatched via `session.prompt`
+ * so a stripped host that drops `metadata` on `session.input.admitted` cannot
+ * misclassify the plugin's own attachment kickoff as human intervention.
+ */
+export function createRecentKickoffTextTracker(
+  ttlMs = 60_000,
+): RecentKickoffTextTracker {
+  const bySession = new Map<string, Map<string, number>>();
+  const prune = (entries: Map<string, number>, now: number): void => {
+    for (const [k, exp] of entries) {
+      if (exp <= now) entries.delete(k);
+    }
+    while (entries.size > 16) {
+      const oldest = entries.keys().next().value;
+      if (oldest === undefined) break;
+      entries.delete(oldest);
+    }
+  };
+  return {
+    record(sessionID, text, now = Date.now()) {
+      const trimmed = text.trim();
+      if (!sessionID || !trimmed) return;
+      let entries = bySession.get(sessionID);
+      if (!entries) {
+        entries = new Map();
+        bySession.set(sessionID, entries);
+      }
+      entries.set(trimmed, now + ttlMs);
+      prune(entries, now);
+    },
+    matches(sessionID, text, now = Date.now()) {
+      const trimmed = text.trim();
+      if (!sessionID || !trimmed) return false;
+      const entries = bySession.get(sessionID);
+      if (!entries) return false;
+      prune(entries, now);
+      return (entries.get(trimmed) ?? 0) > now;
+    },
+    clear() {
+      bySession.clear();
+    },
+  };
+}
+
+/**
+ * Ensures pre-runner attachment and post-runner activation/fence invariants hold
+ * for v2 `CommandEditor.add` executions without silently dropping inputs or
+ * prompting fenced sessions.
+ */
+export function assertV2CommandCanDispatch(args: {
+  sessionID: string;
+  rawArgs: string;
+  hasAttachments: boolean;
+  commandName: string;
+  res: {
+    handled: boolean;
+    ok: boolean;
+    text: string;
+    rendered: string;
+    error?: string;
+    enteredActive: boolean;
+    after: unknown;
+  };
+  canDriveSession?: boolean;
+}): void {
+  const {res} = args;
+  if (!res.handled) throw new Error('Goal command unavailable.');
+  if (!res.ok) {
+    throw new Error(res.error || res.rendered || 'Goal command failed.');
+  }
+  if (!res.enteredActive || !res.after) {
+    if (args.hasAttachments) {
+      throw new Error(
+        'File, agent, and skill attachments can only be included when starting or resuming a goal.',
+      );
+    }
+    return;
+  }
+  if (args.canDriveSession === false) {
+    logV2DiagnosticEvent(
+      `command.transform ${args.sessionID} kickoff refused: session fenced`,
+    );
+    throw new Error(
+      res.text ||
+        `Cannot drive goal in session ${args.sessionID}: session state is locked or unreadable.`,
+    );
+  }
+}
+
+/** Marks normalized user messages matching a recently dispatched kickoff prompt as synthetic. */
+export function markRecentKickoffMessages(
+  messages: unknown[],
+  sessionID: string,
+  tuiMetadataKey: string,
+  tracker?: RecentKickoffTextTracker,
+): unknown[] {
+  if (!tracker) return messages;
+  return messages.map(raw => {
+    if (!raw || typeof raw !== 'object') return raw;
+    const msg = raw as {
+      info?: {
+        role?: string;
+        synthetic?: boolean;
+        metadata?: Record<string, unknown>;
+      };
+      parts?: unknown[];
+    };
+    if (msg.info?.role !== 'user' || msg.info?.synthetic === true) return raw;
+    if (msg.info?.metadata?.[tuiMetadataKey]) return raw;
+    const parts = Array.isArray(msg.parts) ? msg.parts : [];
+    const alreadyInjected = parts.some(p => {
+      const part = p as {
+        synthetic?: boolean;
+        metadata?: Record<string, unknown>;
+      } | null;
+      return (
+        part?.synthetic === true || Boolean(part?.metadata?.[tuiMetadataKey])
+      );
+    });
+    if (alreadyInjected) return raw;
+    const text = parts
+      .map(p =>
+        p &&
+        typeof p === 'object' &&
+        (p as {type?: string}).type === 'text' &&
+        typeof (p as {text?: unknown}).text === 'string'
+          ? (p as {text: string}).text
+          : '',
+      )
+      .filter(Boolean)
+      .join('\n\n');
+    if (!text || !tracker.matches(sessionID, text)) return raw;
+    return {
+      ...msg,
+      info: {...msg.info, synthetic: true},
+      parts: parts.map(p =>
+        p && typeof p === 'object'
+          ? {...(p as Record<string, unknown>), synthetic: true}
+          : p,
+      ),
+    };
+  });
+}
+
+/** Rewrites legacy update-only `CommandEditor` entries onto `goal-command`. */
+export function applyV2LegacyCommandUpdates(
+  draft: {
+    update: (
+      name: string,
+      edit: (command: Record<string, unknown>) => void,
+    ) => void;
+  },
+  commandName: string,
+  templatePrefix: string,
+): void {
+  for (const name of buildV2CommandLegacyNames(commandName)) {
+    draft.update(name, command => {
+      const argument =
+        name === commandName
+          ? '$ARGUMENTS'
+          : `${name.slice(commandName.length + 1)} $ARGUMENTS`.trim();
+      command.template =
+        `${templatePrefix} ${argument}\n` +
+        'Do not summarize, do not ask for confirmation, and do not perform any other work. Reply with only the tool output.';
+      delete command.agent;
+    });
+  }
+}

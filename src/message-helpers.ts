@@ -113,6 +113,16 @@ export function assistantTurnKey(message: unknown): string {
   return createdAt === null ? '' : `#${createdAt}`;
 }
 
+function hasComparableMonotonicIds(firstID: string, lastID: string): boolean {
+  return (
+    firstID.length > 4 &&
+    firstID.length === lastID.length &&
+    firstID.startsWith('msg_') &&
+    lastID.startsWith('msg_') &&
+    firstID !== lastID
+  );
+}
+
 /**
  * Return the NEWEST message from a `session.messages` result, regardless of
  * the order the host returned them in.
@@ -127,19 +137,20 @@ export function assistantTurnKey(message: unknown): string {
  * whole-list fallback: an empty/heuristic comparison is never mixed with
  * timestamps, so a partially-timestamped list cannot invert a known order.
  */
-export function findNewestMessage(messages: unknown[]): unknown | null {
-  if (!Array.isArray(messages) || messages.length === 0) return null;
+function collectAllTimestamps(messages: unknown[]): number[] | null {
   const times: number[] = [];
-  let allTimed = true;
   for (const message of messages) {
     const t = messageCreatedAt(message);
-    if (t === null) {
-      allTimed = false;
-      break;
-    }
+    if (t === null) return null;
     times.push(t);
   }
-  if (allTimed) {
+  return times;
+}
+
+export function findNewestMessage(messages: unknown[]): unknown | null {
+  if (!Array.isArray(messages) || messages.length === 0) return null;
+  const times = collectAllTimestamps(messages);
+  if (times !== null) {
     let bestIndex = 0;
     for (let i = 1; i < times.length; i++) {
       if (times[i] > times[bestIndex]) {
@@ -164,21 +175,16 @@ export function findNewestMessage(messages: unknown[]): unknown | null {
   // both hosts mint ascending ids whose first 12 characters after "msg_" are a
   // fixed-width hex encoding of (timestamp * 0x1000 + counter), so a string
   // compare corresponds to chronological order. The comparison requires matching
-  // lengths (e.g. 24 characters on v1, 30 on v2) to prevent false ordering from
-  // variable-width custom ids.
+  // `msg_` prefix and matching lengths (e.g. 24 chars on v1, 30 on v2) so
+  // mixed-prefix or variable-width mock/custom ids never invert array order.
   const first = messages[0];
   const last = messages[messages.length - 1];
   const firstID = getMessageID(first);
   const lastID = getMessageID(last);
-  if (
-    firstID &&
-    lastID &&
-    firstID !== lastID &&
-    firstID.length === lastID.length
-  ) {
+  if (hasComparableMonotonicIds(firstID, lastID)) {
     return lastID > firstID ? last : first;
   }
-  // Fall back to array order if ids are absent or have mismatched widths.
+  // Fall back to array order if ids are absent, mixed-prefix, or mismatched widths.
   return last ?? null;
 }
 
@@ -291,6 +297,71 @@ export function windowHasToolCallNewerThan(
     if (id > referenceID) return true;
   }
   return false;
+}
+
+export function chronologicalMessages(messages: unknown[]): unknown[] {
+  if (!Array.isArray(messages) || messages.length < 2) return messages;
+  const times = collectAllTimestamps(messages);
+  if (times !== null) {
+    const firstTime = times[0]!;
+    const lastTime = times[times.length - 1]!;
+    if (firstTime !== lastTime) {
+      return firstTime > lastTime ? [...messages].reverse() : messages;
+    }
+  }
+  const firstID = getMessageID(messages[0]);
+  const lastID = getMessageID(messages[messages.length - 1]);
+  if (hasComparableMonotonicIds(firstID, lastID)) {
+    return firstID > lastID ? [...messages].reverse() : messages;
+  }
+  return messages;
+}
+
+/**
+ * Narrow a session message window to the current assistant cycle so historical
+ * tool calls from prior turns cannot indefinitely suppress `noToolCallTurns`.
+ */
+export function sliceCurrentCycleMessages(
+  messages: unknown[],
+  options: {
+    lastNoToolCallMessageID?: string;
+    lastAssistantMessageID?: string;
+    assistantRepeated?: boolean;
+  },
+): unknown[] {
+  if (!Array.isArray(messages) || messages.length === 0) return [];
+  const ordered = chronologicalMessages(messages);
+  let startIdx = 0;
+
+  for (let i = ordered.length - 1; i >= 0; i--) {
+    const entry = ordered[i];
+    if (!entry || typeof entry !== 'object') continue;
+    const msg = entry as {info?: {role?: string}; role?: string};
+    const role = msg.info?.role ?? msg.role;
+    if (role === 'user' && getMessageDelivery(entry) !== 'queue') {
+      startIdx = Math.max(startIdx, i + 1);
+      break;
+    }
+  }
+
+  const noToolRef = options.lastNoToolCallMessageID;
+  if (noToolRef) {
+    for (let i = ordered.length - 1; i >= startIdx; i--) {
+      if (assistantTurnKey(ordered[i]) === noToolRef) {
+        startIdx = Math.max(startIdx, i + 1);
+        break;
+      }
+    }
+  } else if (!options.assistantRepeated && options.lastAssistantMessageID) {
+    for (let i = ordered.length - 1; i >= startIdx; i--) {
+      if (getMessageID(ordered[i]) === options.lastAssistantMessageID) {
+        startIdx = Math.max(startIdx, i + 1);
+        break;
+      }
+    }
+  }
+
+  return startIdx > 0 ? ordered.slice(startIdx) : ordered;
 }
 
 /**
