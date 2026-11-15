@@ -9,7 +9,7 @@ import {DEFAULT_GOAL_OPTIONS} from '../src/session-state-manager.ts';
 // Its `@default` annotations are documentation a user sets an option against,
 // and they had drifted: five of them contradicted
 // `DEFAULT_GOAL_OPTIONS` (maxTurns 10 vs 0, maxDurationMs 900000 vs 1800000,
-// maxTokens 200000 vs 1000000, and two stall brakes at 2 vs 3). `maxTurns: 10`
+// maxTokens 200000 vs 0, and two stall brakes at 2 vs 3). `maxTurns: 10`
 // also contradicted the README's own "the turn brake is disabled by default".
 //
 // `index.d.ts` type checking cannot catch this: it compiles a consumer, and a doc

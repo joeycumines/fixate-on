@@ -396,7 +396,7 @@ export function deserializeGoal(raw: unknown): GoalState {
       Number(source.tokenBudget) > 0
         ? Number(source.tokenBudget)
         : null,
-    maxTokens: toNonNegativeInteger(source.maxTokens, 1000000),
+    maxTokens: toNonNegativeInteger(source.maxTokens, 0),
     maxTurns: toNonNegativeInteger(source.maxTurns, 0),
     maxDurationMs: toNonNegativeInteger(source.maxDurationMs, 1800000),
     minDelayMs: toNonNegativeInteger(source.minDelayMs, 1500),

@@ -35,9 +35,8 @@ export interface DefaultGoalOptions {
 }
 
 export const DEFAULT_GOAL_OPTIONS: Required<DefaultGoalOptions> = {
-  // Cumulative context budget (totalTokens + compactionBaselineTokens).
-  // Sized to allow long campaigns without prematurely halting progressing goals.
-  maxTokens: 1000000,
+  // The cumulative context-token brake is opt-in; zero disables it.
+  maxTokens: 0,
   // Turn counts do not reliably differentiate productive from stuck sessions.
   // Disabled by default (0) in favor of stall and context brakes.
   maxTurns: 0,

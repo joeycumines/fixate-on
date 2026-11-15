@@ -633,7 +633,7 @@ export function createGoalState(
     mode: options.mode ?? 'normal',
     sessionID,
     tokenBudget: options.tokenBudget ?? null,
-    maxTokens: options.maxTokens ?? 1000000,
+    maxTokens: options.maxTokens ?? 0,
     maxTurns: options.maxTurns ?? 0,
     maxDurationMs: options.maxDurationMs ?? 1800000,
     minDelayMs: options.minDelayMs ?? 1500,

@@ -1579,6 +1579,13 @@ test('top-level maxTokens option reaches goals created via /goal command', async
   expect(status).not.toContain('/200,000');
 });
 
+test('context-token ceiling defaults to unlimited for v1 goals', async () => {
+  const {hooks} = await makePlugin({});
+  await runGoalCommand(hooks, 's1', 'test objective');
+  const status = await runGoalCommand(hooks, 's1', 'status');
+  expect(status).toContain('0/unlimited ctx tokens');
+});
+
 test('maxRecentMessages option controls messages fetch limit', async () => {
   let capturedLimit: unknown = undefined;
   const client = {

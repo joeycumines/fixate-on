@@ -85,7 +85,7 @@ test('serializeGoalForTui maps a GoalState to a TuiSnapshot', () => {
   expect(snap.status).toBe('active');
   expect(snap.turnCount).toBe(3);
   expect(snap.totalTokens).toBe(1200);
-  expect(snap.maxTokens).toBe(1000000);
+  expect(snap.maxTokens).toBe(0);
   expect(snap.maxTurns).toBe(0);
   expect(snap.history).toEqual([]);
   expect(snap.lastCheckpoint).toBeNull();

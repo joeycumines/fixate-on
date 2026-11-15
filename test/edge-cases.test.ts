@@ -474,14 +474,13 @@ test('deserializeGoal handles missing fields gracefully', () => {
   const goal = deserializeGoal({});
   expect(goal.goalId).toBe('');
   expect(goal.condition).toBe('');
-  expect(goal.maxTokens).toBe(1000000);
+  expect(goal.maxTokens).toBe(0);
 });
 
-test('deserializeGoal uses fallback for null fields (not 0)', () => {
+test('deserializeGoal uses fallback for null fields', () => {
   // Number(null) === 0 in JavaScript, but null should be treated as
   // "not present" and use the fallback, not 0.
-  // 0 means "unlimited" for maxTokens/maxTurns/maxDurationMs — a
-  // dangerous silent change from the defaults.
+  // maxTokens and maxTurns intentionally default to 0; maxDurationMs does not.
   const goal = deserializeGoal({
     maxTokens: null,
     maxTurns: null,
@@ -491,7 +490,7 @@ test('deserializeGoal uses fallback for null fields (not 0)', () => {
     noProgressTurnsBeforePause: null,
     noToolCallTurnsBeforePause: null,
   });
-  expect(goal.maxTokens).toBe(1000000); // not 0 (unlimited)
+  expect(goal.maxTokens).toBe(0); // unlimited by default
   expect(goal.maxTurns).toBe(0); // 0 = no turn brake by default (see DEFAULT_GOAL_OPTIONS)
   expect(goal.maxDurationMs).toBe(1800000); // not 0 (no limit)
   expect(goal.minDelayMs).toBe(1500); // not 0 (no delay)
@@ -843,7 +842,7 @@ test('recoverState reconstructs from state file', async () => {
 test('createGoalState sets default values', () => {
   const goal = createGoalState('s1', 'test');
   expect(goal.status).toBe('active');
-  expect(goal.maxTokens).toBe(1000000);
+  expect(goal.maxTokens).toBe(0);
   expect(goal.maxTurns).toBe(0);
   expect(goal.maxDurationMs).toBe(1800000);
   expect(goal.tokenBudget).toBe(null);

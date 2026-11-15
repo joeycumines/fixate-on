@@ -238,8 +238,8 @@ Natural language is the primary interface: `/goal <objective>` works with zero f
 | `/goal list [all]` | Lists numbered live goals and settled goals in the per-session archive, with state markers (`focused` = driven now, `idle` = active between turns, `background` = waiting). Alias: `ls`. |
 | `/goal focus <number \| goalId>` | Switches which goal the dashboard and bare commands target. Persisted on disk. Does not alter goal status (focusing a paused goal leaves it paused; unfocused active goals keep running). |
 | `/goal pause [<goalId>]` | Pauses the focused (or named) goal while retaining its state and history. |
-| `/goal resume [<goalId>]` | Resumes a paused, blocked, or brake-stopped goal with a fresh local budget window and reset turn count, preserving the objective and history. |
-| `/goal edit <new objective>` | Revises the focused goal's objective in place, preserving budgets and history and clearing any paused/blocked state. If the goal already hit a hard brake, run `/goal resume` for a fresh budget window. |
+| `/goal resume [<goalId>]` | Resumes a paused, blocked, or brake-stopped goal, resets the turn count, and starts a fresh window for configured per-run limits while preserving the objective and history. |
+| `/goal edit <new objective>` | Revises the focused goal's objective in place, preserving limits and history and clearing any paused/blocked state. If the goal already hit a hard brake, run `/goal resume` to reset it. |
 | `/goal checkpoint <note>` | Records a progress note on the focused goal. |
 | `/goal history [--verbose\|--full]` | Displays the lifecycle event trail and latest progress note. `--verbose` and `--full` both print the raw trail including bookkeeping entries. Alias: `log`. |
 | `/goal accept [proposalId]` | Applies the focused goal's pending proposal (from `propose_goal_change`) — objective, success criteria, constraints, and artifact pointers — and clears it. A supplied ID must match the pending proposal's. Alias: `accept-proposal`. |
@@ -416,14 +416,14 @@ await GoalsPlugin(
 |:---|:---|:---|
 | Auto-continue turns (`maxTurns`) | `0` (`unlimited`) | Off by default; turn count alone cannot distinguish productive work from a stall. Disabled limits always render as `unlimited`, never `/ 0`. |
 | Stall brake (`maxDurationMs`) | `30 minutes` (`1800000` ms) | Time since last evidence of progress (a completed assistant turn or output-token increase, measured from goal creation before first progress — never suppressed by a hung tool call). |
-| Context tokens (`maxTokens`) | `1,000,000` | Cumulative provider-reported context tokens (`input + output + reasoning + cache read + cache write`). |
+| Context tokens (`maxTokens`) | `0` (`unlimited`) | Off by default. Set a positive ceiling for cumulative provider-reported context tokens (`input + output + reasoning + cache read + cache write`). |
 | Continuation cooldown (`minDelayMs`) | `1.5 s` (`1500` ms) | Minimum delay before sending a continuation after idle. |
 | No-progress pause | `< 50` output tokens × `3` turns | Pauses after `noProgressTurnsBeforePause` consecutive low-output turns with no meaningful progress-note change. |
 | No-tool-call pause | `3` consecutive turns | Pauses after `noToolCallTurnsBeforePause` consecutive tool-free continuation turns (anti self-chat loop). |
-| Budget wrap-up threshold (`budgetWrapupRatio`) | `80%` (`0.8`) | Sends a wrap-up warning when context tokens reach 80% of `maxTokens`. |
+| Budget wrap-up threshold (`budgetWrapupRatio`) | `80%` (`0.8`) | Sends a wrap-up warning at 80% of a positive `maxTokens` ceiling; disabled when `maxTokens` is `0`. |
 | Prompt failure pause (`maxPromptFailures`) | `3` consecutive failures | Pauses when OpenCode prompt dispatch fails or defers 3 times in a row. |
 
-**Wrap-up vs. hard stop:** When a brake is reached, the plugin sends one final prompt asking the assistant to summarize what is done, what remains, and the next concrete step. Because a brake is a budget rather than a verdict, the prompt instructs the assistant to call `update_goal {status: "complete"}` only if the objective is genuinely satisfied, and not to mark it `blocked` merely because a brake fired. Run `/goal resume` to continue with a fresh budget window.
+**Wrap-up vs. hard stop:** When a brake is reached, the plugin sends one final prompt asking the assistant to summarize what is done, what remains, and the next concrete step. Because a brake is a budget rather than a verdict, the prompt instructs the assistant to call `update_goal {status: "complete"}` only if the objective is genuinely satisfied, and not to mark it `blocked` merely because a brake fired. Run `/goal resume` to continue with a fresh window for configured per-run limits.
 
 ### Persistence and state root
 
@@ -448,7 +448,7 @@ Pass plugin-level defaults in `opencode.json`:
       {
         "maxTurns": 0,
         "maxDurationMs": 1800000,
-        "maxTokens": 1000000,
+        "maxTokens": 0,
         "minDelayMs": 1500,
         "maxRecentMessages": 50,
         "noProgressTokenThreshold": 50,
@@ -523,7 +523,7 @@ Start with `/goal status --full` (or `--verbose`) and `/goal history --verbose` 
 ### When a goal does not continue
 
 1. **Distinguish self-resolving pauses from stops that wait on you:** Goals paused for `user intervention`, `recovery`, or `queued` sequence ordering resume automatically (unless a `user intervention` yield exceeds 15 minutes without settling, at which point `/goal status` flags that it did not re-arm and offers `/goal resume`). Deliberate pauses (`explicit pause`), hard brakes, no-progress/no-tool-call pauses, prompt failures, and `recovery exhausted` require human action.
-2. **Resume after resolving the cause:** Run `/goal resume` to start a fresh local budget window and reset the turn count without losing the objective or history.
+2. **Resume after resolving the cause:** Run `/goal resume` to reset the turn count and start a fresh window for configured per-run limits without losing the objective or history.
 3. **Check structured logs and paths:** Inspect OpenCode's structured logs for persistence, `sdkShape`, prompt dispatch, or verifier faults, and verify that the working directory and `stateRoot` / `FIXATE_ON_STATE_ROOT` match between server and TUI entries.
 
 **Quick diagnostics:**

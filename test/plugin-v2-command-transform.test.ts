@@ -292,6 +292,7 @@ test('v2 add-only command.transform overrides opencode.goal and drives active ki
     const snap = store.getFocused('s-cmd-1');
     expect(snap?.status).toBe('active');
     expect(snap?.condition).toBe('Fix v2 command execution');
+    expect(snap?.maxTokens).toBe(0);
   } finally {
     await dispose();
     rmSync(root, {recursive: true, force: true});

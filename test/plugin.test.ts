@@ -7,7 +7,7 @@ import {DEFAULT_GOAL_OPTIONS, GoalsPlugin} from '../src/plugin.ts';
 // DEFAULT_GOAL_OPTIONS
 
 test('DEFAULT_GOAL_OPTIONS has expected defaults', () => {
-  expect(DEFAULT_GOAL_OPTIONS.maxTokens).toBe(1000000);
+  expect(DEFAULT_GOAL_OPTIONS.maxTokens).toBe(0);
   expect(DEFAULT_GOAL_OPTIONS.maxTurns).toBe(0);
   expect(DEFAULT_GOAL_OPTIONS.maxDurationMs).toBe(1800000);
   expect(DEFAULT_GOAL_OPTIONS.noProgressTokenThreshold).toBe(50);

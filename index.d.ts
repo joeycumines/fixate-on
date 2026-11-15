@@ -303,13 +303,14 @@ export interface GoalsPluginOptions {
    * progress, so a hung tool call cannot hold the goal open.
    * @default 1800000 */
   maxDurationMs?: number;
-  /** The maximum context-token budget a goal may use before it is stopped for
-   * exceeding a limit. Set it for one goal with `--max-tokens`, or with the
-   * `--budget` shorthand, which takes a `k` or `m` suffix such as `100k` or `1.5m`.
+  /** Optional cumulative context-token ceiling. By default, no context-token
+   * stop or wrap-up threshold is applied. Set a positive value for one goal
+   * with `--max-tokens`, or with the `--budget` shorthand, which takes a `k` or
+   * `m` suffix such as `100k` or `1.5m`; zero disables the ceiling.
    *
    * The count is cumulative over the whole goal (`totalTokens + compactionBaselineTokens`),
-   * so compaction does not reduce it. It is a ceiling, not a target.
-   * @default 1000000 */
+   * so compaction does not reduce it.
+   * @default 0 */
   maxTokens?: number;
   /** The minimum delay, in milliseconds, between two auto-continue prompts. Set it
    * for one goal with `--cooldown-ms`.

@@ -382,11 +382,19 @@ test('buildContinueMessage warns when approaching turn limit', () => {
 });
 
 test('buildContinueMessage warns when approaching token limit', () => {
-  const goal = createGoalState('s1', 'test');
+  const goal = createGoalState('s1', 'test', {maxTokens: 1000000});
   goal.totalTokens = 980000;
   const message = buildContinueMessage(goal, {warnTokensRemaining: 25000});
   expect(message).toContain('Approaching limits');
   expect(message).toContain('context tokens remaining');
+});
+
+test('buildContinueMessage does not warn about tokens without a configured limit', () => {
+  const goal = createGoalState('s1', 'test');
+  goal.totalTokens = 9800000;
+  const message = buildContinueMessage(goal, {warnTokensRemaining: 25000});
+  expect(message).not.toContain('Approaching limits');
+  expect(message).toContain('context_tokens_remaining: unlimited');
 });
 
 test('buildContinueMessage does not warn when far from limits', () => {
