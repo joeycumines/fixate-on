@@ -595,6 +595,37 @@ export function normalizeV2Messages(messages: unknown[]): unknown[] {
 }
 
 /**
+ * Stable identities for the subagent/image jobs that block an idle turn. The
+ * childSessionID (when present) distinguishes concurrent jobs; using these keys
+ * lets a later idle establish that the same job set has cleared.
+ */
+export function blockingBackgroundJobKeys(
+  background: unknown,
+  sessionID: string,
+): string[] {
+  if (!Array.isArray(background)) return [];
+  const keys: string[] = [];
+  for (const entry of background) {
+    if (!entry || typeof entry !== 'object') continue;
+    const item = entry as {
+      kind?: unknown;
+      sessionID?: unknown;
+      status?: unknown;
+      childSessionID?: unknown;
+    };
+    if (item.kind !== 'subagent' && item.kind !== 'image') continue;
+    if (item.sessionID !== undefined && item.sessionID !== sessionID) continue;
+    if (item.status !== undefined && item.status !== 'running') continue;
+    const identity =
+      typeof item.childSessionID === 'string' && item.childSessionID.length > 0
+        ? item.childSessionID
+        : sessionID;
+    keys.push(`${String(item.kind)}:${identity}`);
+  }
+  return keys;
+}
+
+/**
  * Returns true if `experimental.idle` reports any running subagent or image
  * background job scoped to `sessionID`. Shell background jobs do not block idle.
  */
@@ -602,20 +633,33 @@ export function hasBlockingBackgroundJobs(
   background: unknown,
   sessionID: string,
 ): boolean {
-  if (!Array.isArray(background)) return false;
-  for (const entry of background) {
-    if (!entry || typeof entry !== 'object') continue;
-    const item = entry as {
-      kind?: unknown;
-      sessionID?: unknown;
-      status?: unknown;
-    };
-    if (item.kind !== 'subagent' && item.kind !== 'image') continue;
-    if (item.sessionID !== undefined && item.sessionID !== sessionID) continue;
-    if (item.status !== undefined && item.status !== 'running') continue;
-    return true;
-  }
-  return false;
+  return blockingBackgroundJobKeys(background, sessionID).length > 0;
+}
+
+/**
+ * Extract routable text from a v2 inbox item. `synthetic` marks plugin-generated
+ * items (kickoffs/continuations) that must never be treated as human steering.
+ */
+export function extractInboxMessage(
+  item: unknown,
+  tuiMetadataKey: string,
+): {text: string; synthetic: boolean} | null {
+  if (!item || typeof item !== 'object') return null;
+  const entry = item as {
+    type?: string;
+    synthetic?: boolean;
+    metadata?: Record<string, unknown>;
+    payload?: {text?: unknown; metadata?: Record<string, unknown>};
+    text?: unknown;
+  };
+  const text = entry.payload?.text ?? entry.text;
+  if (typeof text !== 'string' || !text.trim()) return null;
+  const synthetic =
+    entry.type === 'synthetic' ||
+    entry.synthetic === true ||
+    Boolean(entry.metadata?.[tuiMetadataKey]) ||
+    Boolean(entry.payload?.metadata?.[tuiMetadataKey]);
+  return {text, synthetic};
 }
 
 /** Computes a lightweight turn signature from normalized messages for idle dedupe. */
@@ -657,10 +701,14 @@ export function shouldSuppressTrailingIdle(
   sessionID: string,
   currentTurnSignature: string,
   now: number,
+  stillDeferred?: (sessionID: string) => boolean,
 ): boolean {
   const entry = records.get(sessionID);
   if (!entry) return false;
   if (entry.backgroundBlocked) {
+    // Keep suppressing while a deferral is authoritative; only the native idle
+    // that clears the background, or bounded escalation, removes the record.
+    if (stillDeferred?.(sessionID)) return true;
     if (now - entry.ts < 30_000) return true;
     records.delete(sessionID);
     return false;

@@ -152,12 +152,15 @@ export async function processIdleEvent(
   // Restricting the scan to messages after the prior turn / prompt boundary
   // ensures a historical tool call cannot suppress `noToolCallTurns` forever.
   const turnKey = assistantTurnKey(latestAssistant);
-  const runtimeQueued = deps.runtime?.queuedInputMessageIDs?.get(sessionID);
-  const runtimeSteered = deps.runtime?.steeredInputMessageIDs?.get(sessionID);
-  const surfacedQueued = deps.runtime?.surfacedQueuedMessageIDs?.get(sessionID);
+  const currentDeliverySets = () => ({
+    queued: deps.runtime?.queuedInputMessageIDs?.get(sessionID),
+    steered: deps.runtime?.steeredInputMessageIDs?.get(sessionID),
+    surfaced: deps.runtime?.surfacedQueuedMessageIDs?.get(sessionID),
+  });
   const isQueuedMessage = (message: unknown, id: string): boolean => {
-    if (id !== '' && runtimeSteered?.has(id) === true) return false;
-    if (id !== '' && runtimeQueued?.has(id) === true) return true;
+    const {queued, steered} = currentDeliverySets();
+    if (id !== '' && steered?.has(id) === true) return false;
+    if (id !== '' && queued?.has(id) === true) return true;
     return getMessageDelivery(message) === 'queue';
   };
   const cycleMessages = sliceCurrentCycleMessages(messages, {
@@ -238,6 +241,12 @@ export async function processIdleEvent(
           g.noProgressTurns += 1;
           g.lastCountedProgressMessageID = turnKey;
         }
+      } else if (latestHasToolCall) {
+        g.noProgressTurns = 0;
+        // The cycle was just evaluated as productive. Remember that evaluation
+        // so a duplicate idle, whose re-sliced window may hide the tool call,
+        // cannot reclassify the same turn as low progress.
+        g.lastCountedProgressMessageID = turnKey;
       } else {
         g.noProgressTurns = 0;
         g.lastCountedProgressMessageID = '';
@@ -339,8 +348,19 @@ export async function processIdleEvent(
       return;
     const messageID = getMessageID(msg);
     if (!isQueuedMessage(msg, messageID)) return;
+    const messageTime =
+      (msg as {time?: {created?: unknown}}).time?.created ??
+      (msg as {info?: {time?: {created?: unknown}}}).info?.time?.created;
     if (
-      (messageID !== '' && surfacedQueued?.has(messageID) === true) ||
+      typeof messageTime === 'number' &&
+      Number.isFinite(messageTime) &&
+      goal.createdAt > 0 &&
+      messageTime < goal.createdAt
+    )
+      return;
+    const {surfaced} = currentDeliverySets();
+    if (
+      (messageID !== '' && surfaced?.has(messageID) === true) ||
       (messageID !== '' && seenNoticeIDs.has(messageID))
     )
       return;

@@ -1,4 +1,4 @@
-// fxi-v2-input-steering.test.ts — FX-I locks: human steering must reach the
+// v2-input-steering.test.ts — FX-I locks: human steering must reach the
 // goal loop on opencode v2, where the v1 `chat.message` hook never fires.
 //
 // Live evidence (drill-v2 campaign 2026-08-26): a whole-message "stop"
@@ -113,7 +113,7 @@ function admittedEvent(
   };
 }
 
-describe('FX-I synthesis: session.input.admitted → chat.message hook', () => {
+describe('v2 input synthesis: session.input.admitted drives the chat.message hook', () => {
   test("human 'stop' reaches the hook with synthetic undefined and pauses explicitly", async () => {
     const machine = new GoalStateMachine(makeActiveGoal(), {
       onCommit: async () => {},
@@ -237,7 +237,7 @@ describe('FX-I synthesis: session.input.admitted → chat.message hook', () => {
   });
 });
 
-describe('FX-I idle defense: the loop never drives over a pending human turn', () => {
+describe('idle defense: the loop never drives over a pending human turn', () => {
   test("newest message human 'stop' → explicit pause, no continuation prompt sent", async () => {
     const machine = new GoalStateMachine(makeActiveGoal(), {
       onCommit: async () => {},
@@ -315,7 +315,7 @@ describe('FX-I idle defense: the loop never drives over a pending human turn', (
   });
 });
 
-describe('FX-E classification anchor used by both FX-I paths', () => {
+describe('stop classification anchor used by both steering paths', () => {
   test('whole-message stop imperatives classify; mixed sentences do not', () => {
     expect(isExplicitStopMessage('stop')).toBe(true);
     expect(isExplicitStopMessage('halt')).toBe(true);

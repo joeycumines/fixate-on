@@ -1,4 +1,4 @@
-// review-remediation-idle.test.ts — regressions for the idle/no-tool/queued
+// idle-cycle-dedup-and-notices.test.ts — regressions for the idle/no-tool/queued
 // findings in scratch/review-05..08.md. Each test reproduces a real defect
 // before the corresponding source fix and must fail on the unfixed commit.
 import {describe, expect, test} from 'bun:test';
@@ -111,7 +111,7 @@ function assistantMessage(id: string, text: string, tool = false): unknown {
   };
 }
 
-describe('review 05-08 idle regressions', () => {
+describe('idle cycle dedup and queued notices', () => {
   test('a duplicate idle after a productive turn does not count it as tool-free', async () => {
     const machine = new GoalStateMachine(makeActiveGoal(), {
       onCommit: async () => {},

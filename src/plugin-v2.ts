@@ -16,13 +16,14 @@ import {
   type V2SessionOp,
   appendUniqueCompactionSystemParts,
   applyV2AgentTransforms,
+  blockingBackgroundJobKeys,
   canonicalPath,
+  extractInboxMessage,
   extractSystemPartText,
   extractV2CreatePayload,
   extractV2SessionIDArg,
   extractV2UpdatePatch,
   hasAssistantReplyContent,
-  hasBlockingBackgroundJobs,
   isSameWorkspaceLocation,
   latestTurnSignatureFromMessages,
   loadZodV2,
@@ -52,7 +53,9 @@ import {GoalsPlugin, type PluginOptions} from './plugin-runtime.ts';
 import type {PluginHooks} from './hooks.ts';
 import {GOAL_COMMAND_TEMPLATE_PREFIX} from './native-agent-config.ts';
 import {
+  consumeInboxPayload,
   recordEventInputDelivery,
+  recordInboxPayload,
   resolveInputDeliveryFields,
 } from './session-runtime.ts';
 import {
@@ -661,18 +664,31 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
         const reg = await ctx.session.hook('experimental.idle', async input => {
           if (!input?.sessionID) return;
           const sessionID = input.sessionID;
-          if (hasBlockingBackgroundJobs(input.background, sessionID)) {
+          const jobKeys = blockingBackgroundJobKeys(
+            input.background,
+            sessionID,
+          );
+          if (jobKeys.length > 0) {
             idleStateBySession.set(sessionID, {
               turnSignature: lastObservedTurnBySession.get(sessionID) ?? '',
               ts: Date.now(),
               backgroundBlocked: true,
             });
-            hooks.runtime?.backgroundBlockedUntil.set(
-              sessionID,
-              Date.now() + 30_000,
-            );
+            const now = Date.now();
+            const deadline = now + 30_000;
+            hooks.runtime?.backgroundBlockedUntil.set(sessionID, deadline);
+            hooks.runtime?.backgroundDeferrals?.set(sessionID, {
+              jobKeys,
+              since: now,
+              nextRecheckAt: deadline,
+              extensions: 0,
+            });
             return;
           }
+          // An idle with no blocking jobs is the authoritative clear: the
+          // previously reported jobs have finished. Release the deferral before
+          // driving the goal so the fallback poller cannot keep deferring.
+          hooks.runtime?.backgroundDeferrals?.delete(sessionID);
           hooks.runtime?.backgroundBlockedUntil.delete(sessionID);
           const preSignature = lastObservedTurnBySession.get(sessionID) ?? '';
           idleStateBySession.set(sessionID, {
@@ -776,6 +792,7 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
           ) {
             idleStateBySession.delete(sessionID);
             hooks.runtime?.backgroundBlockedUntil.delete(sessionID);
+            hooks.runtime?.backgroundDeferrals?.delete(sessionID);
           }
           if (
             ev.type === 'session.execution.succeeded' &&
@@ -785,6 +802,10 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
               sessionID,
               lastObservedTurnBySession.get(sessionID) ?? '',
               Date.now(),
+              id =>
+                (hooks.runtime?.backgroundDeferrals?.has(id) ?? false) ||
+                (hooks.runtime?.backgroundBlockedUntil.get(id) ?? 0) >
+                  Date.now(),
             )
           ) {
             continue;
@@ -798,59 +819,76 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
             sessionID
           ) {
             recordV2InputDelivery(hooks.runtime, data, ev.type, sessionID);
+            const {id: inboxID, delivery} = resolveInputDeliveryFields(
+              data,
+              ev.type,
+              sessionID,
+            );
             if (ev.type === 'session.inbox.enqueued') {
-              const {delivery} = resolveInputDeliveryFields(
-                data,
-                ev.type,
-                sessionID,
+              const message = extractInboxMessage(
+                data.item,
+                GOAL_TUI_METADATA_KEY,
               );
-              if (delivery !== 'queue') {
-                const item = data.item as
-                  | {
-                      id?: unknown;
-                      type?: string;
-                      payload?: {text?: unknown};
-                      text?: unknown;
-                      delivery?: unknown;
-                    }
-                  | undefined;
-                const rawText = item?.payload?.text ?? item?.text;
-                const syntheticItem =
-                  item?.type === 'synthetic' ||
-                  (item as {synthetic?: boolean} | undefined)?.synthetic ===
-                    true ||
-                  Boolean(
-                    (item as {metadata?: Record<string, unknown>} | undefined)
-                      ?.metadata?.[GOAL_TUI_METADATA_KEY],
-                  ) ||
-                  Boolean(
-                    (
-                      item?.payload as
-                        {metadata?: Record<string, unknown>} | undefined
-                    )?.metadata?.[GOAL_TUI_METADATA_KEY],
+              const routable =
+                message &&
+                !message.synthetic &&
+                !recentKickoffTexts.matches(sessionID, message.text);
+              if (delivery === 'queue') {
+                // Retain the text: delivery.changed carries only an id, so a
+                // later queue→steer promotion needs the original payload.
+                if (message)
+                  recordInboxPayload(
+                    hooks.runtime,
+                    sessionID,
+                    inboxID,
+                    message,
                   );
-                if (
-                  typeof rawText === 'string' &&
-                  rawText.trim() &&
-                  !syntheticItem &&
-                  // The plugin's own kickoffs arrive on this same inbox stream.
-                  // Never route them back into the steering hook, or each
-                  // continuation would be mistaken for human intervention.
-                  !recentKickoffTexts.matches(sessionID, rawText)
-                ) {
-                  try {
-                    await synthesizeChatMessageFromText(
-                      hooks['chat.message'],
-                      sessionID,
-                      rawText,
-                      {
-                        inputID: data.inboxID ?? item?.id,
-                        ...(item?.delivery ? {delivery: item.delivery} : {}),
-                      },
-                    );
-                  } catch {
-                    /* steering failures must not break the event loop */
-                  }
+              } else if (routable && message) {
+                // Initially-steered items synthesize immediately as before.
+                try {
+                  await synthesizeChatMessageFromText(
+                    hooks['chat.message'],
+                    sessionID,
+                    message.text,
+                    {
+                      inputID: inboxID,
+                      ...((data.item as {delivery?: unknown})?.delivery
+                        ? {
+                            delivery: (data.item as {delivery: unknown})
+                              .delivery,
+                          }
+                        : {}),
+                    },
+                  );
+                } catch {
+                  /* steering failures must not break the event loop */
+                }
+              }
+            } else if (
+              ev.type === 'session.inbox.delivery.changed' &&
+              delivery === 'steer'
+            ) {
+              // Genuine queue→steer promotion: the host sends no text, so use
+              // the payload retained at enqueue time. Synthesize at most once.
+              const retained = consumeInboxPayload(
+                hooks.runtime,
+                sessionID,
+                inboxID,
+              );
+              if (
+                retained &&
+                !retained.synthetic &&
+                !recentKickoffTexts.matches(sessionID, retained.text)
+              ) {
+                try {
+                  await synthesizeChatMessageFromText(
+                    hooks['chat.message'],
+                    sessionID,
+                    retained.text,
+                    {inputID: inboxID, delivery: 'steer'},
+                  );
+                } catch {
+                  /* steering failures must not break the event loop */
                 }
               }
             }
@@ -870,6 +908,27 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
         /* stream closed or errored */
       }
     })();
+
+    // Retained native command dispatch: an admission failure keeps the original
+    // attachment-bearing payload so a delayed retry does not silently drop it.
+    hooks.runtime!.retryPendingKickoffDispatch = async (
+      sessionID: string,
+      retained: unknown,
+    ) => {
+      const dispatch = retained as {
+        method: 'prompt' | 'synthetic';
+        payload: Record<string, unknown>;
+      };
+      if (dispatch.method === 'prompt') {
+        recentKickoffTexts.record(
+          sessionID,
+          String(dispatch.payload.text ?? ''),
+        );
+        await ctx.session.prompt(dispatch.payload);
+      } else {
+        await ctx.session.synthetic(dispatch.payload);
+      }
+    };
 
     // Bridge 3: Register goal tools with v2 schema and codemode options.
     const z = await loadZodV2();
@@ -918,16 +977,32 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
                     `No objective provided. Use \`/${commandName} <condition>\` to set a goal.`,
                   );
                 }
-                assertV2AttachmentsBeforeRun({rawArgs, hasAttachments});
+                const readOnly =
+                  /^(?:status|info|history|log|list|ls)\b/i.test(rawArgs) ||
+                  rawArgs === '';
+                assertV2AttachmentsBeforeRun({
+                  rawArgs,
+                  hasAttachments,
+                  activeGoalStatus: goalId =>
+                    hooks.runtime?.getGoalStatus?.(sessionID, goalId),
+                });
                 const runner = hooks.runtime?.executeSlashCommand;
                 if (typeof runner !== 'function') {
                   throw new Error('Goal command runner is unavailable.');
                 }
                 const res = await runner(
                   {sessionID, command: commandName, arguments: rawArgs},
-                  {skipKickoff: true, skipReplayRecord: true},
+                  {
+                    skipKickoff: true,
+                    skipReplayRecord: true,
+                    clearKickoffOnSkip: !readOnly,
+                    preserveKickoffOnSkip: readOnly,
+                  },
                 );
-                hooks.runtime?.clearKickoffTimer?.(sessionID);
+                if (!readOnly) {
+                  hooks.runtime?.clearKickoffTimer?.(sessionID);
+                  hooks.runtime?.pendingKickoffDispatch?.delete(sessionID);
+                }
                 assertV2CommandCanDispatch({
                   sessionID,
                   rawArgs,
@@ -971,6 +1046,11 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
                   // A failed admission must not leave an active goal with no way
                   // to start. Re-arm the delayed kickoff so a recovered host can
                   // retry; surface the original failure to the caller.
+                  hooks.runtime?.pendingKickoffDispatch?.set(sessionID, {
+                    goalId: activated.goalId,
+                    runId: activated.runId,
+                    dispatch,
+                  });
                   hooks.runtime?.scheduleKickoff?.(
                     sessionID,
                     activated.goalId,
@@ -981,6 +1061,7 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
                   );
                   throw error;
                 }
+                hooks.runtime?.pendingKickoffDispatch?.delete(sessionID);
               },
             });
             return;

@@ -768,6 +768,13 @@ export async function GoalsPlugin(
     const {kickoffTimers, scheduleKickoff, clearKickoffTimer} = kickoff;
     runtime.clearKickoffTimer = kickoff.clearKickoffTimer;
     runtime.scheduleKickoff = kickoff.scheduleKickoff;
+    runtime.getGoalStatus = (sessionID, goalId) => {
+      const context = getSessionContext(sessionID);
+      const machine = goalId
+        ? (context?.getMachineById?.(goalId) ?? null)
+        : (context?.getMachine() ?? null);
+      return machine?.snapshot().status;
+    };
     if (registerCommand) {
       runtime.executeSlashCommand = kickoff.executeSlashCommand;
     }
@@ -929,6 +936,8 @@ export async function GoalsPlugin(
         runtime.steeredInputMessageIDs.clear();
         runtime.surfacedQueuedMessageIDs.clear();
         runtime.backgroundBlockedUntil.clear();
+        runtime.backgroundDeferrals?.clear();
+        runtime.inboxPayloadsByID?.clear();
         for (const controller of runtime.continuationControllers.values())
           controller.abort();
         for (const timer of kickoffTimers.values()) clearTimeout(timer);

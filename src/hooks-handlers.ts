@@ -30,7 +30,10 @@ import {getTextFromParts} from './message-helpers.ts';
 import {isInternalAgent} from './agent-resolve.ts';
 import {brakeCeiling, brakeCeilingFormatted} from './brake-format.ts';
 import {copyGoalsToForkedSession, extractForkParentID} from './fork-bind.ts';
-import {recordEventInputDelivery} from './session-runtime.ts';
+import {
+  recordEventInputDelivery,
+  resolveInputDeliveryFields,
+} from './session-runtime.ts';
 import {
   COMPACTION_LOOP_STOP_REASON,
   COMPACTION_LOOP_THRESHOLD,
@@ -413,6 +416,22 @@ export function createEventHook(
         eventType,
         sessionID,
       );
+      const {id: inputID, delivery} = resolveInputDeliveryFields(
+        (event?.properties ?? event ?? {}) as Record<string, unknown>,
+        eventType,
+        sessionID,
+      );
+      const hasLiveGoal = (runtime?.sessionGoals.get(sessionID) ?? []).some(
+        m => !m.isTerminal(),
+      );
+      if (inputID && delivery === 'queue' && !hasLiveGoal) {
+        let surfaced = runtime?.surfacedQueuedMessageIDs.get(sessionID);
+        if (!surfaced) {
+          surfaced = new Set<string>();
+          runtime!.surfacedQueuedMessageIDs.set(sessionID, surfaced);
+        }
+        surfaced.add(inputID);
+      }
     }
 
     // Track liveness for sessions delivered directly by the host in this process.

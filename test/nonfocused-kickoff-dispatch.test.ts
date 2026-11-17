@@ -1,4 +1,4 @@
-// review-remediation-kickoff.test.ts — regression for the resume-of-nonfocused-goal
+// nonfocused-kickoff-dispatch.test.ts — regression for the resume-of-nonfocused-goal
 // finding in scratch/review-05..08.md. `enteredActive` must reflect the goal the
 // command actually targeted, not whichever goal is currently focused.
 import {expect, test} from 'bun:test';
@@ -38,7 +38,7 @@ test('resuming a named nonfocused goal reports and dispatches that goal', async 
   const root = mkdtempSync(join(tmpdir(), 'fixate-review-kickoff-'));
   const runtime = createRuntimeState();
   runtime.canDriveSession = () => true;
-  new SessionStateManager(
+  const manager = new SessionStateManager(
     runtime,
     async () => true,
     root,
@@ -74,6 +74,8 @@ test('resuming a named nonfocused goal reports and dispatches that goal', async 
     },
   );
   const machines = [machineA, machineB];
+  runtime.sessionGoals.set(sessionID, machines);
+  runtime.focusedGoalId.set(sessionID, 'goal-b');
   const focused = machineB;
   const prompts: Array<Record<string, unknown>> = [];
 
@@ -87,18 +89,16 @@ test('resuming a named nonfocused goal reports and dispatches that goal', async 
 
   const wiring = createKickoffWiring({
     runtime,
-    stateManager: {
-      getMachine: () =>
-        machineA.snapshot().status === 'active' ? machineA : focused,
-      listMachines: () => machines,
-    } as never,
+    stateManager: manager,
     sessionApi,
     getSessionContext: () =>
       ({
-        getMachine: () => focused,
-        listMachines: () => machines,
+        getMachine: () => manager.getMachine(sessionID),
+        listMachines: () => manager.listMachines(sessionID),
         getMachineById: (id: string) =>
-          machines.find(m => m.snapshot().goalId === id),
+          manager
+            .listMachines(sessionID)
+            .find(m => m.snapshot().goalId === id) ?? null,
         replaceGoals: async () => focused,
         setPendingIntent: () => {},
         getPendingIntent: () => null,

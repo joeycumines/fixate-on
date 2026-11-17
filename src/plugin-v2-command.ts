@@ -6,7 +6,10 @@
  */
 
 import {appendFileSync} from 'node:fs';
-import {SUBCOMMAND_ROOTS} from './commands-args.ts';
+import {
+  classifyGoalCommandOperation,
+  splitLeadingGoalId,
+} from './commands-args.ts';
 
 export interface V2CommandExecutionInput {
   readonly sessionID: string;
@@ -82,17 +85,27 @@ export function validateV2CommandExecutionInput(input: unknown): {
 export function assertV2AttachmentsBeforeRun(args: {
   rawArgs: string;
   hasAttachments: boolean;
+  activeGoalStatus?: (goalId: string | null) => string | undefined;
 }): void {
   if (!args.hasAttachments) return;
-  const root = args.rawArgs.trim().toLowerCase().split(/\s+/)[0] ?? '';
-  if (!root || !SUBCOMMAND_ROOTS.has(root)) return;
+  const operation = classifyGoalCommandOperation(args.rawArgs);
   if (
-    root === 'resume' ||
-    root === 'edit' ||
-    root === 'add' ||
-    root === 'sequence'
+    operation === 'set' ||
+    operation === 'resume' ||
+    operation === 'add' ||
+    operation === 'sequence'
   )
     return;
+  if (operation === 'edit') {
+    const operand = args.rawArgs.trim().slice('edit'.length).trim();
+    const {goalId} = splitLeadingGoalId([], operand);
+    const status = args.activeGoalStatus?.(goalId);
+    // An attachment-bearing edit may only proceed when the command will change
+    // lifecycle state. An already-active goal would be mutated before the
+    // post-run guard could reject the command.
+    if (status !== undefined && status !== 'active') return;
+    if (status === undefined && !goalId) return;
+  }
   throw new Error(
     'File, agent, and skill attachments can only be included when starting or resuming a goal.',
   );

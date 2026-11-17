@@ -1,4 +1,4 @@
-// fxk-queued-input.test.ts — FX-K locks: a message sent to the session WITHOUT
+// queued-input.test.ts — FX-K locks: a message sent to the session WITHOUT
 // interrupting the running turn (inbox delivery "queue") must not yield the goal,
 // and the user must be notified. Only interrupting ("steer") human input pauses
 // with 'user intervention' — the existing intervention tests remain the contract.
@@ -120,7 +120,7 @@ async function driveIdle(hooks: ReturnType<typeof createHooks>) {
   });
 }
 
-describe('FX-K getMessageDelivery structural reader', () => {
+describe('getMessageDelivery structural reader', () => {
   test('reads steer/queue from top-level, info, inbox, and pending placements', () => {
     expect(getMessageDelivery({delivery: 'queue'})).toBe('queue');
     expect(getMessageDelivery({info: {delivery: 'steer'}})).toBe('steer');
@@ -132,7 +132,7 @@ describe('FX-K getMessageDelivery structural reader', () => {
   });
 });
 
-describe('FX-K event recording: inbox/queued input lands in runtime delivery sets', () => {
+describe('event recording: inbox and queued input lands in runtime delivery sets', () => {
   test('recordEventInputDelivery maps admitted/inbox event shapes to delivery sets', () => {
     const runtime = createRuntimeState();
     // v2.2.5 released shape: session.inbox.enqueued {sessionID, inboxID, item:{delivery}}
@@ -273,7 +273,7 @@ describe('FX-K event recording: inbox/queued input lands in runtime delivery set
   });
 });
 
-describe('FX-K idle path: queued input does not yield the goal and notifies the user', () => {
+describe('idle path: queued input does not yield the goal and notifies the user', () => {
   test('message annotated delivery queue after the last assistant message keeps the goal active and announces', async () => {
     const machine = new GoalStateMachine(makeActiveGoal(), {
       onCommit: async () => {},
@@ -591,7 +591,7 @@ describe('FX-K idle path: queued input does not yield the goal and notifies the 
   });
 });
 
-describe('FX-K event hook records inbox delivery from host events', () => {
+describe('event hook records inbox delivery from host events', () => {
   test('session.inbox.enqueued and delivery.changed feed the runtime sets through the event hook', async () => {
     const machine = new GoalStateMachine(makeActiveGoal(), {
       onCommit: async () => {},

@@ -195,7 +195,7 @@ export { default } from "file:///absolute/path/to/fixate-on/plugin/fixate-on/tui
 
 The adapter's relative depths depend on where it sits; adjust them to your layout. The e2e harness in `hack/e2e-harness/` ships a working copy of this adapter (`plugin-dir/`) you can copy.
 
-**Both versions from one document:** a shared `opencode.json` works if it keeps the 1.x spelling for the keys 1.x requires (`plugin` and `permission`) and uses the keys both versions normalize (`mcp.servers`, `command`):
+**Both versions from one document:** a shared `opencode.json` works if it keeps the 1.x spelling for the keys 1.x requires (`plugin` and `permission`) and uses the keys both versions normalize (`command`):
 
 ```json
 {
@@ -210,7 +210,7 @@ The adapter's relative depths depend on where it sits; adjust them to your layou
 }
 ```
 
-Do not rename `plugin` to `plugins` or `permission` to `permissions` in a shared document: 1.x rejects `plugins` and `permissions` as unrecognized keys at startup, and rejects the 2.x permission spelling. 2.x accepts and migrates the 1.x spellings, so the 1.x spelling is the portable one. If you want the 2.x keys, give 1.x its own config file.
+Do not rename `plugin` to `plugins` or `permission` to `permissions` in a shared document: checked OpenCode 1.18.x releases silently drop those plural keys (the plugin list resolves empty), and 1.x does not accept the 2.x permission spelling. 2.x accepts and migrates the 1.x spellings, so the 1.x spelling is the portable one. If you want the 2.x keys, give 1.x its own config file.
 
 **Quick smoke test:**
 
@@ -513,8 +513,8 @@ Start with `/goal status --full` (or `--verbose`) and `/goal history --verbose` 
 | Symptom | Cause | Fix |
 |:---|:---|:---|
 | `configured plugin path must be a directory` | OpenCode 2.x was given a plugin **file** path | point `plugins[].package` at the adapter directory (see [Loading from local source](#loading-from-local-source)) |
-| 1.x refuses to start with a configuration error naming `plugins` | `plugins` (plural) was used in a 1.x-read config; 1.x rejects the unknown key | use `plugin` (singular); 2.x migrates it |
-| 1.x refuses to start with a permissions error | a 2.x-style `permissions` key in a shared config | use the 1.x `permission` map; 2.x migrates it |
+| 1.x loads no configured plugins (no error) | `plugins` (plural) was used in a 1.x-read config; checked 1.18.x releases silently drop it | use `plugin` (singular); 2.x migrates it |
+| 1.x ignores 2.x-style permissions | a `permissions` key in a shared config; checked 1.18.x releases silently drop it | use the 1.x `permission` map; 2.x migrates it |
 | 2.x `/goal foo` becomes plain chat | no `goal` command reached the session (transform unavailable and no bridge template) | on 2.x builds with `command.transform` this should not happen; on older builds declare `command.goal` with the `goal-command` template and `$ARGUMENTS` (see [`/goal` on OpenCode 2.x](#goal-on-opencode-2x)) |
 | 2.x TUI shows the plugin failed to load | older 2.x builds (through v2.2.5) rejected `file://` plugin URLs / never registered palette entries; all 2.x builds reject a plugin **file** target | install `fixate-on` from npm, use an adapter directory for a local checkout, and on v2.2.7+ `cli.json` `file://` entries work; see [Compatibility & Known Limits](#compatibility--known-limits) |
 | 1.x TUI companion never appears | the companion was placed in `opencode.json` instead of `tui.json` | 1.x loads the companion only from `tui.json` (see [TUI companion setup](#tui-companion-setup)) |

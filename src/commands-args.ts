@@ -344,6 +344,38 @@ export function isBareGoalObjective(line: string): boolean {
 }
 
 /**
+ * The dispatched operation for a `/goal` line, mirroring handleCommandOutcome's
+ * whole-token/root rules without mutating state. Used by callers that must make
+ * the same decision before a state-changing command runs.
+ */
+export type GoalCommandOperation =
+  'set' | 'clear' | 'resume' | 'edit' | 'add' | 'sequence' | 'other';
+
+export function classifyGoalCommandOperation(
+  line: string,
+): GoalCommandOperation {
+  const trimmed = line.trim();
+  // CLEAR_COMMANDS dispatch only on a bare verb or verb + one operand; longer
+  // sentences are bare objectives even though the first word is a root.
+  const lower = trimmed.toLowerCase();
+  const clearMatch = /^([A-Za-z]+)(?:\s+(\S+))?$/.exec(trimmed);
+  if (clearMatch && CLEAR_COMMANDS.has(clearMatch[1].toLowerCase()))
+    return 'clear';
+  if (lower === 'resume' || lower.startsWith('resume ')) return 'resume';
+  if (lower === 'edit' || lower.startsWith('edit ')) return 'edit';
+  if (lower === 'add' || lower.startsWith('add ')) return 'add';
+  if (lower === 'sequence' || lower.startsWith('sequence ')) return 'sequence';
+  // Remaining roots that dispatch on any `root <rest>` form. A newline is not
+  // a space in the handler's checks, so multiline text is a bare objective.
+  for (const candidate of SUBCOMMAND_ROOTS) {
+    if (CLEAR_COMMANDS.has(candidate)) continue;
+    if (lower === candidate || lower.startsWith(`${candidate} `))
+      return 'other';
+  }
+  return 'set';
+}
+
+/**
  * Canonical identity of a goal subcommand line, used for duplicate-dispatch detection.
  *
  * Resolves non-semantic differences introduced when models reproduce submission

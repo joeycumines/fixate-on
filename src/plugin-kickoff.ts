@@ -42,7 +42,12 @@ export interface KickoffWiring {
   scheduleKickoff: (sessionID: string, goalId: string, runId: string) => void;
   executeSlashCommand: (
     input: {sessionID?: string; command?: string; arguments?: string},
-    options?: {skipKickoff?: boolean; skipReplayRecord?: boolean},
+    options?: {
+      skipKickoff?: boolean;
+      skipReplayRecord?: boolean;
+      clearKickoffOnSkip?: boolean;
+      preserveKickoffOnSkip?: boolean;
+    },
   ) => Promise<SlashCommandResult>;
   commandExecuteBefore: (
     input: {sessionID?: string; command?: string; arguments?: string},
@@ -92,6 +97,19 @@ export function createKickoffWiring(args: {
       kickoffTimers.delete(sessionID);
     }
   };
+  const machineByGoalId = (
+    sessionID: string,
+    goalID: string,
+  ): ReturnType<SessionStateManager['getMachine']> => {
+    const context = getSessionContext(sessionID);
+    return (
+      context?.getMachineById?.(goalID) ??
+      context
+        ?.listMachines?.()
+        ?.find(machine => machine.snapshot().goalId === goalID) ??
+      stateManager.getMachine(sessionID)
+    );
+  };
   const scheduleKickoff = (
     sessionID: string,
     goalId: string,
@@ -122,7 +140,7 @@ export function createKickoffWiring(args: {
         // reached or leased by another process) must not be prompted or execute work.
         if (!runtime.canDriveSession?.(sessionID)) return;
         if (runtime.promptInFlightSessions.has(sessionID)) return;
-        const machineNow = stateManager.getMachine(sessionID);
+        const machineNow = machineByGoalId(sessionID, goalId);
         if (!machineNow) return;
         const snap = machineNow.snapshot();
         if (
@@ -153,7 +171,7 @@ export function createKickoffWiring(args: {
             // If fetching messages fails, proceed with kickoff; continuation claims and
             // in-flight guards provide fallback deduplication.
           }
-          const machineAtFire = stateManager.getMachine(sessionID);
+          const machineAtFire = machineByGoalId(sessionID, goalId);
           if (!machineAtFire || runtime.disposed) return;
           // Re-check after async calls in case the session fence was established during message retrieval.
           if (!runtime.canDriveSession?.(sessionID)) return;
@@ -164,6 +182,19 @@ export function createKickoffWiring(args: {
             fireSnap.status !== 'active'
           )
             return;
+          const pending = runtime.pendingKickoffDispatch?.get(sessionID);
+          if (pending && pending.goalId === goalId && pending.runId === runId) {
+            runtime.pendingKickoffDispatch?.delete(sessionID);
+            try {
+              await runtime.retryPendingKickoffDispatch?.(
+                sessionID,
+                pending.dispatch,
+              );
+            } catch {
+              // A retry failure is retried by the next idle or explicit resume.
+            }
+            return;
+          }
           let message: string = buildContinueMessage(fireSnap, {});
           if (typeof message !== 'string') message = String(message ?? '');
           const resolvedAgent = normalizeInheritedAgentForPrompt(
@@ -207,7 +238,12 @@ export function createKickoffWiring(args: {
 
   const executeSlashCommand = async (
     input: {sessionID?: string; command?: string; arguments?: string},
-    options?: {skipKickoff?: boolean; skipReplayRecord?: boolean},
+    options?: {
+      skipKickoff?: boolean;
+      skipReplayRecord?: boolean;
+      clearKickoffOnSkip?: boolean;
+      preserveKickoffOnSkip?: boolean;
+    },
   ): Promise<SlashCommandResult> => {
     const emptyResult = (
       overrides: Partial<SlashCommandResult>,
@@ -340,7 +376,10 @@ export function createKickoffWiring(args: {
       const enteredActive = outcome.ok && activatedGoal !== null;
       if (enteredActive && registerCommand && !options?.skipKickoff) {
         scheduleKickoff(sessionID, after!.goalId, after!.runId);
-      } else if (options?.skipKickoff || after?.status !== 'active') {
+      } else if (
+        !options?.preserveKickoffOnSkip &&
+        (options?.clearKickoffOnSkip || after?.status !== 'active')
+      ) {
         clearKickoffTimer(sessionID);
       }
       return {

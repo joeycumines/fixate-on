@@ -428,7 +428,7 @@ describe('verdict prompt is falsification-first', () => {
   });
 });
 
-describe('verifier child-session isolation (review 05-08)', () => {
+describe('verifier child-session isolation', () => {
   function makeClient(child: unknown): {
     session: Record<string, (...args: unknown[]) => Promise<unknown>>;
   } {
@@ -498,5 +498,124 @@ describe('verifier child-session isolation (review 05-08)', () => {
     await expect(verifier(verdictArgs as never)).rejects.toThrow(
       /location|workspace/i,
     );
+  });
+
+  test('verifier accepts a v1 child whose workspace is a top-level directory', async () => {
+    const child = {
+      id: 'child-v1',
+      parentID: 'session-1',
+      agent: 'goal-verify',
+      directory: '/target/workspace',
+    };
+    const client = makeClient(child);
+    const deleted: string[] = [];
+    const captureDeleteInput = (input: unknown): void => {
+      const record = input as {
+        sessionID?: unknown;
+        path?: {id?: unknown};
+        body?: {sessionID?: unknown};
+      };
+      deleted.push(
+        String(
+          record.sessionID ?? record.path?.id ?? record.body?.sessionID ?? '',
+        ),
+      );
+    };
+    client.session.delete = async input => {
+      captureDeleteInput(input);
+      return {};
+    };
+    const verdict = await createChildSessionVerifier(
+      client,
+      {},
+    )(verdictArgs as never);
+    expect(verdict.state).toBe('WORKING');
+    expect(deleted).toEqual(['child-v1']);
+  });
+
+  test('verifier deletes a child created after timeout even when get fails', async () => {
+    let resolveCreate: ((value: unknown) => void) | undefined;
+    const deleted: string[] = [];
+    const captureDeleteInput = (input: unknown): void => {
+      const record = input as {
+        sessionID?: unknown;
+        path?: {id?: unknown};
+        body?: {sessionID?: unknown};
+      };
+      deleted.push(
+        String(
+          record.sessionID ?? record.path?.id ?? record.body?.sessionID ?? '',
+        ),
+      );
+    };
+    const client = {
+      session: {
+        create: async () =>
+          await new Promise<unknown>(resolve => {
+            resolveCreate = resolve;
+          }),
+        get: async () => {
+          throw new Error('lookup failed');
+        },
+        prompt: async () => ({}),
+        delete: async (input: unknown) => {
+          captureDeleteInput(input);
+          return {};
+        },
+        abort: async () => ({}),
+        messages: async () => [],
+      },
+    };
+    const verdictPromise = createChildSessionVerifier(client, {timeoutMs: 5})(
+      verdictArgs as never,
+    );
+    const timedOut = expect(verdictPromise).rejects.toThrow(/timed out/);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    resolveCreate?.({id: 'late-child', parentID: 'session-1'});
+    await timedOut;
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(deleted).toEqual(['late-child']);
+  });
+
+  test('verifier deletes a late-created child whose location is invalid', async () => {
+    let resolveCreate: ((value: unknown) => void) | undefined;
+    const deleted: string[] = [];
+    const captureDeleteInput = (input: unknown): void => {
+      const record = input as {
+        sessionID?: unknown;
+        path?: {id?: unknown};
+        body?: {sessionID?: unknown};
+      };
+      deleted.push(
+        String(
+          record.sessionID ?? record.path?.id ?? record.body?.sessionID ?? '',
+        ),
+      );
+    };
+    const client = {
+      session: {
+        create: async () =>
+          await new Promise<unknown>(resolve => {
+            resolveCreate = resolve;
+          }),
+        get: async () => ({id: 'late-child', parentID: 'session-1'}),
+        prompt: async () => ({}),
+        delete: async (input: unknown) => {
+          captureDeleteInput(input);
+          return {};
+        },
+        abort: async () => ({}),
+        messages: async () => [],
+      },
+    };
+    const verdictPromise = createChildSessionVerifier(client, {timeoutMs: 5})(
+      verdictArgs as never,
+    );
+    const timedOut = expect(verdictPromise).rejects.toThrow(/timed out/);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    resolveCreate?.({id: 'late-child', parentID: 'session-1'});
+    await timedOut;
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(deleted).toEqual(['late-child']);
   });
 });

@@ -76,6 +76,7 @@ export type NoticeKind =
   | 'prompt-failure'
   | 'persistence-failure'
   | 'tool-surface-unavailable'
+  | 'background-completion-unreported'
   | 'user-intervention'
   | 'retraction'
   | 'completion-gate'

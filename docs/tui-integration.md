@@ -87,12 +87,12 @@ OpenCode 1.x (`opencode`) and 2.x (`opencode2`) each read a different file, and 
 ```json
 {
   "plugins": [
-    { "package": "fixate-on", "options": { "stateRoot": ".opencode/goals" } }
+    { "package": "file:///absolute/path/to/plugin-wrappers/fixate-on", "options": { "stateRoot": ".opencode/goals" } }
   ]
 }
 ```
 
-`cli.json` (use the directory adapter described below — a bare `fixate-on/tui-v2` package spec is parsed as GitHub shorthand, and a direct `file://` URL to a `tui-v2.js` file is skipped by the 2.x TUI loader):
+`cli.json` (the companion uses the same directory adapter; a bare `fixate-on/tui-v2` package spec is parsed as GitHub shorthand, and a direct `file://` URL to a `tui-v2.js` file is skipped by the 2.x TUI loader):
 
 ```json
 {

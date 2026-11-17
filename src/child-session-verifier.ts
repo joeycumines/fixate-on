@@ -599,13 +599,29 @@ export function createChildSessionVerifier(
     let childID: string | undefined;
     let timedOut = false;
     let cleanupCompleted = false;
+    const activeDeleteApi = createSessionApiForJudge(client, sdkShape);
+
+    const deleteVerifierChild = async (): Promise<void> => {
+      if (!childID || cleanupCompleted) return;
+      if (typeof c?.session?.delete !== 'function') {
+        throw new Error('child-session cleanup unsupported by host');
+      }
+      try {
+        await activeDeleteApi.delete(childID);
+        cleanupCompleted = true;
+      } catch (error) {
+        throw new Error(
+          `child-session cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    };
 
     const run = async (): Promise<CompletionVerdict> => {
       if (!c?.session?.create || !c?.session?.prompt) {
         throw new Error('child-session API unavailable');
       }
 
-      const sessionApi = createSessionApiForJudge(client, sdkShape);
+      const sessionApi = activeDeleteApi;
       const created = await sessionApi.createChild(goal.sessionID, {
         title: 'goal completion verification',
         ...(location ? {location} : {}),
@@ -624,6 +640,14 @@ export function createChildSessionVerifier(
         throw new Error('child session parent relationship was not preserved');
       }
 
+      // A timeout that wins while createChild is in flight is owned here: the
+      // outer finally already ran without a child ID, so finish cleanup before
+      // any further host call can fail.
+      if (timedOut) {
+        await deleteVerifierChild();
+        throw new Error(`verifier timed out after ${timeoutMs}ms`);
+      }
+
       // The verifier judges THIS workspace. A host that ignores the requested
       // location (e.g. because a parentID forces the parent's location) must
       // fail closed rather than attest a different tree. Likewise, a verifier
@@ -635,12 +659,14 @@ export function createChildSessionVerifier(
       if (canVerifySession) {
         const actual = (await sessionApi.get(childID)) as {
           agent?: unknown;
+          directory?: unknown;
           location?: {directory?: unknown};
         } | null;
-        const actualDir = actual?.location?.directory;
+        const rawDir = actual?.location?.directory ?? actual?.directory;
+        const actualDir = typeof rawDir === 'string' ? rawDir : undefined;
         const expectedDir = cwd ? canonicalPath(cwd) : undefined;
         if (
-          typeof actualDir !== 'string' ||
+          !actualDir ||
           !actualDir.trim() ||
           !expectedDir ||
           canonicalPath(actualDir) !== expectedDir
@@ -657,22 +683,7 @@ export function createChildSessionVerifier(
       }
 
       if (timedOut) {
-        // The timeout may win while createChild is still in flight. The
-        // outer finally ran before childID became known, so clean up this
-        // late-created child here before reporting the timeout.
-        if (typeof c?.session?.delete !== 'function') {
-          throw new Error(
-            'verifier timed out; child-session cleanup unsupported by host',
-          );
-        }
-        try {
-          await sessionApi.delete(childID);
-          cleanupCompleted = true;
-        } catch (error) {
-          throw new Error(
-            `verifier timed out; child-session cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
-          );
-        }
+        await deleteVerifierChild();
         throw new Error(`verifier timed out after ${timeoutMs}ms`);
       }
 
@@ -735,19 +746,7 @@ export function createChildSessionVerifier(
       throw new Error(`verifier error: ${msg}`);
     } finally {
       if (timerID) clearTimeout(timerID);
-      if (childID && !cleanupCompleted) {
-        if (typeof c?.session?.delete !== 'function') {
-          throw new Error('child-session cleanup unsupported by host');
-        }
-        try {
-          await createSessionApiForJudge(client, sdkShape).delete(childID);
-          cleanupCompleted = true;
-        } catch (error) {
-          throw new Error(
-            `child-session cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
-          );
-        }
-      }
+      if (childID) await deleteVerifierChild();
     }
   };
 }

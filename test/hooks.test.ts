@@ -383,7 +383,7 @@ test('event with session.idle continues the goal', async () => {
   expect(mockApi.promptsSent[0]).toContain('Continue working');
 });
 
-test('BUDGET-D2: noProgressTurns counts TURNS, not idle ticks', async () => {
+test('noProgressTurns counts TURNS, not idle ticks', async () => {
   // The regression this locks: the idle handler re-evaluates the SAME latest
   // message on every tick, so one unchanged stalled message advanced the streak
   // to the threshold of 2 by itself (measured live: 6 tracking runs for
@@ -449,7 +449,7 @@ test('BUDGET-D2: noProgressTurns counts TURNS, not idle ticks', async () => {
   expect(machine.snapshot().status).toBe('active');
 });
 
-test('BUDGET-D3: a host with no usage events attributes usage from fetched messages', async () => {
+test('a host with no usage events attributes usage from fetched messages', async () => {
   // v1 hosts deliver no message.updated, so goal.totalTokens stayed 0, the token
   // brake never fired, and the cockpit rendered a false 0 / N gauge. The idle
   // handler already fetches the messages, so it must attribute them.
@@ -499,7 +499,7 @@ test('BUDGET-D3: a host with no usage events attributes usage from fetched messa
   expect(machine.snapshot().usage.output).toBe(4000);
 });
 
-test('BUDGET-D3: a v2 host (session.usage.updated, never message.updated) is not double-counted', async () => {
+test('a v2 host (session.usage.updated, never message.updated) is not double-counted', async () => {
   // The hole this locks: the guard was set only on `message.updated`, which v2
   // NEVER emits, so on v2 the idle path attributed usage that the usage event had
   // already charged — measured: 4000 became 8000, which fires the token-budget
@@ -557,7 +557,7 @@ test('BUDGET-D3: a v2 host (session.usage.updated, never message.updated) is not
   expect(machine.snapshot().usage.output).toBe(afterUsage);
 });
 
-test('BUDGET-D3: on a usage-emitting host, idle does NOT attribute messages events never covered', async () => {
+test('on a usage-emitting host, idle does NOT attribute messages events never covered', async () => {
   // The guard's real job: on v2 the host's own usage events are the authority,
   // and the idle handler must not ADD attribution the host never reported. This
   // message is in the goal's message set and in the fetched list, but no
@@ -617,7 +617,7 @@ test('BUDGET-D3: on a usage-emitting host, idle does NOT attribute messages even
   expect(machine.snapshot().totalTokens).toBe(afterEvent);
 });
 
-test('BUDGET-D3: a host that DOES emit usage events is not double-counted', async () => {
+test('a host that DOES emit usage events is not double-counted', async () => {
   // The v2 guard: attributing from fetched messages on a host that already
   // delivers message.updated would charge every token twice.
   const goal = makeGoal({
@@ -3141,7 +3141,7 @@ test('idlePoller:false starts no poller at all', async () => {
 // `info.id`, so it early-returned with no attribution. Every earlier test used
 // the v2 shape (info object passed directly), so none could see it.
 
-test('BUDGET-D3: a v1-shaped message ({ info, parts }) is attributed, not skipped', async () => {
+test('a v1-shaped message ({ info, parts }) is attributed, not skipped', async () => {
   const goal = makeGoal({
     turnCount: 1,
     maxTurns: 25,
@@ -3353,7 +3353,7 @@ function recoveryPausedSetup(): {machine: GoalStateMachine; deps: HookDeps} {
   runtime.recoveryPendingSessions.add('session-1');
   // Liveness: the re-arm fires for a session the host owns in this process.
   // The stale-session shape (flag without liveness) is covered in
-  // fxj-idle-poll.test.ts, which asserts the flag is consumed un-armed.
+  // idle-poll-fallback.test.ts, which asserts the flag is consumed un-armed.
   runtime.liveSessions.add('session-1');
   const session = makeSessionContext({machine});
   const sessionApi = makeMockSessionApi({
@@ -3477,7 +3477,7 @@ function toolCycle(n: number): unknown[] {
   ];
 }
 
-test('NO-TOOL-CALL-BRAKE: a goal whose agent calls a tool EVERY cycle is not paused', async () => {
+test('a goal whose agent calls a tool EVERY cycle is not paused', async () => {
   const goal = makeGoal({
     turnCount: 1,
     noToolCallTurns: 0,
@@ -3508,7 +3508,7 @@ test('NO-TOOL-CALL-BRAKE: a goal whose agent calls a tool EVERY cycle is not pau
   }
 });
 
-test('NO-TOOL-CALL-BRAKE: a genuinely talk-only goal STILL pauses', async () => {
+test('a genuinely talk-only goal STILL pauses', async () => {
   // The fix must not neuter the brake it protects: with no tool part anywhere
   // in the window, the counter must still reach the threshold.
   const goal = makeGoal({
@@ -3588,7 +3588,7 @@ function idlessProseTurn(text: string): unknown {
   };
 }
 
-test('PER-TURN-GUARD: an id-less unchanged turn cannot accumulate the no-tool-call brake', async () => {
+test('an id-less unchanged turn cannot accumulate the no-tool-call brake', async () => {
   const goal = makeGoal({
     turnCount: 1,
     noToolCallTurns: 0,
@@ -3615,7 +3615,7 @@ test('PER-TURN-GUARD: an id-less unchanged turn cannot accumulate the no-tool-ca
   expect(snap.status).toBe('active');
 });
 
-test('PER-TURN-GUARD: an id-less turn cannot accumulate the no-progress brake either', async () => {
+test('an id-less turn cannot accumulate the no-progress brake either', async () => {
   const goal = makeGoal({
     turnCount: 1,
     noProgressTurns: 0,
@@ -3649,7 +3649,7 @@ test('PER-TURN-GUARD: an id-less turn cannot accumulate the no-progress brake ei
   expect(machine.snapshot().noProgressTurns).toBe(1);
 });
 
-test('PER-TURN-GUARD: a genuinely NEW id-less turn still advances BOTH counters', async () => {
+test('a genuinely NEW id-less turn still advances BOTH counters', async () => {
   // The fail-safe must not disable the brakes on an id-less host either. This is
   // the id-less TWIN of the id-bearing test below: same shape, same threshold,
   // same expected counts.
@@ -3706,7 +3706,7 @@ test('PER-TURN-GUARD: a genuinely NEW id-less turn still advances BOTH counters'
   expect(snap.status).toBe('paused');
 });
 
-test('PER-TURN-GUARD: an ID-BEARING host still counts turns normally', async () => {
+test('an ID-BEARING host still counts turns normally', async () => {
   // The fail-safe must not disable the brakes on a normal host.
   const goal = makeGoal({
     turnCount: 1,
@@ -3751,7 +3751,7 @@ test('PER-TURN-GUARD: an ID-BEARING host still counts turns normally', async () 
   expect(snap.status).toBe('paused');
 });
 
-test('PER-TURN-GUARD: an ID-BEARING host yields the SAME counters as the id-less twin', async () => {
+test('an ID-BEARING host yields the SAME counters as the id-less twin', async () => {
   // HOST PARITY, driven rather than asserted: identical turns, the only
   // difference being that this host reports ids. Any divergence between this
   // test and the id-less one above is a host-dependent brake — the class of bug
@@ -3809,7 +3809,7 @@ test('PER-TURN-GUARD: an ID-BEARING host yields the SAME counters as the id-less
 // was to misrepresent finished work as `blocked`. These tests drive the real
 // hooks path and assert the goal ENDS.
 
-test('ATTESTATION: a sustained fault over a CHANGING workspace SETTLES the goal', async () => {
+test('a sustained fault over a CHANGING workspace SETTLES the goal', async () => {
   // A static workspace CANNOT settle on a fault streak, and must not: with
   // nothing changing, a fault streak is a STUCK AGENT, and the stuck-agent
   // pause (unchanged > maxUnchangedResults) correctly fires before the fault
@@ -3894,7 +3894,7 @@ test('ATTESTATION: a sustained fault over a CHANGING workspace SETTLES the goal'
   );
 });
 
-test('ATTESTATION: a fault over a STATIC workspace PAUSES (stuck agent), never settles', async () => {
+test('a fault over a STATIC workspace PAUSES (stuck agent), never settles', async () => {
   // The other half, and the reason the test above must move the workspace: with
   // nothing changing, repeated unverifiable completion assertions are a stuck
   // agent. Settling there would accept a looping agent's assertions as
@@ -3970,7 +3970,7 @@ test('ATTESTATION: a fault over a STATIC workspace PAUSES (stuck agent), never s
   );
 });
 
-test('ATTESTATION: the fault path is visible and persistent, not silent', async () => {
+test('the fault path is visible and persistent, not silent', async () => {
   const machine = new GoalStateMachine(makeGoal(), {
     onCommit: async () => {},
   });
@@ -4022,7 +4022,7 @@ test('ATTESTATION: the fault path is visible and persistent, not silent', async 
 // actually SETTLE the goal through the real hooks path, and one that answers
 // WORKING must keep it working. That wiring is the whole point of the tier.
 
-test('ATTESTATION: a judge that concurs SETTLES the goal, recorded as attested', async () => {
+test('a judge that concurs SETTLES the goal, recorded as attested', async () => {
   const machine = new GoalStateMachine(makeGoal(), {
     onCommit: async () => {},
   });
@@ -4078,7 +4078,7 @@ test('ATTESTATION: a judge that concurs SETTLES the goal, recorded as attested',
   expect(last?.outcome.status).toBe('verified-complete');
 });
 
-test('ATTESTATION: a judge that refuses keeps the goal WORKING with its objections', async () => {
+test('a judge that refuses keeps the goal WORKING with its objections', async () => {
   const machine = new GoalStateMachine(makeGoal(), {
     onCommit: async () => {},
   });
@@ -4135,7 +4135,7 @@ test('ATTESTATION: a judge that refuses keeps the goal WORKING with its objectio
   );
 });
 
-test('ATTESTATION: resume resets the fault streak, so the bound is CONSECUTIVE', async () => {
+test('resume resets the fault streak, so the bound is CONSECUTIVE', async () => {
   // The pause message tells the user to run /goal resume. If the streak survived
   // the resume, the very next fault would settle the goal unattested — the
   // "consecutive" invariant would be false for exactly the user who followed
@@ -4202,7 +4202,7 @@ test('ATTESTATION: resume resets the fault streak, so the bound is CONSECUTIVE',
   expect(machine.snapshot().attestationFaults).toBe(1);
 });
 
-test('ATTESTATION: an unattestable settlement is ARCHIVED, not left active-complete', async () => {
+test('an unattestable settlement is ARCHIVED, not left active-complete', async () => {
   // The label must survive archiving: a goal that settled without an attestation
   // has to leave the active set and appear in the archive with its honest
   // marker. Before this it stayed active-complete, so the label never reached
@@ -4357,7 +4357,7 @@ test('a judge that OMITS the identity fields still settles', async () => {
   expect(machine.snapshot().status).toBe('complete');
 });
 
-test('NO-TOOL-CALL-BRAKE: historical tool calls do not suppress noToolCallTurns on subsequent tool-free turns', async () => {
+test('historical tool calls do not suppress noToolCallTurns on subsequent tool-free turns', async () => {
   const goal = makeGoal({
     turnCount: 1,
     noToolCallTurns: 0,

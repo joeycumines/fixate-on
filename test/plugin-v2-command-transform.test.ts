@@ -786,3 +786,178 @@ test('v2 commands.goal config override coexists with draft.add and consumeComman
     rmSync(root, {recursive: true, force: true});
   }
 });
+
+test('v2 attachment preflight accepts objectives the command parser treats as bare', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'fixate-v2-preflight-parser-'));
+  const ws = join(root, 'ws');
+  mkdirSync(ws, {recursive: true});
+  const harness = createV2CommandTestCtx({directory: ws});
+  const dispose = await setup(harness.ctx);
+  try {
+    const goalCmd = harness.registeredByAdd.get('goal')!;
+    const objectives = [
+      'Reset the test database and repair the failing migration',
+      'clear the stale cache entries described in the attachment',
+      'clear\nplain multiline objective',
+    ];
+    for (const [index, text] of objectives.entries()) {
+      const sessionID = `s-parser-${index}`;
+      await goalCmd.execute!({
+        sessionID,
+        prompt: {text, files: [{path: 'schema.sql'}]},
+      });
+      const store = createTuiStateStore();
+      await hydrateStoreFromDisk(store, ws);
+      expect(store.getFocused(sessionID)?.condition).toBe(
+        text.replace(/\s+/g, ' ').trim(),
+      );
+    }
+    expect(harness.promptCalls).toHaveLength(objectives.length);
+  } finally {
+    harness.closeEvents();
+    await dispose();
+    rmSync(root, {recursive: true, force: true});
+  }
+});
+
+test('v2 attached edit of an active goal is rejected before mutating state', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'fixate-v2-attached-edit-'));
+  const ws = join(root, 'ws');
+  mkdirSync(ws, {recursive: true});
+  const harness = createV2CommandTestCtx({directory: ws});
+  const dispose = await setup(harness.ctx);
+  try {
+    const goalCmd = harness.registeredByAdd.get('goal')!;
+    await goalCmd.execute!({
+      sessionID: 's-edit',
+      prompt: {text: 'Original objective'},
+    });
+    await expect(
+      goalCmd.execute!({
+        sessionID: 's-edit',
+        prompt: {
+          text: 'edit Replacement objective',
+          files: [{path: 'spec.md'}],
+        },
+      }),
+    ).rejects.toThrow(/starting or resuming/i);
+    const store = createTuiStateStore();
+    await hydrateStoreFromDisk(store, ws);
+    expect(store.getFocused('s-edit')?.condition).toBe('Original objective');
+    expect(store.getFocused('s-edit')?.status).toBe('active');
+  } finally {
+    harness.closeEvents();
+    await dispose();
+    rmSync(root, {recursive: true, force: true});
+  }
+});
+
+test('v2 admission retry preserves the full dispatch and survives a status command', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'fixate-v2-admission-retry-'));
+  const ws = join(root, 'ws');
+  mkdirSync(ws, {recursive: true});
+  const promptCalls: Array<Record<string, unknown>> = [];
+  const harness = createV2CommandTestCtx({
+    directory: ws,
+    options: {kickoffDelayMs: 5000},
+  });
+  harness.ctx.session.prompt = async (input: Record<string, unknown>) => {
+    promptCalls.push(input);
+    if (promptCalls.length === 1) throw new Error('admission rejected');
+    return {id: 'retried-prompt', type: 'user'};
+  };
+  const dispose = await setup(harness.ctx);
+  const realSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = ((fn: () => void, delay?: number) =>
+    realSetTimeout(
+      fn,
+      delay === 5000 ? 0 : delay,
+    )) as typeof globalThis.setTimeout;
+  try {
+    const goalCmd = harness.registeredByAdd.get('goal')!;
+    const files = [{path: 'must-read.md'}];
+    const agents = [{name: 'required-agent'}];
+    const skills = [{name: 'required-skill'}];
+    await expect(
+      goalCmd.execute!({
+        sessionID: 's-retry-payload',
+        prompt: {
+          text: 'Follow attached requirements',
+          files,
+          agents,
+          skills,
+        },
+        delivery: 'queue',
+      }),
+    ).rejects.toThrow(/admission rejected/i);
+    await goalCmd.execute!({
+      sessionID: 's-retry-payload',
+      prompt: {text: 'status'},
+    });
+    await waitFor(
+      () => promptCalls.length === 2,
+      'the original dispatch to be retried',
+    );
+    expect(promptCalls[1]?.files).toEqual(files);
+    expect(promptCalls[1]?.agents).toEqual(agents);
+    expect(promptCalls[1]?.skills).toEqual(skills);
+    expect(promptCalls[1]?.delivery).toBe('queue');
+    expect(harness.syntheticCalls).toHaveLength(0);
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+    harness.closeEvents();
+    await dispose();
+    rmSync(root, {recursive: true, force: true});
+  }
+});
+
+test('v2 queue-to-steer promotion of an inbox stop pauses the goal', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'fixate-v2-inbox-promote-'));
+  const ws = join(root, 'ws');
+  mkdirSync(ws, {recursive: true});
+  const harness = createV2CommandTestCtx({directory: ws});
+  const dispose = await setup(harness.ctx);
+  try {
+    const goalCmd = harness.registeredByAdd.get('goal')!;
+    await goalCmd.execute!({
+      sessionID: 's-promote',
+      prompt: {text: 'Build the feature'},
+    });
+
+    // A queued 'stop' arrives with no text on the later delivery-change event.
+    harness.pushEvent({
+      type: 'session.inbox.enqueued',
+      data: {
+        sessionID: 's-promote',
+        inboxID: 'inbox-stop',
+        item: {
+          id: 'inbox-stop',
+          type: 'user',
+          delivery: 'queue',
+          payload: {text: 'stop'},
+        },
+      },
+    });
+    await waitFor(
+      () => harness.eventsDrained(),
+      'the queued inbox event to be handled',
+    );
+    harness.pushEvent({
+      type: 'session.inbox.delivery.changed',
+      data: {sessionID: 's-promote', inboxID: 'inbox-stop', delivery: 'steer'},
+    });
+    await waitFor(
+      () => harness.eventsDrained(),
+      'the delivery change to be handled',
+    );
+
+    const store = createTuiStateStore();
+    await hydrateStoreFromDisk(store, ws);
+    expect(store.getFocused('s-promote')?.status).toBe('paused');
+    expect(store.getFocused('s-promote')?.stopReason).toBe('explicit pause');
+  } finally {
+    harness.closeEvents();
+    await dispose();
+    rmSync(root, {recursive: true, force: true});
+  }
+});

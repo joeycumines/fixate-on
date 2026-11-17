@@ -91,6 +91,20 @@ export interface RuntimeState {
    * fallback idle poller cannot defeat a deferral made by the native idle hook.
    */
   backgroundBlockedUntil: Map<string, number>;
+  /**
+   * Structured background-work deferrals: the job identities that caused the
+   * deferral and when escalation should occur. The wall-clock gate alone is not
+   * a completion signal; only a later host idle with an empty background is.
+   */
+  backgroundDeferrals?: Map<
+    string,
+    {
+      jobKeys: string[];
+      since: number;
+      nextRecheckAt: number;
+      extensions: number;
+    }
+  >;
   /** Consecutive busy-deferral counter per `${sessionID}:${goalId}` (M1 brake). */
   deferCounts: Map<string, number>;
   /**
@@ -136,6 +150,14 @@ export interface RuntimeState {
    */
   surfacedQueuedMessageIDs: Map<string, Set<string>>;
   /**
+   * Original inbox payloads retained by inboxID so a queue→steer delivery change
+   * (which carries no text) can synthesize steering with the original message.
+   */
+  inboxPayloadsByID?: Map<
+    string,
+    Map<string, {text: string; synthetic: boolean}>
+  >;
+  /**
    * Determines whether this process is permitted to drive a session's goals.
    * Prevents competing instances from dispatching actions on owned sessions.
    */
@@ -143,10 +165,30 @@ export interface RuntimeState {
   /** Clears any pending delayed kickoff timer for a session. */
   clearKickoffTimer?: (sessionID: string) => void;
   scheduleKickoff?: (sessionID: string, goalId: string, runId: string) => void;
+  /** Original v2 command dispatch retained for a fenced admission retry. */
+  pendingKickoffDispatch?: Map<
+    string,
+    {goalId: string; runId: string; dispatch: unknown}
+  >;
+  /** Retries a retained v2 dispatch after a delayed kickoff's guards pass. */
+  retryPendingKickoffDispatch?: (
+    sessionID: string,
+    dispatch: unknown,
+  ) => Promise<void>;
+  /** Reports the status of a session goal without mutating it. */
+  getGoalStatus?: (
+    sessionID: string,
+    goalId: string | null,
+  ) => string | undefined;
   /** Executes the plugin's parsed `/goal` slash command without going through v1 chat parts. */
   executeSlashCommand?: (
     input: {sessionID?: string; command?: string; arguments?: string},
-    options?: {skipKickoff?: boolean; skipReplayRecord?: boolean},
+    options?: {
+      skipKickoff?: boolean;
+      skipReplayRecord?: boolean;
+      clearKickoffOnSkip?: boolean;
+      preserveKickoffOnSkip?: boolean;
+    },
   ) => Promise<{
     handled: boolean;
     ok: boolean;
@@ -180,8 +222,10 @@ export function createRuntimeState(): RuntimeState {
     continuationControllers: new Map(),
     promptInFlightSessions: new Set(),
     recoveryPendingSessions: new Set(),
+    pendingKickoffDispatch: new Map(),
     seenIdleEventIDs: new Set(),
     backgroundBlockedUntil: new Map(),
+    backgroundDeferrals: new Map(),
     deferCounts: new Map(),
     compactionTimestamps: new Map(),
     threadToolsRegistered: false,
@@ -192,6 +236,7 @@ export function createRuntimeState(): RuntimeState {
     queuedInputMessageIDs: new Map(),
     steeredInputMessageIDs: new Map(),
     surfacedQueuedMessageIDs: new Map(),
+    inboxPayloadsByID: new Map(),
     drainPersistence: null,
     disposed: false,
   };
@@ -347,6 +392,8 @@ export function clearSessionDeliveryState(
     | 'steeredInputMessageIDs'
     | 'surfacedQueuedMessageIDs'
     | 'backgroundBlockedUntil'
+    | 'backgroundDeferrals'
+    | 'inboxPayloadsByID'
   >,
   sessionID: string,
 ): void {
@@ -354,6 +401,55 @@ export function clearSessionDeliveryState(
   runtime.steeredInputMessageIDs.delete(sessionID);
   runtime.surfacedQueuedMessageIDs.delete(sessionID);
   runtime.backgroundBlockedUntil.delete(sessionID);
+  runtime.backgroundDeferrals?.delete(sessionID);
+  runtime.inboxPayloadsByID?.delete(sessionID);
+}
+
+/** Retain an inbox message's text so a later delivery change can promote it. */
+export function recordInboxPayload(
+  runtime: RuntimeState | undefined,
+  sessionID: string,
+  id: string,
+  payload: {text: string; synthetic: boolean},
+): void {
+  const store = runtime?.inboxPayloadsByID;
+  if (!store || !sessionID || !id || !payload.text) return;
+  let byID = store.get(sessionID);
+  if (!byID) {
+    byID = new Map();
+    store.set(sessionID, byID);
+  }
+  // The per-session cap is the memory bound. No time bound: a turn can run for
+  // many minutes before a queued message is promoted, and the text must remain
+  // available for as long as the id is still in the delivery sets.
+  byID.set(id, {...payload});
+  while (byID.size > DELIVERY_SET_CAP) {
+    const oldest = byID.keys().next().value;
+    if (oldest === undefined) break;
+    byID.delete(oldest);
+  }
+}
+
+/** Read a retained inbox payload without consuming it. */
+export function peekInboxPayload(
+  runtime: RuntimeState | undefined,
+  sessionID: string,
+  id: string,
+): {text: string; synthetic: boolean} | undefined {
+  const payload = runtime?.inboxPayloadsByID?.get(sessionID)?.get(id);
+  if (!payload) return undefined;
+  return {text: payload.text, synthetic: payload.synthetic};
+}
+
+/** Consume a retained inbox payload so a promotion is synthesized at most once. */
+export function consumeInboxPayload(
+  runtime: RuntimeState | undefined,
+  sessionID: string,
+  id: string,
+): {text: string; synthetic: boolean} | undefined {
+  const payload = peekInboxPayload(runtime, sessionID, id);
+  runtime?.inboxPayloadsByID?.get(sessionID)?.delete(id);
+  return payload;
 }
 
 export const runtimeStorage = new AsyncLocalStorage<RuntimeState>();

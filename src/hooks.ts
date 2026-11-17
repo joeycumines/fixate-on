@@ -146,13 +146,56 @@ export function createHooks(deps: HookDeps): PluginHooks {
         // this process lifetime, preventing resumption of un-opened persisted sessions.
         if (!deps.runtime?.liveSessions.has(sessionID)) continue;
         if (deps.runtime?.promptInFlightSessions.has(sessionID)) continue;
-        // A host-reported background job defers idles. The same gate is set by
-        // the native experimental.idle hook; the fallback poller must honor it.
-        if (
-          (deps.runtime?.backgroundBlockedUntil.get(sessionID) ?? 0) >
-          Date.now()
-        )
+        // A host-reported background job defers idles. The wall-clock deadline
+        // is NOT a completion signal — only a later native idle with an empty
+        // background authoritatively clears it. On expiry we keep deferring and
+        // extend with backoff, until a bounded cap pauses with an explicit
+        // receipt instead of driving over live work or stalling forever.
+        const deferral = deps.runtime?.backgroundDeferrals?.get(sessionID);
+        const backgroundDeadline =
+          deps.runtime?.backgroundBlockedUntil.get(sessionID);
+        if (deferral || backgroundDeadline !== undefined) {
+          const now = Date.now();
+          const deadline = backgroundDeadline ?? deferral!.nextRecheckAt;
+          if (deadline > now) continue;
+          const MAX_BACKGROUND_WAIT_MS = 15 * 60_000;
+          const since = deferral?.since ?? now;
+          if (now - since >= MAX_BACKGROUND_WAIT_MS) {
+            // Bounded escalation: pause with an explicit receipt rather than
+            // continue past an unattested completion or loop indefinitely.
+            const session = getSessionContext(sessionID);
+            const allMachines = sessionMachines(session);
+            for (const target of allMachines) {
+              if (target.isTerminal()) continue;
+              await target.transition('paused', {
+                source: 'idle-handler',
+                stopReason: 'background completion unreported',
+                detail:
+                  'A background subagent/image job did not report completion within the wait bound; resume after it finishes.',
+              });
+              await target.addNotice(
+                'background-completion-unreported',
+                'Background job completion was not reported; goal paused. Resume once the job has finished.',
+              );
+            }
+            if (session) await session.persist();
+            deps.runtime?.backgroundDeferrals?.delete(sessionID);
+            deps.runtime?.backgroundBlockedUntil.delete(sessionID);
+            continue;
+          }
+          // Still within the bound: extend the deferral with bounded backoff.
+          // The host's next experimental.idle with empty background clears it.
+          const extensions = (deferral?.extensions ?? 0) + 1;
+          const nextRecheckAt = now + Math.min(60_000, 5_000 * extensions);
+          deps.runtime?.backgroundDeferrals?.set(sessionID, {
+            jobKeys: deferral?.jobKeys ?? [],
+            since,
+            nextRecheckAt,
+            extensions,
+          });
+          deps.runtime?.backgroundBlockedUntil.set(sessionID, nextRecheckAt);
           continue;
+        }
         const lastReal = lastAuthenticIdleAt.get(sessionID);
         if (lastReal !== undefined && Date.now() - lastReal < IDLE_GRACE_MS)
           continue;
