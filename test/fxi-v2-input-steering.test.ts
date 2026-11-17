@@ -19,7 +19,10 @@ import type {GoalState} from '../src/state-machine.ts';
 import {createGoalState, GoalStateMachine} from '../src/state-machine.ts';
 import type {UsageSnapshot} from '../src/accounting.ts';
 import {createLoopPolicy} from '../src/continuation-loop.ts';
-import {synthesizeChatMessageFromAdmitted} from '../src/plugin-v2.ts';
+import {
+  synthesizeChatMessageFromAdmitted,
+  synthesizeChatMessageFromText,
+} from '../src/plugin-v2.ts';
 
 function makeUsage(): UsageSnapshot {
   return {
@@ -122,6 +125,25 @@ describe('FX-I synthesis: session.input.admitted → chat.message hook', () => {
     await synthesizeChatMessageFromAdmitted(
       hooks['chat.message'],
       admittedEvent('session-1', 'stop').data,
+    );
+
+    expect(machine.snapshot().status).toBe('paused');
+    expect(machine.snapshot().stopReason).toBe('explicit pause');
+  });
+
+  test("inbox 'stop' with steer delivery reaches the hook and pauses explicitly", async () => {
+    const machine = new GoalStateMachine(makeActiveGoal(), {
+      onCommit: async () => {},
+    });
+    const hooks = createHooks(
+      makeDeps(makeSessionContext(machine), makeMockSessionApi()),
+    );
+
+    await synthesizeChatMessageFromText(
+      hooks['chat.message'],
+      'session-1',
+      'stop',
+      {sessionID: 'session-1', item: {delivery: 'steer'}},
     );
 
     expect(machine.snapshot().status).toBe('paused');

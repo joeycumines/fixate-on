@@ -767,6 +767,7 @@ export async function GoalsPlugin(
     });
     const {kickoffTimers, scheduleKickoff, clearKickoffTimer} = kickoff;
     runtime.clearKickoffTimer = kickoff.clearKickoffTimer;
+    runtime.scheduleKickoff = kickoff.scheduleKickoff;
     if (registerCommand) {
       runtime.executeSlashCommand = kickoff.executeSlashCommand;
     }
@@ -922,10 +923,12 @@ export async function GoalsPlugin(
         runtime.disposed = true;
         runtime.executeSlashCommand = undefined;
         runtime.clearKickoffTimer = undefined;
+        runtime.scheduleKickoff = undefined;
         runtime.recoveryPendingSessions.clear();
         runtime.queuedInputMessageIDs.clear();
         runtime.steeredInputMessageIDs.clear();
         runtime.surfacedQueuedMessageIDs.clear();
+        runtime.backgroundBlockedUntil.clear();
         for (const controller of runtime.continuationControllers.values())
           controller.abort();
         for (const timer of kickoffTimers.values()) clearTimeout(timer);

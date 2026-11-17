@@ -146,6 +146,13 @@ export function createHooks(deps: HookDeps): PluginHooks {
         // this process lifetime, preventing resumption of un-opened persisted sessions.
         if (!deps.runtime?.liveSessions.has(sessionID)) continue;
         if (deps.runtime?.promptInFlightSessions.has(sessionID)) continue;
+        // A host-reported background job defers idles. The same gate is set by
+        // the native experimental.idle hook; the fallback poller must honor it.
+        if (
+          (deps.runtime?.backgroundBlockedUntil.get(sessionID) ?? 0) >
+          Date.now()
+        )
+          continue;
         const lastReal = lastAuthenticIdleAt.get(sessionID);
         if (lastReal !== undefined && Date.now() - lastReal < IDLE_GRACE_MS)
           continue;

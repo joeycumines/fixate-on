@@ -31,6 +31,7 @@ export interface SlashCommandResult {
   rendered: string;
   before: GoalState | null;
   after: GoalState | null;
+  activatedGoal: GoalState | null;
   enteredActive: boolean;
   error?: string;
 }
@@ -41,7 +42,7 @@ export interface KickoffWiring {
   scheduleKickoff: (sessionID: string, goalId: string, runId: string) => void;
   executeSlashCommand: (
     input: {sessionID?: string; command?: string; arguments?: string},
-    options?: {skipKickoff?: boolean},
+    options?: {skipKickoff?: boolean; skipReplayRecord?: boolean},
   ) => Promise<SlashCommandResult>;
   commandExecuteBefore: (
     input: {sessionID?: string; command?: string; arguments?: string},
@@ -206,7 +207,7 @@ export function createKickoffWiring(args: {
 
   const executeSlashCommand = async (
     input: {sessionID?: string; command?: string; arguments?: string},
-    options?: {skipKickoff?: boolean},
+    options?: {skipKickoff?: boolean; skipReplayRecord?: boolean},
   ): Promise<SlashCommandResult> => {
     const emptyResult = (
       overrides: Partial<SlashCommandResult>,
@@ -221,6 +222,7 @@ export function createKickoffWiring(args: {
       rendered: '',
       before: null,
       after: null,
+      activatedGoal: null,
       enteredActive: false,
       ...overrides,
     });
@@ -275,6 +277,14 @@ export function createKickoffWiring(args: {
 
     const beforeMachine = session.getMachine();
     const before = beforeMachine?.snapshot() ?? null;
+    const beforeByGoal = new Map(
+      (session.listMachines?.() ?? (beforeMachine ? [beforeMachine] : [])).map(
+        m => {
+          const snap = m.snapshot();
+          return [snap.goalId, snap] as const;
+        },
+      ),
+    );
     // Mark slash dispatch so that v1 replaying the command as a chat message can be suppressed.
     markSlashDispatch(sessionID, args);
 
@@ -292,20 +302,42 @@ export function createKickoffWiring(args: {
         'user-command',
       );
       // Record dispatch to prevent duplicate mutations if the host also invokes the command template.
-      markCommandDispatch(sessionID, args, text, receipt, dispatchChanged);
+      // Native v2 commands are the only invocation (no duplicate template channel), so they must
+      // not populate this cache: a later deliberate goal-command call would replay a stale receipt.
+      if (!options?.skipReplayRecord) {
+        markCommandDispatch(sessionID, args, text, receipt, dispatchChanged);
+      }
       const header = formatCommandHeader(runtime.hasTuiCompanion, subcmd);
       const rendered = `${header}\n${text}${receipt ? `\n\n${receipt}` : ''}`;
-      // Trigger kickoff if this command transitioned the goal into an active status.
+      // Activation is a property of the goal the command actually targeted,
+      // not of the focused presentation goal. A named resume can activate a
+      // background goal while focus stays elsewhere.
       const afterMachine = session.getMachine();
-      const after = afterMachine?.snapshot() ?? null;
-      const enteredActive =
-        outcome.ok &&
-        after !== null &&
-        after.status === 'active' &&
-        (before === null ||
-          before.goalId !== after.goalId ||
-          before.runId !== after.runId ||
-          before.status !== 'active');
+      const focusedAfter = afterMachine?.snapshot() ?? null;
+      const afterByGoal = new Map(
+        (session.listMachines?.() ?? (afterMachine ? [afterMachine] : [])).map(
+          m => {
+            const snap = m.snapshot();
+            return [snap.goalId, snap] as const;
+          },
+        ),
+      );
+      let activatedGoal: GoalState | null = null;
+      for (const [goalId, afterGoal] of afterByGoal) {
+        if (afterGoal.status !== 'active') continue;
+        const beforeGoal = beforeByGoal.get(goalId) ?? null;
+        if (
+          beforeGoal === null ||
+          beforeGoal.goalId !== afterGoal.goalId ||
+          beforeGoal.runId !== afterGoal.runId ||
+          beforeGoal.status !== 'active'
+        ) {
+          activatedGoal = afterGoal;
+          break;
+        }
+      }
+      const after = activatedGoal ?? focusedAfter;
+      const enteredActive = outcome.ok && activatedGoal !== null;
       if (enteredActive && registerCommand && !options?.skipKickoff) {
         scheduleKickoff(sessionID, after!.goalId, after!.runId);
       } else if (options?.skipKickoff || after?.status !== 'active') {
@@ -322,6 +354,7 @@ export function createKickoffWiring(args: {
         rendered,
         before,
         after,
+        activatedGoal,
         enteredActive,
         ...(outcome.ok ? {} : {error: text}),
       };
@@ -338,6 +371,7 @@ export function createKickoffWiring(args: {
         rendered: 'Goal command error: ' + message,
         before,
         after: before,
+        activatedGoal: null,
         enteredActive: false,
         error: message,
       };

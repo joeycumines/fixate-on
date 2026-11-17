@@ -30,6 +30,7 @@ function createV2CommandTestCtx(opts: {
   mode?: 'add-only' | 'update-only';
   preRegisteredGoal?: AddCommandEntry;
   contextMessages?: () => unknown[];
+  onSynthetic?: (input: Record<string, unknown>) => Promise<unknown> | unknown;
 }) {
   const registeredByAdd = new Map<string, AddCommandEntry>();
   if (opts.preRegisteredGoal) {
@@ -87,6 +88,7 @@ function createV2CommandTestCtx(opts: {
         return {id: `prm-${promptCalls.length}`, type: 'user'};
       },
       synthetic: async (input: Record<string, unknown>) => {
+        if (opts?.onSynthetic) return opts.onSynthetic(input);
         syntheticCalls.push(input);
         return {id: `syn-${syntheticCalls.length}`, type: 'synthetic'};
       },
@@ -294,6 +296,40 @@ test('v2 add-only command.transform overrides opencode.goal and drives active ki
     expect(snap?.condition).toBe('Fix v2 command execution');
     expect(snap?.maxTokens).toBe(0);
   } finally {
+    await dispose();
+    rmSync(root, {recursive: true, force: true});
+  }
+});
+
+test('v2 command.transform rejects attachments before mutating state on clear', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'fixate-v2-cmd-attach-'));
+  const ws = join(root, 'ws');
+  mkdirSync(ws, {recursive: true});
+  const harness = createV2CommandTestCtx({directory: ws});
+  const dispose = await setup(harness.ctx);
+  try {
+    const goalCmd = harness.registeredByAdd.get('goal')!;
+    await goalCmd.execute!({
+      sessionID: 's-attach',
+      prompt: {text: 'Build the feature'},
+    });
+
+    const fileAttachment = {path: 'spec.md', mime: 'text/markdown'};
+    await expect(
+      goalCmd.execute!({
+        sessionID: 's-attach',
+        prompt: {text: 'clear', files: [fileAttachment]},
+      }),
+    ).rejects.toThrow(/starting or resuming/i);
+
+    // The rejected clear must not have destroyed the goal.
+    const store = createTuiStateStore();
+    await hydrateStoreFromDisk(store, ws);
+    const snap = store.getFocused('s-attach');
+    expect(snap?.status).toBe('active');
+    expect(snap?.condition).toBe('Build the feature');
+  } finally {
+    harness.closeEvents();
     await dispose();
     rmSync(root, {recursive: true, force: true});
   }
@@ -602,6 +638,90 @@ test('v2 attachment kickoff avoids false user-intervention pauses and ignores ex
     expect(snap?.status).toBe('active');
     expect(snap?.stopReason).not.toBe('user intervention');
     expect(harness.syntheticCalls).toHaveLength(1);
+  } finally {
+    harness.closeEvents();
+    await dispose();
+    rmSync(root, {recursive: true, force: true});
+  }
+});
+
+test('v2 native commands do not poison the v1 replay cache for later goal-command calls', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'fixate-v2-cmd-replay-'));
+  const ws = join(root, 'ws');
+  mkdirSync(ws, {recursive: true});
+  const harness = createV2CommandTestCtx({directory: ws});
+  const dispose = await setup(harness.ctx);
+  try {
+    const goalCmd = harness.registeredByAdd.get('goal')!;
+    const goalCommandTool = harness.registeredTools.find(
+      t => t.name === 'goal-command',
+    )!;
+
+    await goalCmd.execute!({
+      sessionID: 's-replay',
+      prompt: {text: 'Set the replay objective'},
+    });
+    await goalCmd.execute!({sessionID: 's-replay', prompt: {text: 'pause'}});
+    await goalCmd.execute!({sessionID: 's-replay', prompt: {text: 'resume'}});
+
+    // A later deliberate goal-command pause must execute for real, not replay
+    // the native pause's cached receipt and report success while staying active.
+    const out = (await goalCommandTool.execute!(
+      {subcommand: 'pause'},
+      {sessionID: 's-replay'},
+    )) as {content: string};
+    expect(out.content).toContain('source=goal-command');
+    expect(out.content).not.toContain('source=user-command');
+
+    const store = createTuiStateStore();
+    await hydrateStoreFromDisk(store, ws);
+    expect(store.getFocused('s-replay')?.status).toBe('paused');
+  } finally {
+    harness.closeEvents();
+    await dispose();
+    rmSync(root, {recursive: true, force: true});
+  }
+});
+
+test('v2 initial synthetic admission failure re-arms a retryable kickoff', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'fixate-v2-kickfail-'));
+  const ws = join(root, 'ws');
+  mkdirSync(ws, {recursive: true});
+  let attempts = 0;
+  const harness = createV2CommandTestCtx({
+    directory: ws,
+    options: {kickoffDelayMs: 5000},
+    onSynthetic: () => {
+      attempts++;
+      if (attempts === 1) throw new Error('admission rejected');
+      return {id: 'syn-retry', type: 'synthetic'};
+    },
+  });
+  const dispose = await setup(harness.ctx);
+  try {
+    const goalCmd = harness.registeredByAdd.get('goal')!;
+    // Observe the scheduling DECISION: on admission failure the plugin must
+    // arm a delayed retry kickoff instead of dropping the active goal's intent.
+    const armedDelays: number[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = ((fn: () => void, delay?: number) => {
+      armedDelays.push(Number(delay ?? 0));
+      return realSetTimeout(fn, 0);
+    }) as typeof globalThis.setTimeout;
+    try {
+      await expect(
+        goalCmd.execute!({
+          sessionID: 's-kickfail',
+          prompt: {text: 'Build the retry goal'},
+        }),
+      ).rejects.toThrow(/admission rejected/i);
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+    }
+    expect(armedDelays.filter(d => d >= 5000)).toHaveLength(1);
+
+    // The retry kickoff re-attempts the synthetic admission and succeeds.
+    await waitFor(() => attempts === 2, 'the retry kickoff to fire');
   } finally {
     harness.closeEvents();
     await dispose();

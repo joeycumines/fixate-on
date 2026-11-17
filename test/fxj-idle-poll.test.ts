@@ -220,6 +220,30 @@ describe('FX-J synthetic idle wakes the loop without any host event delivery', (
     }
   });
 
+  test('a shared background-work deferral stops the fallback poller from synthesizing an idle', async () => {
+    const machine = new GoalStateMachine(makeActiveGoal(), {
+      onCommit: async () => {},
+    });
+    const api = makeMockSessionApi(makeWrappedAssistantMessages());
+    const deps = makeDeps(makeSessionContext(machine), api);
+    deps.runtime!.sessionGoals.set('session-1', [machine]);
+    deps.runtime!.liveSessions.add('session-1');
+    deps.runtime!.backgroundBlockedUntil.set('session-1', Date.now() + 30_000);
+    const hooks = createHooks({
+      ...deps,
+      idlePollerIntervalMs: 20,
+      idleQuietMs: 30,
+      idleGraceMs: 0,
+    });
+    try {
+      await new Promise(r => setTimeout(r, 250));
+      expect(api.promptsSent.length).toBe(0);
+      expect(machine.snapshot().status).toBe('active');
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
   test('the sweep serves a session once the host speaks for it', async () => {
     // A session the user opens delivers chat.params (or a command dispatch)
     // first, which marks it live — the sweep then synthesizes idles for it.

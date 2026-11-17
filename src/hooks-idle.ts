@@ -151,10 +151,21 @@ export async function processIdleEvent(
   // Evaluate whether the agent executed any tools during THIS cycle only.
   // Restricting the scan to messages after the prior turn / prompt boundary
   // ensures a historical tool call cannot suppress `noToolCallTurns` forever.
+  const turnKey = assistantTurnKey(latestAssistant);
+  const runtimeQueued = deps.runtime?.queuedInputMessageIDs?.get(sessionID);
+  const runtimeSteered = deps.runtime?.steeredInputMessageIDs?.get(sessionID);
+  const surfacedQueued = deps.runtime?.surfacedQueuedMessageIDs?.get(sessionID);
+  const isQueuedMessage = (message: unknown, id: string): boolean => {
+    if (id !== '' && runtimeSteered?.has(id) === true) return false;
+    if (id !== '' && runtimeQueued?.has(id) === true) return true;
+    return getMessageDelivery(message) === 'queue';
+  };
   const cycleMessages = sliceCurrentCycleMessages(messages, {
     lastNoToolCallMessageID: goal.lastNoToolCallMessageID,
     lastAssistantMessageID: goal.lastAssistantMessageID,
     assistantRepeated,
+    focusTurnKey: turnKey,
+    isQueuedMessage,
   });
   const windowHasToolCall = windowHasToolCallNewerThan(
     cycleMessages,
@@ -166,7 +177,6 @@ export async function processIdleEvent(
   // Track turns rather than raw idle ticks. The idle handler fires repeatedly on the
   // same message during polling cycles, so state changes are keyed by turn identity
   // to avoid prematurely tripping stall thresholds.
-  const turnKey = assistantTurnKey(latestAssistant);
   const alreadyCountedThisTurn =
     !turnKey || turnKey === goal.lastCountedProgressMessageID;
   const alreadyCountedNoToolCall =
@@ -191,7 +201,10 @@ export async function processIdleEvent(
       }
       if (latestHasToolCall) {
         g.noToolCallTurns = 0;
-        g.lastNoToolCallMessageID = '';
+        // Keep the evaluated assistant identity as the dedupe key even on a
+        // productive cycle. A duplicate idle before the next assistant reply
+        // must not reclassify this same turn as tool-free.
+        g.lastNoToolCallMessageID = turnKey;
       } else if (g.turnCount > 0 && !alreadyCountedNoToolCall) {
         g.noToolCallTurns += 1;
         g.lastNoToolCallMessageID = turnKey;
@@ -271,9 +284,71 @@ export async function processIdleEvent(
   let latestHumanIntervention: string | null = null;
   const queuedNotices: string[] = [];
   const queuedIDs: string[] = [];
-  const runtimeQueued = deps.runtime?.queuedInputMessageIDs?.get(sessionID);
-  const runtimeSteered = deps.runtime?.steeredInputMessageIDs?.get(sessionID);
-  const surfacedQueued = deps.runtime?.surfacedQueuedMessageIDs?.get(sessionID);
+  // Two independent scans over the message history:
+  //  - the trailing scan finds an UNANSWERED human intervention and stops at the
+  //    newest assistant, so an old delivery-less user message is not a fresh stop;
+  //  - the queued scan looks across the whole history for delivery-tagged user
+  //    messages not yet surfaced. On v2 the host consumes and answers queued input
+  //    before experimental.idle runs, so those messages sit BEHIND an assistant
+  //    and are invisible to the trailing scan.
+  const seenNoticeIDs = new Set<string>();
+  const collectQueuedNotice = (msg: unknown): void => {
+    if (!msg || typeof msg !== 'object') return;
+    const parts =
+      (msg as {parts?: unknown[]}).parts ??
+      (
+        (msg as {info?: {parts?: unknown[]}}).info as
+          {parts?: unknown[]} | undefined
+      )?.parts ??
+      [];
+    const msgInjected =
+      (msg as {synthetic?: boolean}).synthetic === true ||
+      (msg as {info?: {synthetic?: boolean}}).info?.synthetic === true ||
+      Boolean(
+        (msg as {metadata?: Record<string, unknown>}).metadata?.[
+          GOAL_TUI_METADATA_KEY
+        ],
+      ) ||
+      Boolean(
+        (msg as {info?: {metadata?: Record<string, unknown>}}).info?.metadata?.[
+          GOAL_TUI_METADATA_KEY
+        ],
+      );
+    if (
+      msgInjected ||
+      parts.some(p => {
+        const part = p as {
+          synthetic?: boolean;
+          metadata?: Record<string, unknown>;
+        } | null;
+        return (
+          part?.synthetic === true ||
+          Boolean(part?.metadata?.[GOAL_TUI_METADATA_KEY])
+        );
+      })
+    )
+      return;
+    const text = getTextFromParts(parts);
+    if (
+      !text ||
+      text.includes(SERVER_MODE_HEADER) ||
+      text.includes(TUI_MODE_HEADER) ||
+      isCommandTemplateEcho(text) ||
+      matchSlashEcho(sessionID, text)
+    )
+      return;
+    const messageID = getMessageID(msg);
+    if (!isQueuedMessage(msg, messageID)) return;
+    if (
+      (messageID !== '' && surfacedQueued?.has(messageID) === true) ||
+      (messageID !== '' && seenNoticeIDs.has(messageID))
+    )
+      return;
+    seenNoticeIDs.add(messageID);
+    queuedNotices.push(text);
+    queuedIDs.push(messageID);
+  };
+
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i] as {
       info?: {
@@ -289,16 +364,26 @@ export async function processIdleEvent(
     const role = msg.info?.role ?? msg.role;
     if (role === 'assistant' || role === 'agent') break;
     if (role !== 'user') continue;
+    const effectiveDelivery = isQueuedMessage(msg, getMessageID(msg))
+      ? 'queue'
+      : undefined;
+    // A queued message never interrupts; it is collected by the full-history
+    // scan below. Only interrupting (or unknown-delivery) input yields the goal.
+    if (effectiveDelivery === 'queue') continue;
     const parts =
       (msg as {parts?: unknown[]}).parts ??
       (msg.info as {parts?: unknown[]} | undefined)?.parts ??
       [];
     const msgInjected =
-      msg.synthetic === true ||
+      (msg as {synthetic?: boolean}).synthetic === true ||
       msg.info?.synthetic === true ||
-      Boolean(msg.metadata?.[GOAL_TUI_METADATA_KEY]) ||
+      Boolean(
+        (msg as {metadata?: Record<string, unknown>}).metadata?.[
+          GOAL_TUI_METADATA_KEY
+        ],
+      ) ||
       Boolean(msg.info?.metadata?.[GOAL_TUI_METADATA_KEY]);
-    const injected =
+    if (
       msgInjected ||
       parts.some(p => {
         const part = p as {
@@ -309,40 +394,23 @@ export async function processIdleEvent(
           part?.synthetic === true ||
           Boolean(part?.metadata?.[GOAL_TUI_METADATA_KEY])
         );
-      });
-    if (injected) continue;
+      })
+    )
+      continue;
     const text = getTextFromParts(parts);
-    if (!text) continue;
-    if (text.includes(SERVER_MODE_HEADER) || text.includes(TUI_MODE_HEADER))
+    if (
+      !text ||
+      text.includes(SERVER_MODE_HEADER) ||
+      text.includes(TUI_MODE_HEADER) ||
+      isCommandTemplateEcho(text) ||
+      matchSlashEcho(sessionID, text)
+    )
       continue;
-    if (isCommandTemplateEcho(text)) continue;
-    if (matchSlashEcho(sessionID, text)) continue;
-    const messageID = getMessageID(msg);
-    // Runtime event sets carry the host's latest delivery observation, so they
-    // take precedence over a (possibly stale) static annotation on the message.
-    const inRuntimeQueued =
-      messageID !== '' && runtimeQueued?.has(messageID) === true;
-    const inRuntimeSteered =
-      messageID !== '' && runtimeSteered?.has(messageID) === true;
-    const effectiveDelivery = inRuntimeSteered
-      ? 'steer'
-      : inRuntimeQueued
-        ? 'queue'
-        : getMessageDelivery(msg);
-    if (effectiveDelivery === 'queue') {
-      // Non-interrupting input: keep the goal running, but make the message
-      // visible to the user through the goal notice channel. Skip ids already
-      // surfaced on an earlier idle pass, and keep scanning so an interrupting
-      // message further back still wins.
-      if (messageID !== '' && surfacedQueued?.has(messageID) === true) continue;
-      queuedNotices.push(text);
-      queuedIDs.push(messageID);
-      continue;
-    }
-    // The newest interrupting message wins; keep scanning older messages only
-    // to surface queued ones as notices before the assistant-role break.
+    // The newest interrupting message wins.
     if (latestHumanIntervention === null) latestHumanIntervention = text;
   }
+  for (let i = messages.length - 1; i >= 0; i--)
+    collectQueuedNotice(messages[i]);
   if (queuedNotices.length > 0) {
     // Collect every unsurfaced queued message in chronological order (the scan
     // walked newest-first, so reverse) and surface them as one notice.
@@ -434,13 +502,12 @@ export async function processIdleEvent(
     session.setPendingIntent(machine.snapshot().goalId, null);
   }
   // The queued-notice announcement is only truthful when this idle actually
-  // commits to continuing. Announce here — after the decision — rather than
-  // before the intervention check, so a pause/stop/brake on the same turn can
-  // never be preceded by a false "the goal keeps running".
+  // commits to an ordinary continuation. apply-pending-intent can settle the
+  // goal as blocked/complete, so it uses the neutral branch below.
   if (
     queuedNotices.length > 0 &&
     deps.announceGoalDecision &&
-    (decision.type === 'continue' || decision.type === 'apply-pending-intent')
+    decision.type === 'continue'
   ) {
     const slice = (s: string) => Array.from(s).slice(0, 200).join('');
     await deps.announceGoalDecision(

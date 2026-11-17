@@ -85,6 +85,12 @@ export interface RuntimeState {
    */
   recoveryPendingSessions: Set<string>;
   seenIdleEventIDs: Set<string>;
+  /**
+   * Sessions where the host reported blocking background jobs. Value is a
+   * deadline (epoch ms) after which the gate may be re-evaluated. Shared so the
+   * fallback idle poller cannot defeat a deferral made by the native idle hook.
+   */
+  backgroundBlockedUntil: Map<string, number>;
   /** Consecutive busy-deferral counter per `${sessionID}:${goalId}` (M1 brake). */
   deferCounts: Map<string, number>;
   /**
@@ -136,10 +142,11 @@ export interface RuntimeState {
   canDriveSession?: (sessionID: string) => boolean;
   /** Clears any pending delayed kickoff timer for a session. */
   clearKickoffTimer?: (sessionID: string) => void;
+  scheduleKickoff?: (sessionID: string, goalId: string, runId: string) => void;
   /** Executes the plugin's parsed `/goal` slash command without going through v1 chat parts. */
   executeSlashCommand?: (
     input: {sessionID?: string; command?: string; arguments?: string},
-    options?: {skipKickoff?: boolean},
+    options?: {skipKickoff?: boolean; skipReplayRecord?: boolean},
   ) => Promise<{
     handled: boolean;
     ok: boolean;
@@ -151,6 +158,7 @@ export interface RuntimeState {
     rendered: string;
     before: GoalState | null;
     after: GoalState | null;
+    activatedGoal: GoalState | null;
     enteredActive: boolean;
     error?: string;
   }>;
@@ -173,6 +181,7 @@ export function createRuntimeState(): RuntimeState {
     promptInFlightSessions: new Set(),
     recoveryPendingSessions: new Set(),
     seenIdleEventIDs: new Set(),
+    backgroundBlockedUntil: new Map(),
     deferCounts: new Map(),
     compactionTimestamps: new Map(),
     threadToolsRegistered: false,
@@ -337,12 +346,14 @@ export function clearSessionDeliveryState(
     | 'queuedInputMessageIDs'
     | 'steeredInputMessageIDs'
     | 'surfacedQueuedMessageIDs'
+    | 'backgroundBlockedUntil'
   >,
   sessionID: string,
 ): void {
   runtime.queuedInputMessageIDs.delete(sessionID);
   runtime.steeredInputMessageIDs.delete(sessionID);
   runtime.surfacedQueuedMessageIDs.delete(sessionID);
+  runtime.backgroundBlockedUntil.delete(sessionID);
 }
 
 export const runtimeStorage = new AsyncLocalStorage<RuntimeState>();

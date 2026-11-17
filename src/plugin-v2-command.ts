@@ -6,6 +6,7 @@
  */
 
 import {appendFileSync} from 'node:fs';
+import {SUBCOMMAND_ROOTS} from './commands-args.ts';
 
 export interface V2CommandExecutionInput {
   readonly sessionID: string;
@@ -67,6 +68,34 @@ export function validateV2CommandExecutionInput(input: unknown): {
       ? obj.delivery
       : undefined;
   return {sessionID, rawArgs, prompt: promptObj, hasAttachments, delivery};
+}
+
+/**
+ * Validate attachment eligibility using only the parsed command line, BEFORE the
+ * state-mutating runner executes. The post-runner fence cannot undo a `clear`
+ * or `edit` that already committed; this preflight can.
+ *
+ * A bare objective (no subcommand root) starts a goal, and `resume`/`edit`/
+ * `add`/`sequence` may start or resume one. Every other named subcommand is
+ * read-only or lifecycle/control output and must not carry attachments.
+ */
+export function assertV2AttachmentsBeforeRun(args: {
+  rawArgs: string;
+  hasAttachments: boolean;
+}): void {
+  if (!args.hasAttachments) return;
+  const root = args.rawArgs.trim().toLowerCase().split(/\s+/)[0] ?? '';
+  if (!root || !SUBCOMMAND_ROOTS.has(root)) return;
+  if (
+    root === 'resume' ||
+    root === 'edit' ||
+    root === 'add' ||
+    root === 'sequence'
+  )
+    return;
+  throw new Error(
+    'File, agent, and skill attachments can only be included when starting or resuming a goal.',
+  );
 }
 
 /** Command names rewritten by the legacy `CommandEditor.update` fallback. */

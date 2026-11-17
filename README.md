@@ -42,7 +42,7 @@ Throughout this section, "OpenCode 1.x" means the `opencode` binary and "OpenCod
 | Local-checkout target | a file works (`.../plugin/fixate-on/plugin.js`) | a directory is required; released 2.x builds reject a file target with `configured plugin path must be a directory` |
 | `/goal` registration | `command.execute.before` intercepts the auto-registered command; the `config` hook also installs a bridge `command.goal` template | no `command.execute.before`; the plugin's `command.transform` registers its own `goal` command (overriding the built-in `opencode.goal`), and an explicit `command.goal` config still works alongside it |
 | Native agents (`goal`, `goal-verify`) | registered by the `config` hook | registered by the plugin's `agent.transform` bridge (the 2.x host does not call the 1.x `config` hook) |
-| TUI companion | `tui.json` `plugin` array → `fixate-on/tui` | `cli.json` `plugins` array → `fixate-on/tui-v2` (a `file://` entry pointing at the bundle) |
+| TUI companion | `tui.json` `plugin` array → `fixate-on/tui` | `cli.json` `plugins` array → directory adapter (see [Loading from local source](#loading-from-local-source)) |
 | Permission key in a shared config | `permission` (a map) | `permissions`; 2.x also accepts the 1.x spelling, 1.x does not accept the 2.x one |
 
 A bridge `command.goal` template is a fallback on 2.x, not a requirement: the plugin's `command.transform` registers `/goal` itself when the host exposes the transform, so zero-config works there too.
@@ -112,22 +112,22 @@ The optional TUI companion provides an interactive dashboard, command palette ac
   }
   ```
 
-- **OpenCode 2.x**: there is no `tui.json` contract. The 2.x companion (`fixate-on/tui-v2`) loads as a CLI plugin entry in `cli.json`:
+- **OpenCode 2.x**: there is no `tui.json` contract. The 2.x companion loads as a CLI plugin entry in `cli.json`, but the published package cannot be named by a bare npm spec: `fixate-on/tui-v2` is parsed as a GitHub shorthand, and the package's `./tui` export is the 1.x companion. Use the directory adapter described in [Loading from local source](#loading-from-local-source) for both the server and companion entries: it is the verified 2.x installation path.
 
-  `cli.json`:
+  `cli.json` (directory adapter — see the full recipe below):
 
   ```json
   {
     "plugins": [
       {
-        "package": "fixate-on/tui-v2",
+        "package": "file:///absolute/path/to/plugin-wrappers/fixate-on",
         "options": { "stateRoot": ".opencode/goals" }
       }
     ]
   }
   ```
 
-  A `file://` URL to `plugin/fixate-on/tui-v2.js` inside a local checkout works the same way. Released 2.x builds differ in which local forms they accept (see [Compatibility & Known Limits](#compatibility--known-limits)); when in doubt, install from npm (`fixate-on/tui-v2`) rather than pointing at a file path.
+  A `file://` URL pointing **directly at** `tui-v2.js` is not a valid 2.x plugin target: the 2.x TUI loader skips local file targets and only loads directories. Install via the adapter directory instead.
 
 **State root alignment:** Both the server plugin and the TUI companion resolve the persisted state directory independently and reject goal files whose embedded session ID does not match their parent directory. If you override the default state directory, either set the `FIXATE_ON_STATE_ROOT` environment variable (read by both) or pass the identical `stateRoot` option to **both** entries (server plugin and companion):
 
@@ -139,7 +139,7 @@ The optional TUI companion provides an interactive dashboard, command palette ac
 }
 ```
 
-On 2.x the companion loads in the same process as the server plugin, so setting `stateRoot` on the single `plugins` entry is enough; confirm the pairing with `/goal status`.
+On 2.x the companion and the server plugin resolve the state root separately, and the host's automatic server-to-TUI discovery may pass a bare plugin target without its options. Set the same `stateRoot` on **both** the server and CLI entries, or rely on the shared `FIXATE_ON_STATE_ROOT` environment variable. Do not rely on a single entry to configure both.
 
 See [`docs/tui-integration.md`](docs/tui-integration.md) for the dual-mode output headers, 1.x disk-refresh vs 2.x `Result.metadata` transport architecture, toast coalescing rules, and keyboard shortcut tables.
 
@@ -195,12 +195,12 @@ export { default } from "file:///absolute/path/to/fixate-on/plugin/fixate-on/tui
 
 The adapter's relative depths depend on where it sits; adjust them to your layout. The e2e harness in `hack/e2e-harness/` ships a working copy of this adapter (`plugin-dir/`) you can copy.
 
-**Both versions from one document:** a shared `opencode.json` works if it keeps the 1.x spelling for the keys 1.x requires (`plugin` and `permission`) and uses the keys both versions normalize (`mcp.servers`, `commands`):
+**Both versions from one document:** a shared `opencode.json` works if it keeps the 1.x spelling for the keys 1.x requires (`plugin` and `permission`) and uses the keys both versions normalize (`mcp.servers`, `command`):
 
 ```json
 {
   "plugin": [["file:///home/me/.config/opencode/plugin-wrappers/fixate-on", {}]],
-  "commands": {
+  "command": {
     "goal": {
       "template": "Call the goal-command tool exactly once with its subcommand parameter set verbatim to: $ARGUMENTS\nDo not summarize, do not ask for confirmation, and do not perform any other work. Reply with only the tool output.",
       "agent": "build"
@@ -210,7 +210,7 @@ The adapter's relative depths depend on where it sits; adjust them to your layou
 }
 ```
 
-Do not rename `plugin` to `plugins` or `permission` to `permissions` in a shared document: 1.x silently drops `plugins` (the plugin never loads and `/goal` is absent, with no error) and rejects the 2.x permission spelling. 2.x accepts and migrates the 1.x spellings, so the 1.x spelling is the portable one. If you want the 2.x keys, give 1.x its own config file.
+Do not rename `plugin` to `plugins` or `permission` to `permissions` in a shared document: 1.x rejects `plugins` and `permissions` as unrecognized keys at startup, and rejects the 2.x permission spelling. 2.x accepts and migrates the 1.x spellings, so the 1.x spelling is the portable one. If you want the 2.x keys, give 1.x its own config file.
 
 **Quick smoke test:**
 
@@ -500,7 +500,7 @@ Pass plugin-level defaults in `opencode.json`:
 | Package subpaths | `.` and `./server` load the dual-version server bundle (1.x via the `server` export, 2.x via the default `{ id, setup }`); `./tui` is the 1.x companion (load it from `tui.json`); `./tui-v2` is the 2.x companion (load it from `cli.json`) and depends on host-supplied modules. TypeScript declarations support `NodeNext` and `Bundler`. |
 | Provider templates | Strict-template backends require the goal block to merge into the primary `system` message (covered by regression tests). |
 | Static built-in verifier | The built-in `goal-verify` subagent is read-only (`read`, `glob`, `grep`); it cannot run shell commands itself and relies on workspace inspection plus evidence cited by the primary agent. |
-| OpenCode 2.x TUI plugins | Measured on the installed 2.x release v2.2.7 (the build this repo's e2e harness runs): the server still rejects a configured plugin **file** target with `configured plugin path must be a directory` (point at an adapter directory — see [Loading from local source](#loading-from-local-source)), but the TUI does load `cli.json` plugins and register their palette entries, so `ctrl+p` → `fixate:` works. Older 2.x builds (through v2.2.5) never registered CLI-plugin palette entries and defaulted plugin keymap layers to base mode, which made palette entries vanish the moment the palette opened; the v2 companion declares `mode: "global"` itself to stay reachable on those builds. For the companion either install `fixate-on/tui-v2` from npm or point `cli.json` at a `file://` bundle. See [Host API Requirements](docs/tui-integration.md#host-api-requirements). |
+| OpenCode 2.x TUI plugins | Measured on the installed 2.x release v2.2.7 (the build this repo's e2e harness runs): the server still rejects a configured plugin **file** target with `configured plugin path must be a directory` (point at an adapter directory — see [Loading from local source](#loading-from-local-source)), but the TUI does load `cli.json` plugins and register their palette entries, so `ctrl+p` → `fixate:` works. Older 2.x builds (through v2.2.5) never registered CLI-plugin palette entries and defaulted plugin keymap layers to base mode, which made palette entries vanish the moment the palette opened; the v2 companion declares `mode: "global"` itself to stay reachable on those builds. For the companion use the adapter directory (a direct `file://` URL to a `tui-v2.js` file is skipped by the 2.x TUI loader; see [Loading from local source](#loading-from-local-source)). See [Host API Requirements](docs/tui-integration.md#host-api-requirements). |
 
 ---
 
@@ -513,7 +513,7 @@ Start with `/goal status --full` (or `--verbose`) and `/goal history --verbose` 
 | Symptom | Cause | Fix |
 |:---|:---|:---|
 | `configured plugin path must be a directory` | OpenCode 2.x was given a plugin **file** path | point `plugins[].package` at the adapter directory (see [Loading from local source](#loading-from-local-source)) |
-| 1.x loads but `/goal` is absent, no error | `plugins` (plural) was used in a 1.x-read config; 1.x drops it | use `plugin` (singular); 2.x migrates it |
+| 1.x refuses to start with a configuration error naming `plugins` | `plugins` (plural) was used in a 1.x-read config; 1.x rejects the unknown key | use `plugin` (singular); 2.x migrates it |
 | 1.x refuses to start with a permissions error | a 2.x-style `permissions` key in a shared config | use the 1.x `permission` map; 2.x migrates it |
 | 2.x `/goal foo` becomes plain chat | no `goal` command reached the session (transform unavailable and no bridge template) | on 2.x builds with `command.transform` this should not happen; on older builds declare `command.goal` with the `goal-command` template and `$ARGUMENTS` (see [`/goal` on OpenCode 2.x](#goal-on-opencode-2x)) |
 | 2.x TUI shows the plugin failed to load | older 2.x builds (through v2.2.5) rejected `file://` plugin URLs / never registered palette entries; all 2.x builds reject a plugin **file** target | install `fixate-on` from npm, use an adapter directory for a local checkout, and on v2.2.7+ `cli.json` `file://` entries work; see [Compatibility & Known Limits](#compatibility--known-limits) |

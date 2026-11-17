@@ -327,18 +327,39 @@ export function sliceCurrentCycleMessages(
     lastNoToolCallMessageID?: string;
     lastAssistantMessageID?: string;
     assistantRepeated?: boolean;
+    focusTurnKey?: string;
+    isQueuedMessage?: (message: unknown, id: string) => boolean;
   },
 ): unknown[] {
   if (!Array.isArray(messages) || messages.length === 0) return [];
   const ordered = chronologicalMessages(messages);
   let startIdx = 0;
 
-  for (let i = ordered.length - 1; i >= 0; i--) {
+  // Classify the cycle of the assistant turn being evaluated, not whatever
+  // message happens to be last. A duplicate idle after a synthetic continuation
+  // has no newer assistant yet; slicing from that unanswered prompt would cut
+  // the tool call out of the already-completed turn and miscount it as tool-free.
+  let scanEnd = ordered.length - 1;
+  if (options.focusTurnKey) {
+    for (let i = ordered.length - 1; i >= 0; i--) {
+      if (assistantTurnKey(ordered[i]) === options.focusTurnKey) {
+        scanEnd = i;
+        break;
+      }
+    }
+  }
+
+  const isQueued = (entry: unknown): boolean => {
+    const id = getMessageID(entry);
+    if (options.isQueuedMessage) return options.isQueuedMessage(entry, id);
+    return getMessageDelivery(entry) === 'queue';
+  };
+  for (let i = scanEnd; i >= 0; i--) {
     const entry = ordered[i];
     if (!entry || typeof entry !== 'object') continue;
     const msg = entry as {info?: {role?: string}; role?: string};
     const role = msg.info?.role ?? msg.role;
-    if (role === 'user' && getMessageDelivery(entry) !== 'queue') {
+    if (role === 'user' && !isQueued(entry)) {
       startIdx = Math.max(startIdx, i + 1);
       break;
     }

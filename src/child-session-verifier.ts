@@ -15,6 +15,7 @@ import {
   type VerifierJudgeFn,
 } from './completion-gate.ts';
 import {escapeGoalText} from './escape.ts';
+import {canonicalPath} from './plugin-v2-helpers.ts';
 import {
   findLatestAssistantMessage,
   getTextFromParts,
@@ -621,6 +622,38 @@ export function createChildSessionVerifier(
         createdObj.parentID !== goal.sessionID
       ) {
         throw new Error('child session parent relationship was not preserved');
+      }
+
+      // The verifier judges THIS workspace. A host that ignores the requested
+      // location (e.g. because a parentID forces the parent's location) must
+      // fail closed rather than attest a different tree. Likewise, a verifier
+      // running under another agent is not the read-only verifier we registered.
+      // Only hosts that expose `get` can be checked; a missing location is
+      // tolerated only when the host cannot report one at all.
+      const canVerifySession =
+        typeof (c.session as {get?: unknown} | undefined)?.get === 'function';
+      if (canVerifySession) {
+        const actual = (await sessionApi.get(childID)) as {
+          agent?: unknown;
+          location?: {directory?: unknown};
+        } | null;
+        const actualDir = actual?.location?.directory;
+        const expectedDir = cwd ? canonicalPath(cwd) : undefined;
+        if (
+          typeof actualDir !== 'string' ||
+          !actualDir.trim() ||
+          !expectedDir ||
+          canonicalPath(actualDir) !== expectedDir
+        ) {
+          throw new Error(
+            'child verifier workspace location does not match the goal workspace',
+          );
+        }
+        if (agent && actual?.agent && String(actual.agent) !== agent) {
+          throw new Error(
+            `child verifier is running under agent ${String(actual.agent)}, not ${agent}`,
+          );
+        }
       }
 
       if (timedOut) {

@@ -222,6 +222,9 @@ function makeEnv(
   };
   delete env.OPENCODE_TUI_CONFIG;
   delete env.OPENCODE_CONFIG_CONTENT;
+  // The campaign is isolated: never inherit a developer's external state root.
+  // Cases set their own absolute stateRoot explicitly.
+  delete env.FIXATE_ON_STATE_ROOT;
   return env;
 }
 
@@ -231,6 +234,7 @@ async function bootServe(opencode2Bin: string, serveCwd: string, env: Record<str
     {cwd: serveCwd, env, stdout: 'pipe', stderr: 'pipe'},
   );
   const dec = new TextDecoder();
+  const stdoutChunks: string[] = [];
   const outReader = srv.stdout.getReader();
   const errReader = srv.stderr.getReader();
   const errChunks: string[] = [];
@@ -242,23 +246,63 @@ async function bootServe(opencode2Bin: string, serveCwd: string, env: Record<str
     }
   })();
 
-  let baseUrl = '';
-  const deadline = Date.now() + 10_000;
-  while (Date.now() < deadline && !baseUrl) {
-    const {done, value} = await outReader.read();
-    if (done) break;
-    const match = dec.decode(value).match(/http:\/\/127\.0\.0\.1:\d+/);
-    if (match) baseUrl = match[0];
-  }
-  const drainOut = (async () => {
+  // Cleanup is owned from the moment the child exists, including startup failure.
+  let cleanupStarted = false;
+  const cleanup = async () => {
+    if (cleanupStarted) return errChunks.join('');
+    cleanupStarted = true;
+    srv.kill('SIGTERM');
+    const drained = Promise.all([
+      srv.exited,
+      (async () => {
+        while (true) {
+          const {done} = await outReader.read().catch(() => ({done: true}));
+          if (done) break;
+        }
+      })(),
+      drainErr,
+    ]);
+    // Bound shutdown: a child that ignores SIGTERM must not hang the campaign.
+    await Promise.race([
+      drained,
+      new Promise<void>(resolve => {
+        const t = setTimeout(() => {
+          srv.kill('SIGKILL');
+          resolve();
+        }, 2000);
+        t.unref?.();
+      }),
+    ]);
+    return errChunks.join('');
+  };
+
+  const startupDeadlineMs = 10_000;
+  let urlTimer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<symbol>(resolve => {
+    urlTimer = setTimeout(() => resolve(Symbol('serve startup deadline')), startupDeadlineMs);
+  });
+  const foundUrl = (async () => {
+    let buffered = '';
     while (true) {
       const {done, value} = await outReader.read();
-      if (done) break;
-      dec.decode(value);
+      if (done) return '';
+      buffered += dec.decode(value, {stream: true});
+      stdoutChunks.push(buffered);
+      const match = buffered.match(/http:\/\/127\.0\.0\.1:\d+/);
+      if (match) return match[0];
     }
   })();
 
-  assert(baseUrl.length > 0, `serve failed to bind; stderr=${errChunks.join('')}`);
+  let baseUrl: string | symbol;
+  try {
+    baseUrl = await Promise.race([foundUrl, deadline]);
+  } finally {
+    if (urlTimer) clearTimeout(urlTimer);
+  }
+  if (typeof baseUrl !== 'string' || !baseUrl) {
+    await cleanup();
+    assert(false, `serve failed to bind within ${startupDeadlineMs}ms; stdout=${stdoutChunks.join('')}; stderr=${errChunks.join('')}`);
+  }
 
   return {
     baseUrl,
@@ -267,9 +311,7 @@ async function bootServe(opencode2Bin: string, serveCwd: string, env: Record<str
       Authorization: 'Basic ' + Buffer.from('opencode:e2e').toString('base64'),
     },
     async stop() {
-      srv.kill('SIGTERM');
-      await Promise.all([srv.exited, drainOut, drainErr]);
-      return errChunks.join('');
+      return cleanup();
     },
   };
 }
@@ -380,7 +422,13 @@ async function runCase1SlashGoalAndSettlement(opencode2Bin: string): Promise<voi
     });
     assert(statusRes.ok, `/goal status failed: ${statusRes.status}`);
     await Bun.sleep(400);
-    assert(logs.length === reqCountBeforeStatus, `/goal status must not trigger an LLM turn (${reqCountBeforeStatus} -> ${logs.length})`);
+    // On newer 2.x hosts the verifier's result is delivered back to the parent
+    // as an asynchronous agent turn just after settlement; that is host traffic,
+    // not a turn caused by /goal status. Only a status-triggered turn fails.
+    const statusTurns = logs
+      .slice(reqCountBeforeStatus)
+      .filter(l => !l.lastUser.includes('<subagent sessionID='));
+    assert(statusTurns.length === 0, `/goal status must not trigger an LLM turn (found ${statusTurns.length})`);
 
     const ctxRes = await fetch(`${srv.baseUrl}/api/session/${sid}/context`, {headers: srv.headers});
     assert(ctxRes.ok, `GET /api/session/:id/context failed: ${ctxRes.status}`);
@@ -394,6 +442,10 @@ async function runCase1SlashGoalAndSettlement(opencode2Bin: string): Promise<voi
     const judgeLogs = logs.filter(l => l.kind === 'judge');
     assert(agentLogs.length >= 2, `expected >= 2 agent turns (write + update_goal), got ${agentLogs.length}`);
     for (const l of agentLogs) {
+      // A subagent result delivered back to the parent after settlement is a
+      // legitimate turn without goal context: the goal is already terminal.
+      const isPostSettlementSubagentResult = l.lastUser.includes('<subagent sessionID=');
+      if (isPostSettlementSubagentResult) continue;
       assert(l.sysText.includes('<fixate_on'), `agent req#${l.seq} missing <fixate_on system prompt`);
     }
     assert(judgeLogs.length >= 1, `expected child-session judge request, got ${judgeLogs.length}`);

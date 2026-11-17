@@ -55,7 +55,7 @@ OpenCode 1.x (`opencode`) and 2.x (`opencode2`) each read a different file, and 
 |:---|:---|:---|
 | `opencode.json` | 1.x server | the server plugin (`plugin` array) |
 | `tui.json` (`~/.config/opencode/tui.json` or `$OPENCODE_TUI_CONFIG`) | 1.x TUI only | the 1.x companion (`fixate-on/tui`); putting it in `opencode.json` does not load it |
-| `cli.json` | 2.x TUI | the 2.x companion (`fixate-on/tui-v2`, or a `file://` URL to `plugin/fixate-on/tui-v2.js` in a local checkout) |
+| `cli.json` | 2.x TUI | the 2.x companion, loaded through a directory adapter (see [Installation](#installation)) |
 | `opencode.json` (`plugins`) | 2.x server | the server plugin (`{package, options}` entries; released 2.x builds require a directory for local paths) |
 
 **OpenCode 1.x**: server plugin in `opencode.json`, companion in `tui.json`:
@@ -92,17 +92,17 @@ OpenCode 1.x (`opencode`) and 2.x (`opencode2`) each read a different file, and 
 }
 ```
 
-`cli.json`:
+`cli.json` (use the directory adapter described below — a bare `fixate-on/tui-v2` package spec is parsed as GitHub shorthand, and a direct `file://` URL to a `tui-v2.js` file is skipped by the 2.x TUI loader):
 
 ```json
 {
   "plugins": [
-    { "package": "fixate-on/tui-v2", "options": { "stateRoot": ".opencode/goals" } }
+    { "package": "file:///absolute/path/to/plugin-wrappers/fixate-on", "options": { "stateRoot": ".opencode/goals" } }
   ]
 }
 ```
 
-For a local checkout on 2.x, released builds reject a configured plugin **file** target (`configured plugin path must be a directory`), so point at a small adapter directory that re-exports the bundles: `server.js` re-exporting `plugin/fixate-on/plugin.js`, `tui.js` re-exporting `plugin/fixate-on/tui-v2.js` (not the package's `./tui`, which is the 1.x companion). `hack/e2e-harness/plugin-dir/` in this repository is a working copy. In `cli.json` the companion may instead be a `file://` URL to the `tui-v2.js` bundle, though released 2.x builds before the upstream loading fixes may reject `file://` plugin URLs; install from npm when in doubt. The full recipes, including the shared-config variant that serves both versions from one `opencode.json`, are in [the README's installation section](../README.md#loading-from-local-source).
+For a local checkout on 2.x, released builds reject a configured plugin **file** target (`configured plugin path must be a directory`), so point at a small adapter directory that re-exports the bundles: `server.js` re-exporting `plugin/fixate-on/plugin.js`, `tui.js` re-exporting `plugin/fixate-on/tui-v2.js` (not the package's `./tui`, which is the 1.x companion). `hack/e2e-harness/plugin-dir/` in this repository is a working copy. The same directory target is used in both `opencode.json` and `cli.json`; a `file://` URL pointing directly at `tui-v2.js` is not loaded by the 2.x TUI. The full recipes, including the shared-config variant that serves both versions from one `opencode.json`, are in [the README's installation section](../README.md#loading-from-local-source).
 
 With the pair in place, smoke-test the pairing:
 
@@ -114,12 +114,12 @@ With the pair in place, smoke-test the pairing:
 
 The server plugin (`fixate-on`) manages goal state, persistence,
 and the command execution loop. The TUI companion (`fixate-on/tui` on 1.x,
-`fixate-on/tui-v2` on 2.x) subscribes to goal lifecycle events and renders
+the v2 companion on 2.x) subscribes to goal lifecycle events and renders
 interactive panels. Set the identical `stateRoot` option (or
-`FIXATE_ON_STATE_ROOT`) on the server entry and the companion entry; on 2.x
-both live in the same process, so one entry each is enough, while on 1.x they
-are two entries in two files and must agree. Confirm the pairing with
-`/goal status`.
+`FIXATE_ON_STATE_ROOT`) on the server entry and the companion entry: on 2.x
+they resolve the root independently and host discovery may strip entry options,
+so one entry alone is not enough; on 1.x they are two entries in two files and
+must agree. Confirm the pairing with `/goal status`.
 
 ## Dual-Mode Command Execution
 

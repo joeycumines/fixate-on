@@ -1,6 +1,7 @@
 import {describe, expect, test} from 'bun:test';
 import {
   buildVerdictPrompt,
+  createChildSessionVerifier,
   parseVerdictFromJudge,
 } from '../src/child-session-verifier.ts';
 import type {GoalState} from '../src/state-machine.ts';
@@ -424,5 +425,78 @@ describe('verdict prompt is falsification-first', () => {
     expect(prompt).toContain('"schema_version":1');
     expect(prompt).toContain('evidence MUST have at least one entry');
     expect(prompt).toContain('outstanding MUST be empty');
+  });
+});
+
+describe('verifier child-session isolation (review 05-08)', () => {
+  function makeClient(child: unknown): {
+    session: Record<string, (...args: unknown[]) => Promise<unknown>>;
+  } {
+    return {
+      session: {
+        create: async () => child,
+        get: async () => child,
+        prompt: async () => ({
+          parts: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                schema_version: 1,
+                task_id: 'goal-123',
+                state: 'WORKING',
+                outstanding: ['not done'],
+                evidence: ['looked'],
+              }),
+            },
+          ],
+        }),
+        delete: async () => ({}),
+        abort: async () => ({}),
+        messages: async () => [],
+      },
+    };
+  }
+
+  const verdictArgs = {
+    cwd: '/target/workspace',
+    taskId: 'goal-123',
+    candidateIdentity: {candidate: 'c', fingerprint: 'f'},
+    goal: createGoalState('session-1', 'Ship the release', {
+      goalId: 'goal-123',
+      runId: 'r1',
+    }),
+    latestText: 'Done',
+  };
+
+  test('verifier rejects a child whose actual workspace differs from the goal cwd', async () => {
+    const wrong = {
+      id: 'child-1',
+      parentID: 'session-1',
+      agent: 'goal-verify',
+      location: {directory: '/other/workspace'},
+    };
+    const verifier = createChildSessionVerifier(makeClient(wrong), {});
+    await expect(verifier(verdictArgs as never)).rejects.toThrow(
+      /location|workspace/i,
+    );
+  });
+
+  test('verifier rejects a child running under an unexpected agent', async () => {
+    const wrong = {
+      id: 'child-1',
+      parentID: 'session-1',
+      agent: 'build',
+      location: {directory: '/target/workspace'},
+    };
+    const verifier = createChildSessionVerifier(makeClient(wrong), {});
+    await expect(verifier(verdictArgs as never)).rejects.toThrow(/agent/i);
+  });
+
+  test('verifier rejects a child with no readable location', async () => {
+    const wrong = {id: 'child-1', parentID: 'session-1', agent: 'goal-verify'};
+    const verifier = createChildSessionVerifier(makeClient(wrong), {});
+    await expect(verifier(verdictArgs as never)).rejects.toThrow(
+      /location|workspace/i,
+    );
   });
 });

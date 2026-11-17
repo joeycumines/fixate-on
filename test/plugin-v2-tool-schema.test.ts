@@ -57,6 +57,12 @@ function capturingCtx(
     onRemove?: (input: Record<string, unknown>) => Promise<unknown> | unknown;
     onUpdate?: (input: Record<string, unknown>) => Promise<unknown> | unknown;
     onWait?: (input: Record<string, unknown>) => Promise<unknown> | unknown;
+    agentTransform?: (
+      draft: unknown,
+    ) =>
+      Promise<{dispose: () => Promise<void>}> | {dispose: () => Promise<void>};
+    onDispose?: () => void;
+    onIterReturn?: () => void;
   },
 ): {
   ctx: Parameters<typeof setup>[0];
@@ -109,7 +115,22 @@ function capturingCtx(
     },
     event: {
       // An immediately-ending async iterable unless tests provide a custom stream.
-      subscribe: () => opts?.events ?? (async function* () {})(),
+      subscribe: () =>
+        opts?.events ??
+        ({
+          [Symbol.asyncIterator]: () => ({
+            next: async () => ({done: true, value: undefined}),
+            return: async () => {
+              opts?.onIterReturn?.();
+              return {done: true, value: undefined};
+            },
+          }),
+        } as AsyncIterable<{
+          id?: string;
+          type: string;
+          location?: {directory?: string; workspaceID?: string} | null;
+          data?: Record<string, unknown>;
+        }>),
     },
     tool: {
       transform: async (
@@ -131,9 +152,31 @@ function capturingCtx(
         dispose: async () => {},
       }),
     },
+    ...(opts?.agentTransform ? {agent: {transform: opts.agentTransform}} : {}),
   } as unknown as Parameters<typeof setup>[0];
   return {ctx, captured: tools, contextHook, sessionHooks};
 }
+
+test('v2 setup unwires live resources when a late agent transform throws', async () => {
+  let iterReturned = 0;
+  const root = mkdtempSync(join(tmpdir(), 'fixate-v2-unwind-'));
+  try {
+    const tools: RegisteredTool[] = [];
+    const h = capturingCtx(tools, {
+      options: {persistState: false, childSessionJudge: false},
+      onIterReturn: () => {
+        iterReturned++;
+      },
+      agentTransform: async () => {
+        throw new Error('late transform failure');
+      },
+    });
+    await expect(setup(h.ctx)).rejects.toThrow('late transform failure');
+    expect(iterReturned).toBe(1);
+  } finally {
+    rmSync(root, {recursive: true, force: true});
+  }
+});
 
 test('v2 event session IDs accept direct and authoritative nested shapes only', () => {
   expect(getV2EventSessionID({sessionID: 'direct'})).toBe('direct');
@@ -198,6 +241,53 @@ test('v2 parent-bound child creation delegates when supported and fails closed (
     }),
   ).rejects.toThrow(/unsupported.*no fork performed/i);
   expect(removedIDs).toEqual(['orphan-1']);
+});
+
+test('v2 prompt fails closed when the requested agent cannot be selected', async () => {
+  let promptCalls = 0;
+  const shim = createV2ClientShim(
+    {
+      session: {
+        switchAgent: async () => {
+          throw new Error('Agent not found: goal-verify');
+        },
+        prompt: async () => {
+          promptCalls++;
+          return {parts: [{type: 'text', text: 'verdict'}]};
+        },
+      },
+    } as never,
+    {bySession: new Map()},
+  );
+  await expect(
+    shim.session.prompt!({
+      sessionID: 'ses-child',
+      agent: 'goal-verify',
+      parts: [{type: 'text', text: 'judge'}],
+    }),
+  ).rejects.toThrow(/agent/i);
+  expect(promptCalls).toBe(0);
+
+  // A host without switchAgent must also fail closed for an explicit agent.
+  const noSwitch = createV2ClientShim(
+    {
+      session: {
+        prompt: async () => {
+          promptCalls++;
+          return {parts: [{type: 'text', text: 'verdict'}]};
+        },
+      },
+    } as never,
+    {bySession: new Map()},
+  );
+  await expect(
+    noSwitch.session.prompt!({
+      sessionID: 'ses-child',
+      agent: 'goal-verify',
+      parts: [{type: 'text', text: 'judge'}],
+    }),
+  ).rejects.toThrow(/agent/i);
+  expect(promptCalls).toBe(0);
 });
 
 test('v2 delete, update, and prompt wait delegate cleanly when host exposes remove/update/wait/switchAgent', async () => {
