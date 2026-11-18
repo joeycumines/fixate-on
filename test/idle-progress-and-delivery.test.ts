@@ -52,6 +52,9 @@ function makeDeps(session: SessionContext, messages: unknown[]): HookDeps {
   const runtime = createRuntimeState();
   runtime.threadToolsRegistered = true;
   runtime.liveSessions.add('session-1');
+  // Register the session's machines on the runtime so the pre-goal createdAt
+  // guard reads a real machine list (runtime.sessionGoals drives the guard).
+  runtime.sessionGoals.set('session-1', [session.getMachine()!]);
   return {
     getSessionContext: () => session,
     getLoopPolicy: () => createLoopPolicy(),
@@ -146,7 +149,10 @@ describe('idle progress and delivery classification', () => {
   });
 
   test('pre-goal queued input is not attributed to a newly created goal', async () => {
-    const machine = new GoalStateMachine(makeGoal(), {
+    const state = makeGoal();
+    // The goal was created 60s ago; the queued message predates it by 30s.
+    state.createdAt = Date.now() - 60_000;
+    const machine = new GoalStateMachine(state, {
       onCommit: async () => {},
     });
     const deps = makeDeps(makeSession(machine), [
@@ -154,6 +160,7 @@ describe('idle progress and delivery classification', () => {
         id: 'old-q',
         role: 'user',
         delivery: 'queue',
+        time: {created: Date.now() - 90_000},
         parts: [{type: 'text', text: 'answered before goal'}],
       },
       assistant('a1', 'answer', 200),

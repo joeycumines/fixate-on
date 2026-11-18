@@ -33,7 +33,7 @@ import {createGoalState, GoalStateMachine} from '../src/state-machine.ts';
 import type {UsageSnapshot} from '../src/accounting.ts';
 import {createLoopPolicy} from '../src/continuation-loop.ts';
 import {GoalsPlugin} from '../src/plugin-runtime.ts';
-import {v1PartsToV2Text} from '../src/plugin-v2.ts';
+import {v1PartsToV2Text} from '../src/plugin-v2-event-leaf.ts';
 
 // FIX-A fixtures (mirror hooks.test.ts harness)
 

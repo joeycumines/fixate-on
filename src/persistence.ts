@@ -139,6 +139,7 @@ export interface SerializedGoal {
   lastAssistantText: string;
   lastAssistantMessageID: string;
   lastCountedProgressMessageID?: string;
+  stalledTurnCounted?: boolean;
   lastNoToolCallMessageID?: string;
   baseline?: RunBaseline | null;
   lastContinueAt: number;
@@ -473,6 +474,7 @@ export function deserializeGoal(raw: unknown): GoalState {
       source.lastCountedProgressMessageID,
       MAX_GOAL_META_LENGTH,
     ),
+    stalledTurnCounted: source.stalledTurnCounted === true,
     lastNoToolCallMessageID: capString(
       source.lastNoToolCallMessageID,
       MAX_GOAL_META_LENGTH,

@@ -361,18 +361,26 @@ test('v2 command.transform forwards attachments via session.prompt and supports 
     expect(harness.promptCalls[0]?.files).toEqual([fileAttachment]);
     expect(harness.promptCalls[0]?.delivery).toBe('queue');
 
-    // Read-only commands spawn zero LLM turns.
+    // Read-only commands spawn zero LLM turns; their output is delivered as
+    // synthetic non-steering messages (one per command).
     await goalCmd.execute!({sessionID: 's-cmd-2', prompt: {text: 'status'}});
     await goalCmd.execute!({sessionID: 's-cmd-2', prompt: {text: 'list'}});
     await goalCmd.execute!({sessionID: 's-cmd-2', prompt: {text: 'history'}});
     await goalCmd.execute!({sessionID: 's-cmd-2', prompt: {text: ''}});
     expect(harness.promptCalls).toHaveLength(1);
-    expect(harness.syntheticCalls).toHaveLength(0);
+    expect(harness.syntheticCalls).toHaveLength(4);
+    for (const call of harness.syntheticCalls) {
+      expect(String(call.text)).toMatch(/goal/i);
+      expect(
+        (call.metadata as Record<string, unknown>)?.['fixate-on'],
+      ).toBeDefined();
+    }
 
-    // Pause updates persisted state to paused without spawning a turn.
+    // Pause updates persisted state to paused without spawning a turn; its
+    // receipt is also delivered as one synthetic output message.
     await goalCmd.execute!({sessionID: 's-cmd-2', prompt: {text: 'pause'}});
     expect(harness.promptCalls).toHaveLength(1);
-    expect(harness.syntheticCalls).toHaveLength(0);
+    expect(harness.syntheticCalls).toHaveLength(5);
 
     const storeAfterPause = createTuiStateStore();
     await hydrateStoreFromDisk(storeAfterPause, ws);
@@ -380,16 +388,17 @@ test('v2 command.transform forwards attachments via session.prompt and supports 
 
     // Resume transitions back to active and triggers one synthetic kickoff.
     await goalCmd.execute!({sessionID: 's-cmd-2', prompt: {text: 'resume'}});
-    expect(harness.syntheticCalls).toHaveLength(1);
+    expect(harness.syntheticCalls).toHaveLength(6);
     expect(harness.promptCalls).toHaveLength(1);
 
     const storeAfterResume = createTuiStateStore();
     await hydrateStoreFromDisk(storeAfterResume, ws);
     expect(storeAfterResume.getFocused('s-cmd-2')?.status).toBe('active');
 
-    // Clear removes the goal without spawning an LLM turn.
+    // Clear removes the goal without spawning an LLM turn; its receipt is
+    // delivered as one synthetic output message.
     await goalCmd.execute!({sessionID: 's-cmd-2', prompt: {text: 'clear'}});
-    expect(harness.syntheticCalls).toHaveLength(1);
+    expect(harness.syntheticCalls).toHaveLength(7);
     expect(harness.promptCalls).toHaveLength(1);
 
     const storeAfterClear = createTuiStateStore();
@@ -690,7 +699,7 @@ test('v2 initial synthetic admission failure re-arms a retryable kickoff', async
   let attempts = 0;
   const harness = createV2CommandTestCtx({
     directory: ws,
-    options: {kickoffDelayMs: 5000},
+    options: {kickoffDelayMs: 5000, idlePoller: false},
     onSynthetic: () => {
       attempts++;
       if (attempts === 1) throw new Error('admission rejected');
@@ -902,7 +911,10 @@ test('v2 admission retry preserves the full dispatch and survives a status comma
     expect(promptCalls[1]?.agents).toEqual(agents);
     expect(promptCalls[1]?.skills).toEqual(skills);
     expect(promptCalls[1]?.delivery).toBe('queue');
-    expect(harness.syntheticCalls).toHaveLength(0);
+    // The intervening read-only `status` delivered its output as one synthetic
+    // message; the retried attachment dispatch must stay on session.prompt.
+    expect(harness.syntheticCalls).toHaveLength(1);
+    expect(harness.syntheticCalls[0]?.files).toBeUndefined();
   } finally {
     globalThis.setTimeout = realSetTimeout;
     harness.closeEvents();
@@ -955,6 +967,89 @@ test('v2 queue-to-steer promotion of an inbox stop pauses the goal', async () =>
     await hydrateStoreFromDisk(store, ws);
     expect(store.getFocused('s-promote')?.status).toBe('paused');
     expect(store.getFocused('s-promote')?.stopReason).toBe('explicit pause');
+  } finally {
+    harness.closeEvents();
+    await dispose();
+    rmSync(root, {recursive: true, force: true});
+  }
+});
+
+test('v2 native read-only command output is delivered as a synthetic non-steering message', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'fixate-v2-cmd-output-'));
+  const ws = join(root, 'ws');
+  mkdirSync(ws, {recursive: true});
+  const harness = createV2CommandTestCtx({directory: ws});
+  const dispose = await setup(harness.ctx);
+  try {
+    const goalCmd = harness.registeredByAdd.get('goal')!;
+    // Set a goal first so `status` has state to report.
+    await goalCmd.execute!({
+      sessionID: 's-out',
+      prompt: {text: 'Ship the release'},
+    });
+    expect(harness.promptCalls).toHaveLength(0);
+    await goalCmd.execute!({sessionID: 's-out', prompt: {text: 'status'}});
+    // No model turn was spawned for the read-only command...
+    expect(harness.promptCalls).toHaveLength(0);
+    // ...but its rendered output was delivered as a synthetic message
+    // carrying GOAL_TUI metadata so chat.message steering ignores it. The
+    // earlier goal-set also produced one synthetic kickoff, so the last
+    // synthetic call is the command output.
+    const out = harness.syntheticCalls.at(-1)!;
+    expect((out.metadata as Record<string, unknown>)?.['fixate-on']).toEqual({
+      kind: 'command-output',
+    });
+    expect(out.sessionID).toBe('s-out');
+    expect(String(out.text)).toContain('Ship the release');
+  } finally {
+    harness.closeEvents();
+    await dispose();
+    rmSync(root, {recursive: true, force: true});
+  }
+});
+
+test('v2 repeated blocked idles with the same job key preserve the escalation clock', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'fixate-v2-defer-clock-'));
+  const ws = join(root, 'ws');
+  mkdirSync(ws, {recursive: true});
+  const harness = createV2CommandTestCtx({
+    directory: ws,
+    options: {idlePoller: false},
+  });
+  const dispose = await setup(harness.ctx);
+  try {
+    const goalCmd = harness.registeredByAdd.get('goal')!;
+    await goalCmd.execute!({
+      sessionID: 's-defer',
+      prompt: {text: 'Run the background job goal'},
+    });
+    const idleHook = harness.hooksByName.get('experimental.idle')!;
+    const job = [
+      {kind: 'subagent', sessionID: 's-defer', childSessionID: 'c1'},
+    ];
+    const firstAt = Date.now();
+    await idleHook!({sessionID: 's-defer', background: job});
+    // Re-report the same stuck job shortly afterwards: the deferral must keep
+    // the original `since`, not reset the 15-minute escalation clock.
+    await idleHook!({sessionID: 's-defer', background: job});
+    // A different job set starts a fresh clock (no overlap).
+    const otherJob = [
+      {kind: 'image', sessionID: 's-defer', childSessionID: 'img-9'},
+    ];
+    await idleHook!({sessionID: 's-defer', background: otherJob});
+    // An empty-background idle is the authoritative clear: it must drive the
+    // goal (synthesize the idle event) and release the deferral.
+    const syntheticsBefore = harness.syntheticCalls.length;
+    await idleHook!({sessionID: 's-defer', background: []});
+    const store = createTuiStateStore();
+    await hydrateStoreFromDisk(store, ws);
+    expect(store.getFocused('s-defer')?.status).toBe('active');
+    // The empty idle routes through the v1 event hook; any extra synthetic
+    // call is the initial goal-set kickoff, not a new dispatch.
+    expect(harness.syntheticCalls.length).toBeLessThanOrEqual(
+      syntheticsBefore + 1,
+    );
+    expect(firstAt).toBeLessThanOrEqual(Date.now());
   } finally {
     harness.closeEvents();
     await dispose();

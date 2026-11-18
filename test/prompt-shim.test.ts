@@ -6,7 +6,8 @@ import {describe, expect, test} from 'bun:test';
 import {mkdtemp} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {setup, v1PartsToV2Text} from '../src/plugin-v2.ts';
+import {setup} from '../src/plugin-v2.ts';
+import {v1PartsToV2Text} from '../src/plugin-v2-event-leaf.ts';
 
 describe('v1 parts → v2 text translation (A4 live-found defect lock)', () => {
   test('continuation payload maps to {sessionID, text} with hoisted plugin metadata', () => {

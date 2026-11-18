@@ -18,6 +18,26 @@ export const CLEAR_COMMANDS = new Set([
 export const STATUS_COMMANDS = new Set(['status', 'info']);
 export const HISTORY_COMMANDS = new Set(['history', 'log']);
 export const LIST_COMMANDS = new Set(['list', 'ls']);
+
+/** Roots that activate or mutate goal lifecycle (never read-only). */
+const MUTATING_SUBCOMMANDS = new Set([
+  ...CLEAR_COMMANDS,
+  'pause',
+  'resume',
+  'edit',
+  'add',
+  'sequence',
+  'accept',
+  'accept-proposal',
+  'reject',
+  'reject-proposal',
+  'handback',
+  'review',
+  'review-payload',
+  'focus',
+  'checkpoint',
+]);
+
 export const NO_ARG_SUBCOMMANDS = new Set([
   'status',
   'info',
@@ -66,6 +86,32 @@ export const SUBCOMMAND_ROOTS = new Set([
   'add',
   'sequence',
 ]);
+
+/**
+ * Subcommand roots whose handler only reports state and never mutates goals:
+ * they never start, resume, pause, or clear a goal. Derived from the dispatch
+ * roots minus the lifecycle/activating roots, so it cannot drift from the
+ * handler. Used by host adapters to decide whether a command preserves a
+ * pending kickoff retry.
+ */
+export const READ_ONLY_SUBCOMMANDS = new Set(
+  [...SUBCOMMAND_ROOTS].filter(root => !MUTATING_SUBCOMMANDS.has(root)),
+);
+
+/**
+ * True when the line dispatches to a read-only subcommand (status/info/history/
+ * log/list/ls with an optional operand) or is empty. Mirrors
+ * classifyGoalCommandOperation's token rule: the root must be followed by a
+ * space/tab or end-of-line, never another word character, so `status-page` is
+ * a bare objective, not read-only.
+ */
+export function isReadOnlyGoalCommand(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) return true;
+  const match = /^([A-Za-z]+)(?:[ \t]+(.*))?$/.exec(trimmed);
+  if (!match) return false;
+  return READ_ONLY_SUBCOMMANDS.has(match[1].toLowerCase());
+}
 
 export function stripWrappingQuotes(text: string): string {
   if (text.length >= 2) {
@@ -358,7 +404,10 @@ export function classifyGoalCommandOperation(
   // CLEAR_COMMANDS dispatch only on a bare verb or verb + one operand; longer
   // sentences are bare objectives even though the first word is a root.
   const lower = trimmed.toLowerCase();
-  const clearMatch = /^([A-Za-z]+)(?:\s+(\S+))?$/.exec(trimmed);
+  // CLEAR_COMMANDS dispatch only on a bare verb or verb + one space/tab-separated
+  // operand; a newline is not a token separator in the handler's checks, so
+  // 'clear\nfoo' is a bare objective, not a clear.
+  const clearMatch = /^([A-Za-z]+)(?:[ \t]+(\S+))?$/.exec(trimmed);
   if (clearMatch && CLEAR_COMMANDS.has(clearMatch[1].toLowerCase()))
     return 'clear';
   if (lower === 'resume' || lower.startsWith('resume ')) return 'resume';

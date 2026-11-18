@@ -3,13 +3,11 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {expect, test} from 'bun:test';
 import {waitFor} from './wait-for.ts';
+import {createV2ClientShim, setup, shapeToolResult} from '../src/plugin-v2.ts';
 import {
-  createV2ClientShim,
   getV2EventSessionID,
-  setup,
-  shapeToolResult,
   v1PartsToV2Text,
-} from '../src/plugin-v2.ts';
+} from '../src/plugin-v2-event-leaf.ts';
 
 // v2 tool input schema contract
 //

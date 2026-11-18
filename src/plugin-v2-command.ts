@@ -10,6 +10,7 @@ import {
   classifyGoalCommandOperation,
   splitLeadingGoalId,
 } from './commands-args.ts';
+import type {GoalState} from './state-machine.ts';
 
 export interface V2CommandExecutionInput {
   readonly sessionID: string;
@@ -86,6 +87,7 @@ export function assertV2AttachmentsBeforeRun(args: {
   rawArgs: string;
   hasAttachments: boolean;
   activeGoalStatus?: (goalId: string | null) => string | undefined;
+  goalIds?: () => string[];
 }): void {
   if (!args.hasAttachments) return;
   const operation = classifyGoalCommandOperation(args.rawArgs);
@@ -98,12 +100,22 @@ export function assertV2AttachmentsBeforeRun(args: {
     return;
   if (operation === 'edit') {
     const operand = args.rawArgs.trim().slice('edit'.length).trim();
-    const {goalId} = splitLeadingGoalId([], operand);
+    const goalIds = args.goalIds?.() ?? [];
+    // Resolve the named goal against the session's real goal list so non-UUID
+    // ids (test fixtures, legacy ids) match too; splitLeadingGoalId falls back
+    // to a UUID-shape guess when the operand's first token is not a known id.
+    const {goalId} = splitLeadingGoalId(
+      goalIds.map(id => ({goalId: id}) as GoalState),
+      operand,
+    );
     const status = args.activeGoalStatus?.(goalId);
     // An attachment-bearing edit may only proceed when the command will change
-    // lifecycle state. An already-active goal would be mutated before the
-    // post-run guard could reject the command.
-    if (status !== undefined && status !== 'active') return;
+    // lifecycle state. The handler transitions any non-active non-terminal
+    // goal (paused/blocked) to active and rejects terminal goals outright, so
+    // attachments are admitted only for paused/blocked targets; an
+    // already-active goal would be mutated before the post-run guard could
+    // reject the command.
+    if (status === 'paused' || status === 'blocked') return;
     if (status === undefined && !goalId) return;
   }
   throw new Error(

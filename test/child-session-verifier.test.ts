@@ -4,6 +4,7 @@ import {
   createChildSessionVerifier,
   parseVerdictFromJudge,
 } from '../src/child-session-verifier.ts';
+import {VERIFIER_SESSION_PERMISSIONS} from '../src/plugin-v2-tools-agents.ts';
 import type {GoalState} from '../src/state-machine.ts';
 import {createGoalState} from '../src/state-machine.ts';
 import type {CandidateIdentity} from '../src/completion-gate.ts';
@@ -536,6 +537,7 @@ describe('verifier child-session isolation', () => {
   test('verifier deletes a child created after timeout even when get fails', async () => {
     let resolveCreate: ((value: unknown) => void) | undefined;
     const deleted: string[] = [];
+    let getCalls = 0;
     const captureDeleteInput = (input: unknown): void => {
       const record = input as {
         sessionID?: unknown;
@@ -555,6 +557,7 @@ describe('verifier child-session isolation', () => {
             resolveCreate = resolve;
           }),
         get: async () => {
+          getCalls += 1;
           throw new Error('lookup failed');
         },
         prompt: async () => ({}),
@@ -575,6 +578,10 @@ describe('verifier child-session isolation', () => {
     await timedOut;
     await new Promise(resolve => setTimeout(resolve, 0));
     expect(deleted).toEqual(['late-child']);
+    // The lookup threw on every call, so cleanup must not have depended on a
+    // successful get to identify the late child. The timed-out create path
+    // therefore never consults get at all.
+    expect(getCalls).toBe(0);
   });
 
   test('verifier deletes a late-created child whose location is invalid', async () => {
@@ -617,5 +624,76 @@ describe('verifier child-session isolation', () => {
     await timedOut;
     await new Promise(resolve => setTimeout(resolve, 0));
     expect(deleted).toEqual(['late-child']);
+  });
+
+  test('verifier child is created with an explicit restrictive session permission policy', async () => {
+    // On v2 hosts a parent-bound child inherits the parent session's permission
+    // rules and the host applies session rules AFTER agent rules (last match
+    // wins), so a permissive parent would override the verifier agent's denies
+    // unless the child carries its own restrictive policy.
+    let capturedCreateInput: Record<string, unknown> | undefined;
+    let capturedCreateBody: Record<string, unknown> | undefined;
+    const client = {
+      session: {
+        create: async (input: unknown) => {
+          const i = input as Record<string, unknown>;
+          // The SDK shim calls create either flat ({...body}) or legacy
+          // ({body}); capture whichever carries the fields.
+          if (i.body && typeof i.body === 'object') {
+            capturedCreateBody = i.body as Record<string, unknown>;
+          } else {
+            capturedCreateInput = i;
+          }
+          return {id: 'child-1', parentID: 'session-1'};
+        },
+        get: async () => ({
+          id: 'child-1',
+          parentID: 'session-1',
+          location: {directory: '/target/workspace'},
+        }),
+        prompt: async () => ({
+          parts: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                schema_version: 1,
+                task_id: 'goal-123',
+                state: 'WORKING',
+                outstanding: ['not done'],
+                evidence: ['looked'],
+              }),
+            },
+          ],
+        }),
+        delete: async () => ({}),
+        abort: async () => ({}),
+        messages: async () => [],
+      },
+    };
+    const verifier = createChildSessionVerifier(client, {});
+    await verifier({
+      cwd: '/target/workspace',
+      taskId: 'goal-123',
+      candidateIdentity: {candidate: 'c', fingerprint: 'f'},
+      goal: createGoalState('session-1', 'Ship the release', {
+        goalId: 'goal-123',
+        runId: 'r1',
+      }),
+      latestText: 'Done',
+    } as never);
+    const perms = (capturedCreateInput ?? capturedCreateBody)?.permissions as
+      Array<{action: string; resource: string; effect: string}> | undefined;
+    expect(Array.isArray(perms)).toBe(true);
+    // deny-all must be present and ordered FIRST so it cannot be overridden by
+    // later rules; mutation actions must be denied.
+    expect(perms![0]).toEqual({action: '*', resource: '*', effect: 'deny'});
+    for (const action of ['edit', 'write', 'patch', 'bash']) {
+      const rule = perms!.findLast(
+        r => r.action === action || r.action === '*',
+      );
+      expect(rule?.effect).toBe('deny');
+    }
+    // The policy must equal the shared VERIFIER_SESSION_PERMISSIONS constant.
+    expect(perms).toEqual(VERIFIER_SESSION_PERMISSIONS.map(r => ({...r})));
   });
 });

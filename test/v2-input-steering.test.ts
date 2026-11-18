@@ -22,7 +22,7 @@ import {createLoopPolicy} from '../src/continuation-loop.ts';
 import {
   synthesizeChatMessageFromAdmitted,
   synthesizeChatMessageFromText,
-} from '../src/plugin-v2.ts';
+} from '../src/plugin-v2-event-leaf.ts';
 
 function makeUsage(): UsageSnapshot {
   return {

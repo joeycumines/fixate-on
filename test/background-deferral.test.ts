@@ -13,6 +13,7 @@ import {createGoalState, GoalStateMachine} from '../src/state-machine.ts';
 import {createLoopPolicy} from '../src/continuation-loop.ts';
 import {
   blockingBackgroundJobKeys,
+  nextDeferralOnBlockedIdle,
   shouldSuppressTrailingIdle,
 } from '../src/plugin-v2-helpers.ts';
 
@@ -237,3 +238,224 @@ describe('background deferral expiry', () => {
 // Inbox promotion is covered by the full bridge test in
 // test/plugin-v2-command-transform.test.ts and payload retention by
 // test/inbox-payload-retention.test.ts.
+
+describe('bounded escalation with mixed goal statuses', () => {
+  function mixedSession(
+    active: GoalStateMachine,
+    paused: GoalStateMachine,
+    blocked: GoalStateMachine,
+  ): SessionContext {
+    const session = makeSession(active);
+    session.listMachines = () => [active, paused, blocked];
+    session.listActiveGoals = () => [
+      active.snapshot(),
+      paused.snapshot(),
+      blocked.snapshot(),
+    ];
+    return session;
+  }
+
+  test('expiry transitions only active/finalizing goals and still announces once', async () => {
+    const activeGoal = makeGoal();
+    activeGoal.goalId = 'g-active';
+    const pausedGoal = {
+      ...makeGoal(),
+      goalId: 'g-paused',
+      status: 'paused' as const,
+    };
+    const blockedGoal = {
+      ...makeGoal(),
+      goalId: 'g-blocked',
+      status: 'blocked' as const,
+    };
+    const active = new GoalStateMachine(activeGoal, {onCommit: async () => {}});
+    const paused = new GoalStateMachine(pausedGoal, {onCommit: async () => {}});
+    const blocked = new GoalStateMachine(blockedGoal, {
+      onCommit: async () => {},
+    });
+    const runtime = createRuntimeState();
+    const veryOld = Date.now() - 16 * 60_000;
+    runtime.backgroundBlockedUntil.set('s1', veryOld);
+    runtime.backgroundDeferrals!.set('s1', {
+      jobKeys: ['subagent:child-1'],
+      since: veryOld,
+      nextRecheckAt: veryOld,
+      extensions: 20,
+    });
+    let announces = 0;
+    const deps = makeDeps(mixedSession(active, paused, blocked), runtime);
+    deps.announceGoalDecision = async () => {
+      announces += 1;
+    };
+    const hooks = createHooks({
+      ...deps,
+      idlePoller: true,
+      idlePollerIntervalMs: 20,
+      idleQuietMs: 30,
+      idleGraceMs: 0,
+    });
+    try {
+      await sleep(200);
+      // Only the active goal may transition to paused; paused->paused and
+      // blocked->paused are not in TRANSITION_TABLE and must be skipped.
+      expect(active.snapshot().status).toBe('paused');
+      expect(active.snapshot().stopReason).toBe(
+        'background completion unreported',
+      );
+      expect(paused.snapshot().status).toBe('paused');
+      expect(paused.snapshot().stopReason).not.toBe(
+        'background completion unreported',
+      );
+      expect(blocked.snapshot().status).toBe('blocked');
+      // Every non-terminal goal still receives the receipt notice (notices
+      // land in pendingNotices and flush into history on the next commit).
+      for (const m of [active, paused, blocked]) {
+        const snap = m.snapshot();
+        const pending = snap.pendingNotices ?? [];
+        const inHistory = snap.history.some(
+          h =>
+            h.type === 'notice' &&
+            h.detail.includes('Background job completion was not reported'),
+        );
+        const inPending = pending.some(n =>
+          n.message.includes('Background job completion was not reported'),
+        );
+        expect(inHistory || inPending).toBe(true);
+      }
+      expect(announces).toBe(1);
+      expect(runtime.backgroundDeferrals!.has('s1')).toBe(false);
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('expiry is skipped when canDriveSession fences the session', async () => {
+    const machine = new GoalStateMachine(makeGoal(), {
+      onCommit: async () => {},
+    });
+    const runtime = createRuntimeState();
+    runtime.canDriveSession = () => false;
+    const veryOld = Date.now() - 16 * 60_000;
+    runtime.backgroundBlockedUntil.set('s1', veryOld);
+    runtime.backgroundDeferrals!.set('s1', {
+      jobKeys: ['subagent:child-1'],
+      since: veryOld,
+      nextRecheckAt: veryOld,
+      extensions: 20,
+    });
+    let announces = 0;
+    const deps = makeDeps(makeSession(machine), runtime);
+    deps.announceGoalDecision = async () => {
+      announces += 1;
+    };
+    const hooks = createHooks({
+      ...deps,
+      idlePoller: true,
+      idlePollerIntervalMs: 20,
+      idleQuietMs: 30,
+      idleGraceMs: 0,
+    });
+    try {
+      await sleep(200);
+      expect(machine.snapshot().status).toBe('active');
+      expect(announces).toBe(0);
+      expect(runtime.backgroundDeferrals!.has('s1')).toBe(true);
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+});
+
+describe('nextDeferralOnBlockedIdle (clock preservation)', () => {
+  test('overlapping job keys preserve since/extensions and only move the recheck', () => {
+    const now = 1_000_000;
+    const existing = {
+      jobKeys: ['subagent:c1'],
+      since: 500_000,
+      nextRecheckAt: 900_000,
+      extensions: 4,
+    };
+    const next = nextDeferralOnBlockedIdle({
+      jobKeys: ['subagent:c1', 'image:img-2'],
+      existing,
+      now,
+    });
+    expect(next.since).toBe(500_000);
+    expect(next.extensions).toBe(4);
+    expect(next.nextRecheckAt).toBe(now + 30_000);
+    expect(next.jobKeys).toEqual(['subagent:c1', 'image:img-2']);
+  });
+
+  test('a disjoint job set starts a fresh clock', () => {
+    const now = 1_000_000;
+    const existing = {
+      jobKeys: ['subagent:c1'],
+      since: 500_000,
+      nextRecheckAt: 900_000,
+      extensions: 4,
+    };
+    const next = nextDeferralOnBlockedIdle({
+      jobKeys: ['image:img-9'],
+      existing,
+      now,
+    });
+    expect(next.since).toBe(now);
+    expect(next.extensions).toBe(0);
+  });
+
+  test('no existing deferral starts fresh', () => {
+    const now = 1_000_000;
+    const next = nextDeferralOnBlockedIdle({
+      jobKeys: ['subagent:c1'],
+      existing: undefined,
+      now,
+    });
+    expect(next.since).toBe(now);
+    expect(next.extensions).toBe(0);
+    expect(next.nextRecheckAt).toBe(now + 30_000);
+  });
+});
+
+describe('execution/step start does not clear a background deferral', () => {
+  test('a step.started event between blocked idles keeps the deferral authoritative', async () => {
+    const machine = new GoalStateMachine(makeGoal(), {
+      onCommit: async () => {},
+    });
+    const runtime = createRuntimeState();
+    const past = Date.now() - 60_000;
+    runtime.backgroundBlockedUntil.set('s1', past);
+    runtime.backgroundDeferrals!.set('s1', {
+      jobKeys: ['subagent:child-1'],
+      since: past,
+      nextRecheckAt: past,
+      extensions: 0,
+    });
+    const deps = makeDeps(makeSession(machine), runtime);
+    const hooks = createHooks({
+      ...deps,
+      idlePoller: true,
+      idlePollerIntervalMs: 20,
+      idleQuietMs: 30,
+      idleGraceMs: 0,
+    });
+    try {
+      // A control-only event (compaction / execution start) arrives while the
+      // deferral is outstanding: it must NOT clear the deferral maps.
+      await hooks.event!({
+        type: 'session.execution.started',
+        sessionID: 's1',
+        id: 'ev-exec-1',
+      });
+      expect(runtime.backgroundDeferrals!.has('s1')).toBe(true);
+      expect(runtime.backgroundBlockedUntil.has('s1')).toBe(true);
+      await sleep(150);
+      // The poller extended the deferral rather than driving a continuation.
+      expect(machine.snapshot().status).toBe('active');
+      expect((runtime.backgroundBlockedUntil.get('s1') ?? 0) > Date.now()).toBe(
+        true,
+      );
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+});

@@ -90,6 +90,8 @@ export function createKickoffWiring(args: {
   // active status. The kickoff sends an initial continuation prompt unless an agent turn
   // materialized in the interim. (v2 routes commands via templates and does not use this hook.)
   const kickoffTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Bound on admission retries for a retained kickoff dispatch. */
+  const MAX_KICKOFF_RETRY_ATTEMPTS = 3;
   const clearKickoffTimer = (sessionID: string): void => {
     const t = kickoffTimers.get(sessionID);
     if (t !== undefined) {
@@ -184,14 +186,39 @@ export function createKickoffWiring(args: {
             return;
           const pending = runtime.pendingKickoffDispatch?.get(sessionID);
           if (pending && pending.goalId === goalId && pending.runId === runId) {
-            runtime.pendingKickoffDispatch?.delete(sessionID);
+            // Retain the dispatch until the retry actually succeeds: deleting
+            // before the attempt strands the attachment payload when the retry
+            // fails a second time (a later resume builds a fresh dispatch
+            // without attachments).
+            runtime.promptInFlightSessions.add(sessionID);
             try {
               await runtime.retryPendingKickoffDispatch?.(
                 sessionID,
                 pending.dispatch,
               );
+              runtime.pendingKickoffDispatch?.delete(sessionID);
             } catch {
-              // A retry failure is retried by the next idle or explicit resume.
+              // Re-arm a bounded retry so a transient second failure does not
+              // permanently drop the retained dispatch.
+              const attempts = (pending.attempts ?? 0) + 1;
+              if (attempts >= MAX_KICKOFF_RETRY_ATTEMPTS) {
+                runtime.pendingKickoffDispatch?.delete(sessionID);
+                const target = machineAtFire;
+                if (target && !target.isTerminal()) {
+                  await target.addNotice(
+                    'prompt-failure',
+                    `Kickoff admission failed ${attempts} times; the retained dispatch was dropped. Run \`/goal resume\` after the host recovers.`,
+                  );
+                }
+              } else {
+                runtime.pendingKickoffDispatch?.set(sessionID, {
+                  ...pending,
+                  attempts,
+                });
+                scheduleKickoff(sessionID, goalId, runId);
+              }
+            } finally {
+              runtime.promptInFlightSessions.delete(sessionID);
             }
             return;
           }
@@ -359,17 +386,27 @@ export function createKickoffWiring(args: {
         ),
       );
       let activatedGoal: GoalState | null = null;
-      for (const [goalId, afterGoal] of afterByGoal) {
-        if (afterGoal.status !== 'active') continue;
-        const beforeGoal = beforeByGoal.get(goalId) ?? null;
-        if (
-          beforeGoal === null ||
-          beforeGoal.goalId !== afterGoal.goalId ||
-          beforeGoal.runId !== afterGoal.runId ||
-          beforeGoal.status !== 'active'
-        ) {
-          activatedGoal = afterGoal;
-          break;
+      // When the command outcome names its target goal deterministically (e.g.
+      // `add`), prefer that goal over the first newly-active machine: two
+      // concurrent `add` commands would otherwise both attach the first goal.
+      const namedGoalId = outcome.targetGoalId;
+      if (namedGoalId) {
+        const named = afterByGoal.get(namedGoalId) ?? null;
+        if (named && named.status === 'active') activatedGoal = named;
+      }
+      if (activatedGoal === null) {
+        for (const [goalId, afterGoal] of afterByGoal) {
+          if (afterGoal.status !== 'active') continue;
+          const beforeGoal = beforeByGoal.get(goalId) ?? null;
+          if (
+            beforeGoal === null ||
+            beforeGoal.goalId !== afterGoal.goalId ||
+            beforeGoal.runId !== afterGoal.runId ||
+            beforeGoal.status !== 'active'
+          ) {
+            activatedGoal = afterGoal;
+            break;
+          }
         }
       }
       const after = activatedGoal ?? focusedAfter;

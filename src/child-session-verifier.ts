@@ -16,6 +16,7 @@ import {
 } from './completion-gate.ts';
 import {escapeGoalText} from './escape.ts';
 import {canonicalPath} from './plugin-v2-helpers.ts';
+import {VERIFIER_SESSION_PERMISSIONS} from './plugin-v2-tools-agents.ts';
 import {
   findLatestAssistantMessage,
   getTextFromParts,
@@ -429,6 +430,9 @@ export function createChildSessionJudge(
       const sessionApi = createSessionApiForJudge(client, sdkShape);
       const created = await sessionApi.createChild(sessionID, {
         title: 'goal completion judge',
+        // Same restrictive session policy as the verifier: see
+        // VERIFIER_SESSION_PERMISSIONS.
+        permissions: VERIFIER_SESSION_PERMISSIONS.map(rule => ({...rule})),
       });
       const createdObj = created as {
         id?: string;
@@ -598,22 +602,37 @@ export function createChildSessionVerifier(
 
     let childID: string | undefined;
     let timedOut = false;
-    let cleanupCompleted = false;
-    const activeDeleteApi = createSessionApiForJudge(client, sdkShape);
+    // Single-flight cleanup: created synchronously on first use so concurrent
+    // callers (the run path and the outer finally) await the same deletion.
+    let cleanupPromise: Promise<void> | undefined;
+    // API construction is lazy: createOpenCodeSessionApi throws when the client
+    // has no session object, and that throw must land inside the try/catch so
+    // failurePolicy 'approve' can still synthesize WORKING.
+    let activeDeleteApi: OpenCodeSessionApi | undefined;
+    const getDeleteApi = (): OpenCodeSessionApi => {
+      if (!activeDeleteApi)
+        activeDeleteApi = createSessionApiForJudge(client, sdkShape);
+      return activeDeleteApi;
+    };
 
     const deleteVerifierChild = async (): Promise<void> => {
-      if (!childID || cleanupCompleted) return;
-      if (typeof c?.session?.delete !== 'function') {
-        throw new Error('child-session cleanup unsupported by host');
+      if (!childID) return;
+      if (!cleanupPromise) {
+        cleanupPromise = (async () => {
+          if (typeof c?.session?.delete !== 'function') {
+            throw new Error('child-session cleanup unsupported by host');
+          }
+          try {
+            await getDeleteApi().delete(childID!);
+          } catch (error) {
+            // A not-found child is already gone: treat as cleaned up.
+            const msg = error instanceof Error ? error.message : String(error);
+            if (/not found/i.test(msg)) return;
+            throw new Error(`child-session cleanup failed: ${msg}`);
+          }
+        })();
       }
-      try {
-        await activeDeleteApi.delete(childID);
-        cleanupCompleted = true;
-      } catch (error) {
-        throw new Error(
-          `child-session cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
+      await cleanupPromise;
     };
 
     const run = async (): Promise<CompletionVerdict> => {
@@ -621,10 +640,15 @@ export function createChildSessionVerifier(
         throw new Error('child-session API unavailable');
       }
 
-      const sessionApi = activeDeleteApi;
+      const sessionApi = getDeleteApi();
       const created = await sessionApi.createChild(goal.sessionID, {
         title: 'goal completion verification',
         ...(location ? {location} : {}),
+        // Explicit restrictive session policy: on v2 hosts a parent-bound
+        // child inherits the parent's permission rules and the host applies
+        // session rules AFTER agent rules (last match wins), so without this
+        // a permissive parent would override the verifier agent's denies.
+        permissions: VERIFIER_SESSION_PERMISSIONS.map(rule => ({...rule})),
       });
       const createdObj = created as {
         id?: string;
@@ -633,19 +657,18 @@ export function createChildSessionVerifier(
       } | null;
       childID = createdObj?.id || createdObj?.sessionID;
       if (!childID) throw new Error('child session id unavailable');
+      // A timeout that wins while createChild is in flight owns cleanup here:
+      // check it before the parent-relationship guard so a late-created child
+      // is still deleted rather than leaked.
+      if (timedOut) {
+        await deleteVerifierChild();
+        throw new Error(`verifier timed out after ${timeoutMs}ms`);
+      }
       if (
         createdObj?.parentID !== undefined &&
         createdObj.parentID !== goal.sessionID
       ) {
         throw new Error('child session parent relationship was not preserved');
-      }
-
-      // A timeout that wins while createChild is in flight is owned here: the
-      // outer finally already ran without a child ID, so finish cleanup before
-      // any further host call can fail.
-      if (timedOut) {
-        await deleteVerifierChild();
-        throw new Error(`verifier timed out after ${timeoutMs}ms`);
       }
 
       // The verifier judges THIS workspace. A host that ignores the requested
@@ -665,11 +688,13 @@ export function createChildSessionVerifier(
         const rawDir = actual?.location?.directory ?? actual?.directory;
         const actualDir = typeof rawDir === 'string' ? rawDir : undefined;
         const expectedDir = cwd ? canonicalPath(cwd) : undefined;
+        // An intentionally omitted cwd cannot be matched against a reported
+        // directory; only fail closed when a comparison is actually possible.
         if (
-          !actualDir ||
-          !actualDir.trim() ||
-          !expectedDir ||
-          canonicalPath(actualDir) !== expectedDir
+          expectedDir &&
+          (!actualDir ||
+            !actualDir.trim() ||
+            canonicalPath(actualDir) !== expectedDir)
         ) {
           throw new Error(
             'child verifier workspace location does not match the goal workspace',
@@ -746,7 +771,23 @@ export function createChildSessionVerifier(
       throw new Error(`verifier error: ${msg}`);
     } finally {
       if (timerID) clearTimeout(timerID);
-      if (childID) await deleteVerifierChild();
+      if (childID) {
+        try {
+          await deleteVerifierChild();
+        } catch (cleanupError) {
+          // Cleanup failure must not override a fail-open WORKING verdict
+          // already returned by the catch. Under failurePolicy 'reject' the
+          // catch rethrows anyway; only rethrow the cleanup error when no
+          // other error is already propagating and the policy is 'reject'.
+          if (failurePolicy === 'reject') {
+            const msg =
+              cleanupError instanceof Error
+                ? cleanupError.message
+                : String(cleanupError);
+            throw new Error(`verifier cleanup error: ${msg}`);
+          }
+        }
+      }
     }
   };
 }

@@ -168,7 +168,7 @@ export interface RuntimeState {
   /** Original v2 command dispatch retained for a fenced admission retry. */
   pendingKickoffDispatch?: Map<
     string,
-    {goalId: string; runId: string; dispatch: unknown}
+    {goalId: string; runId: string; dispatch: unknown; attempts?: number}
   >;
   /** Retries a retained v2 dispatch after a delayed kickoff's guards pass. */
   retryPendingKickoffDispatch?: (
@@ -243,7 +243,31 @@ export function createRuntimeState(): RuntimeState {
 }
 
 /** Cap on ids held per delivery set (insertion-order eviction). */
-const DELIVERY_SET_CAP = 256;
+export const DELIVERY_SET_CAP = 256;
+
+/**
+ * Adds `id` to a per-session set with insertion-order eviction at
+ * DELIVERY_SET_CAP. Returns the set (creating and registering it on `target`
+ * when absent). Null-safe: a missing runtime or empty key is a no-op.
+ */
+export function addToCappedIDSet(
+  target: Map<string, Set<string>> | undefined,
+  sessionID: string,
+  id: string,
+): void {
+  if (!target || !sessionID || !id) return;
+  let set = target.get(sessionID);
+  if (!set) {
+    set = new Set<string>();
+    target.set(sessionID, set);
+  }
+  set.add(id);
+  while (set.size > DELIVERY_SET_CAP) {
+    const oldest = set.values().next().value;
+    if (oldest === undefined) break;
+    set.delete(oldest);
+  }
+}
 
 /**
  * Records one input-delivery observation into the runtime's per-session sets.

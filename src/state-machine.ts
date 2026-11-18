@@ -219,6 +219,7 @@ export class GoalStateMachine {
         // make subsequent observations of the same message ID appear counted,
         // prematurely suppressing the brake until a new turn occurs.
         this.goal.lastCountedProgressMessageID = '';
+        this.goal.stalledTurnCounted = false;
         this.goal.lastNoToolCallMessageID = '';
         this.goal.promptFailures = 0;
         this.goal.budgetWrapupSent = false;
@@ -683,6 +684,7 @@ export function createGoalState(
     lastAssistantText: '',
     lastAssistantMessageID: '',
     lastCountedProgressMessageID: '',
+    stalledTurnCounted: false,
     lastNoToolCallMessageID: '',
     lastContinueAt: 0,
     lastProgressAt: 0,

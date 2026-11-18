@@ -325,6 +325,14 @@ export interface GoalState {
    */
   lastCountedProgressMessageID?: string;
   /**
+   * Whether the turn pinned in `lastCountedProgressMessageID` was counted as a
+   * STALL. When false, the pin came from a productive evaluation (tool call or
+   * prose) and a duplicate idle must not reclassify the same turn as low
+   * progress; when true, the turn is already counted and must not be counted
+   * again. The flag resets whenever a new turn is evaluated.
+   */
+  stalledTurnCounted?: boolean;
+  /**
    * Assistant message ID already counted toward `noToolCallTurns`, ensuring turns
    * rather than idle ticks are counted.
    */

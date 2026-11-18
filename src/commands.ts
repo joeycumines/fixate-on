@@ -81,6 +81,12 @@ export interface CommandSessionContext {
 export interface CommandOutcome {
   ok: boolean;
   text: string;
+  /**
+   * The goal the command actually targeted, when deterministic (e.g. `add`
+   * returns the newly created goal). Lets dispatchers pair kickoff
+   * attachments with the correct goal under concurrent commands.
+   */
+  targetGoalId?: string;
 }
 
 const passOutcome = (text: string): CommandOutcome => ({ok: true, text});
@@ -684,19 +690,26 @@ export async function handleCommandOutcome(
       );
     }
     const addedPersisted = await session.persist();
+    const addedGoalId = machine.snapshot().goalId;
     if (!addedPersisted) {
       const cause = session.isOwnedElsewhere?.()
         ? "NOT SAVED — this host could not write this session's file, because another process owns it."
         : "NOT SAVED — this host would not write this session's file. No other process owns it; see the host log for the cause.";
-      return passOutcome(
-        [
+      return {
+        ok: true,
+        text: [
           cause,
           'The goal is live in memory for this process only and will be gone on restart.',
           `Objective: ${parsed.condition}`,
         ].join('\n'),
-      );
+        targetGoalId: addedGoalId,
+      };
     }
-    return passOutcome(`Added and focused new goal: ${parsed.condition}`);
+    return {
+      ok: true,
+      text: `Added and focused new goal: ${parsed.condition}`,
+      targetGoalId: addedGoalId,
+    };
   }
 
   if (

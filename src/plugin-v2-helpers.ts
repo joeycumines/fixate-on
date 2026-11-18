@@ -636,6 +636,38 @@ export function hasBlockingBackgroundJobs(
   return blockingBackgroundJobKeys(background, sessionID).length > 0;
 }
 
+/** Shape of one background-deferral record (mirrors RuntimeState's map value). */
+export interface BackgroundDeferral {
+  jobKeys: string[];
+  since: number;
+  nextRecheckAt: number;
+  extensions: number;
+}
+
+/**
+ * Computes the next deferral record for a blocked idle. A host re-reporting a
+ * job set that overlaps the recorded one must not reset the escalation clock:
+ * `since`/`extensions` are preserved and only `nextRecheckAt` moves. A
+ * disjoint set starts a fresh clock.
+ */
+export function nextDeferralOnBlockedIdle(args: {
+  jobKeys: string[];
+  existing: BackgroundDeferral | undefined;
+  now: number;
+  recheckDelayMs?: number;
+}): BackgroundDeferral {
+  const {jobKeys, existing, now} = args;
+  const recheckDelayMs = args.recheckDelayMs ?? 30_000;
+  const overlaps =
+    existing !== undefined && jobKeys.some(k => existing.jobKeys.includes(k));
+  return {
+    jobKeys,
+    since: overlaps ? existing.since : now,
+    nextRecheckAt: now + recheckDelayMs,
+    extensions: overlaps ? existing.extensions : 0,
+  };
+}
+
 /**
  * Extract routable text from a v2 inbox item. `synthetic` marks plugin-generated
  * items (kickoffs/continuations) that must never be treated as human steering.
@@ -724,167 +756,3 @@ export function shouldSuppressTrailingIdle(
 }
 
 /** Registers v1 goal tools on the v2 `tool.transform` host surface with retry logging. */
-export async function registerV2GoalTools(args: {
-  toolTransform: NonNullable<V2Context['tool']>['transform'];
-  tools: Record<string, unknown>;
-  z: ZodModule | null;
-  drainTuiEvents: (sessionID: string) => unknown[];
-  encodeMetadata: (events: unknown[]) => Record<string, unknown> | undefined;
-  shapeResult: (
-    result: unknown,
-    goalMetadata: Record<string, unknown> | undefined,
-  ) => unknown;
-  disposers: Array<() => Promise<void> | void>;
-}): Promise<void> {
-  const registeredNames = new Set<string>();
-  const registerOnce = async (): Promise<void> => {
-    const attemptNames = new Set<string>();
-    const reg = await args.toolTransform(draft => {
-      for (const [name, def] of Object.entries(args.tools)) {
-        if (!def || typeof def !== 'object') continue;
-        if (registeredNames.has(name)) continue;
-        const tool = def as {
-          description?: string;
-          args?: Record<string, unknown>;
-          execute?: (
-            toolArgs: Record<string, unknown>,
-            ctx: {sessionID: string},
-          ) => Promise<unknown> | unknown;
-        };
-        if (typeof tool.execute !== 'function') continue;
-        try {
-          draft.add({
-            name,
-            description:
-              typeof tool.description === 'string'
-                ? tool.description
-                : `${name} (fixate-on)`,
-            input: buildToolInputSchema(args.z, tool.args),
-            options: {codemode: false},
-            execute: async (input: unknown, execCtx: unknown) => {
-              const sid =
-                (execCtx as {sessionID?: string} | null)?.sessionID ?? '';
-              const result = await tool.execute!(
-                (input ?? {}) as Record<string, unknown>,
-                {sessionID: sid},
-              );
-              const events = sid ? args.drainTuiEvents(sid) : [];
-              const goalMeta = args.encodeMetadata(events);
-              return args.shapeResult(result, goalMeta);
-            },
-          });
-          attemptNames.add(name);
-        } catch (error) {
-          console.error(
-            `[fixate-on] failed to register tool "${name}":`,
-            error instanceof Error ? error.message : error,
-          );
-        }
-      }
-    });
-    args.disposers.push(() => reg.dispose());
-    for (const name of attemptNames) registeredNames.add(name);
-  };
-
-  try {
-    await registerOnce();
-  } catch (error) {
-    console.error(
-      '[fixate-on] tool registration failed (attempt 1):',
-      error instanceof Error ? error.message : error,
-    );
-    await logToolRegistrationFailure('attempt-1', error);
-    try {
-      await registerOnce();
-      console.error('[fixate-on] tool registration succeeded on retry');
-    } catch (retryError) {
-      console.error(
-        '[fixate-on] tool registration FAILED after retry — goal tools are UNAVAILABLE:',
-        retryError instanceof Error ? retryError.message : retryError,
-      );
-      await logToolRegistrationFailure('retry-exhausted', retryError);
-    }
-  }
-}
-
-export interface NativeAgentSpec {
-  readonly description?: string;
-  readonly mode?: string;
-  readonly prompt?: string;
-  readonly hidden?: boolean;
-}
-
-/**
- * Mirrors native `goal` and read-only `goal-verify` agent registration into
- * OpenCode v2's `ctx.agent.transform` draft while failing closed on pre-existing
- * verifier collisions.
- */
-export function applyV2AgentTransforms(
-  draft: V2AgentDraft,
-  agentsConfig: Record<string, NativeAgentSpec> | undefined,
-  opts: {
-    goalAgentName: string;
-    verifierAgentName: string;
-    registerAgents: boolean;
-    requireVerifierOwnership: boolean;
-  },
-): void {
-  if (opts.goalAgentName === opts.verifierAgentName) {
-    throw new TypeError(
-      'goalAgentName and verifierAgentName must be different',
-    );
-  }
-  const existingVerifier = draft.get?.(opts.verifierAgentName);
-  if (existingVerifier && opts.requireVerifierOwnership) {
-    throw new Error(
-      `childSessionJudge cannot safely use existing agent ${JSON.stringify(opts.verifierAgentName)}; choose an unused verifierAgentName`,
-    );
-  }
-  if (!opts.registerAgents || !agentsConfig) return;
-
-  const goalSpec = agentsConfig[opts.goalAgentName];
-  if (goalSpec && !draft.get?.(opts.goalAgentName)) {
-    draft.update(opts.goalAgentName, entry => {
-      entry.name = opts.goalAgentName;
-      if (goalSpec.description) entry.description = goalSpec.description;
-      entry.mode = 'primary';
-      entry.hidden = false;
-      if (goalSpec.prompt) entry.system = goalSpec.prompt;
-    });
-  }
-
-  const verifierSpec = agentsConfig[opts.verifierAgentName];
-  if (verifierSpec && !existingVerifier) {
-    draft.update(opts.verifierAgentName, entry => {
-      entry.name = opts.verifierAgentName;
-      if (verifierSpec.description) {
-        entry.description = verifierSpec.description;
-      }
-      entry.mode = 'subagent';
-      entry.hidden = true;
-      if (verifierSpec.prompt) entry.system = verifierSpec.prompt;
-      const perms = Array.isArray(entry.permissions)
-        ? entry.permissions
-        : (entry.permissions = []);
-      perms.length = 0;
-      perms.push(
-        {action: '*', resource: '*', effect: 'deny'},
-        {action: 'read', resource: '*', effect: 'allow'},
-        {action: 'glob', resource: '*', effect: 'allow'},
-        {action: 'grep', resource: '*', effect: 'allow'},
-        {action: 'read', resource: '*.env', effect: 'deny'},
-        {action: 'read', resource: '*.env.*', effect: 'deny'},
-        {action: 'read', resource: '*.env.example', effect: 'allow'},
-        {action: 'edit', resource: '*', effect: 'deny'},
-        {action: 'write', resource: '*', effect: 'deny'},
-        {action: 'patch', resource: '*', effect: 'deny'},
-        {action: 'bash', resource: '*', effect: 'deny'},
-        {action: 'shell', resource: '*', effect: 'deny'},
-        {action: 'create_goal', resource: '*', effect: 'deny'},
-        {action: 'update_goal', resource: '*', effect: 'deny'},
-        {action: 'propose_goal_change', resource: '*', effect: 'deny'},
-        {action: 'goal-command', resource: '*', effect: 'deny'},
-      );
-    });
-  }
-}

@@ -158,24 +158,41 @@ export function createHooks(deps: HookDeps): PluginHooks {
           const now = Date.now();
           const deadline = backgroundDeadline ?? deferral!.nextRecheckAt;
           if (deadline > now) continue;
+          if (
+            deps.runtime?.canDriveSession &&
+            !deps.runtime.canDriveSession(sessionID)
+          )
+            continue;
           const MAX_BACKGROUND_WAIT_MS = 15 * 60_000;
           const since = deferral?.since ?? now;
           if (now - since >= MAX_BACKGROUND_WAIT_MS) {
             // Bounded escalation: pause with an explicit receipt rather than
             // continue past an unattested completion or loop indefinitely.
+            // Only active/finalizing goals can transition to paused per
+            // TRANSITION_TABLE; already-paused/blocked goals keep their state
+            // and stop reason but still receive the notice and announcement.
             const session = getSessionContext(sessionID);
             const allMachines = sessionMachines(session);
             for (const target of allMachines) {
               if (target.isTerminal()) continue;
-              await target.transition('paused', {
-                source: 'idle-handler',
-                stopReason: 'background completion unreported',
-                detail:
-                  'A background subagent/image job did not report completion within the wait bound; resume after it finishes.',
-              });
+              const snap = target.snapshot();
+              if (snap.status === 'active' || snap.finalizing) {
+                await target.transition('paused', {
+                  source: 'idle-handler',
+                  stopReason: 'background completion unreported',
+                  detail:
+                    'A background subagent/image job did not report completion within the wait bound; resume after it finishes.',
+                });
+              }
               await target.addNotice(
                 'background-completion-unreported',
                 'Background job completion was not reported; goal paused. Resume once the job has finished.',
+              );
+            }
+            if (deps.announceGoalDecision) {
+              await deps.announceGoalDecision(
+                sessionID,
+                'A background subagent/image job did not report completion within the wait bound; goal(s) paused. Resume once the job has finished.',
               );
             }
             if (session) await session.persist();

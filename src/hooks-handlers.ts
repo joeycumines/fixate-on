@@ -31,6 +31,7 @@ import {isInternalAgent} from './agent-resolve.ts';
 import {brakeCeiling, brakeCeilingFormatted} from './brake-format.ts';
 import {copyGoalsToForkedSession, extractForkParentID} from './fork-bind.ts';
 import {
+  addToCappedIDSet,
   recordEventInputDelivery,
   resolveInputDeliveryFields,
 } from './session-runtime.ts';
@@ -424,13 +425,8 @@ export function createEventHook(
       const hasLiveGoal = (runtime?.sessionGoals.get(sessionID) ?? []).some(
         m => !m.isTerminal(),
       );
-      if (inputID && delivery === 'queue' && !hasLiveGoal) {
-        let surfaced = runtime?.surfacedQueuedMessageIDs.get(sessionID);
-        if (!surfaced) {
-          surfaced = new Set<string>();
-          runtime!.surfacedQueuedMessageIDs.set(sessionID, surfaced);
-        }
-        surfaced.add(inputID);
+      if (inputID && delivery === 'queue' && !hasLiveGoal && runtime) {
+        addToCappedIDSet(runtime.surfacedQueuedMessageIDs, sessionID, inputID);
       }
     }
 
