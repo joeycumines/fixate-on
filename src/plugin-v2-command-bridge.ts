@@ -18,7 +18,7 @@ import {
   logV2DiagnosticEvent,
   validateV2CommandExecutionInput,
 } from './plugin-v2-command.ts';
-import {isReadOnlyGoalCommand} from './commands-args.ts';
+import {parseGoalCommand} from './commands-args.ts';
 import {
   normalizeInheritedAgentForPrompt,
   stripAgentListSortPrefix,
@@ -26,7 +26,13 @@ import {
 import {GOAL_TUI_METADATA_KEY} from './tui-state.ts';
 import {GOAL_COMMAND_TEMPLATE_PREFIX} from './native-agent-config.ts';
 import type {PluginHooks} from './hooks.ts';
-import type {RuntimeState} from './session-runtime.ts';
+import {
+  acquirePromptInFlight,
+  retainKickoffDispatch,
+  removeKickoffDispatch,
+  type RuntimeState,
+  type PendingKickoffDispatch,
+} from './session-runtime.ts';
 import type {PluginOptions} from './plugin-runtime.ts';
 import type {RecentKickoffTextTracker} from './plugin-v2-command.ts';
 import type {V2Context} from './plugin-v2-helpers.ts';
@@ -37,6 +43,7 @@ export interface V2CommandBridgeDeps {
   pluginOptions: PluginOptions;
   recentKickoffTexts: RecentKickoffTextTracker;
   disposers: Array<() => Promise<void> | void>;
+  publishOutput?: (sessionID: string, text: string) => Promise<void>;
 }
 
 /**
@@ -65,6 +72,7 @@ export async function registerV2GoalCommandBridge(
           description:
             'Set or manage the persistent thread goal [status|pause|resume|clear|list|history]',
           execute: async input => {
+            const userCommandStartedAt = Date.now();
             const {sessionID, rawArgs, prompt, hasAttachments, delivery} =
               validateV2CommandExecutionInput(input);
             if (!rawArgs && hasAttachments) {
@@ -72,16 +80,28 @@ export async function registerV2GoalCommandBridge(
                 `No objective provided. Use \`/${commandName} <condition>\` to set a goal.`,
               );
             }
-            // Read-only = the line dispatches to a reporting subcommand
-            // (status/info/history/log/list/ls) or is empty. Derived from
-            // the same token rule as the command operation dispatch, so
-            // `status-page ...` is a bare objective, not read-only.
-            const readOnly = isReadOnlyGoalCommand(rawArgs);
+            const command = parseGoalCommand(rawArgs);
             assertV2AttachmentsBeforeRun({
               rawArgs,
               hasAttachments,
               activeGoalStatus: goalId =>
                 hooks.runtime?.getGoalStatus?.(sessionID, goalId),
+              canRecoverAttachedEdit: goalId => {
+                const machines =
+                  hooks.runtime?.sessionGoals.get(sessionID) ?? [];
+                const targetId =
+                  goalId ?? hooks.runtime?.focusedGoalId.get(sessionID);
+                const machine = targetId
+                  ? machines.find(m => m.snapshot().goalId === targetId)
+                  : machines[0];
+                const snap = machine?.snapshot();
+                return Boolean(
+                  snap?.kickoffAdmissionPending &&
+                  !hooks.runtime?.pendingKickoffDispatch
+                    ?.get(sessionID)
+                    ?.has(snap.goalId),
+                );
+              },
               goalIds: () =>
                 (hooks.runtime?.sessionGoals.get(sessionID) ?? []).map(
                   m => m.snapshot().goalId,
@@ -91,84 +111,187 @@ export async function registerV2GoalCommandBridge(
             if (typeof runner !== 'function') {
               throw new Error('Goal command runner is unavailable.');
             }
-            const res = await runner(
-              {sessionID, command: commandName, arguments: rawArgs},
-              {
-                skipKickoff: true,
-                skipReplayRecord: true,
-                clearKickoffOnSkip: !readOnly,
-                preserveKickoffOnSkip: readOnly,
-              },
-            );
-            // Cancel a pending kickoff retry only when this command
-            // succeeded AND supersedes the retained goal/run: unrelated,
-            // rejected, or read-only commands must leave the retry armed.
-            const pendingBefore =
-              hooks.runtime?.pendingKickoffDispatch?.get(sessionID);
-            const supersedesPending =
-              res.ok &&
-              pendingBefore !== undefined &&
-              res.activatedGoal !== null &&
-              pendingBefore.goalId === res.activatedGoal.goalId &&
-              pendingBefore.runId === res.activatedGoal.runId;
-            if (!readOnly || supersedesPending) {
-              hooks.runtime?.clearKickoffTimer?.(sessionID);
-              if (supersedesPending || !readOnly) {
-                hooks.runtime?.pendingKickoffDispatch?.delete(sessionID);
+            // The first persisted activation already carries the input marker.
+            // Fence idle while the command prepares its retained dispatch.
+            const releaseCommand = hasAttachments
+              ? acquirePromptInFlight(hooks.runtime, sessionID)
+              : () => {};
+            try {
+              const res = await runner(
+                {sessionID, command: commandName, arguments: rawArgs},
+                {
+                  skipKickoff: true,
+                  skipReplayRecord: true,
+                  preserveKickoffOnSkip: true,
+                  hasAttachments,
+                  userCommandStartedAt,
+                },
+              );
+              const runtime = hooks.runtime;
+              if (!runtime) {
+                throw new Error('Goal runtime is unavailable.');
               }
-            }
-            assertV2CommandCanDispatch({
-              sessionID,
-              rawArgs,
-              hasAttachments,
-              commandName,
-              res,
-              canDriveSession: hooks.runtime?.canDriveSession?.(sessionID),
-            });
-            logV2DiagnosticEvent(
-              `command.transform ${sessionID} cmd=${res.subcmd || 'status'} enteredActive=${String(res.enteredActive)}`,
-            );
-            const activated = res.activatedGoal ?? res.after;
-            if (!res.enteredActive || !activated) {
-              // Non-activating commands (status/list/history/pause/clear/
-              // handback/review) still produce output the host would
-              // otherwise discard (the command contract is Promise<void>).
-              // Deliver it as a synthetic, non-steering message so the
-              // chat.message hook ignores it but the user sees it.
-              if (res.ok && res.rendered) {
-                try {
-                  await ctx.session.synthetic({
-                    sessionID,
-                    text: res.rendered,
-                    metadata: {
-                      [GOAL_TUI_METADATA_KEY]: {kind: 'command-output'},
-                    },
+              const targetGoalId =
+                res.targetGoalId ?? res.activatedGoal?.goalId;
+              const retained = targetGoalId
+                ? runtime.pendingKickoffDispatch
+                    ?.get(sessionID)
+                    ?.get(targetGoalId)
+                : undefined;
+              const target = targetGoalId
+                ? runtime.sessionGoals
+                    .get(sessionID)
+                    ?.find(m => m.snapshot().goalId === targetGoalId)
+                    ?.snapshot()
+                : undefined;
+              // Explicit resume can re-admit a retained payload even if the goal
+              // was already active. Never duplicate an admission still in flight.
+              if (
+                res.ok &&
+                command.action === 'resume' &&
+                retained &&
+                target?.status === 'active' &&
+                target.runId === retained.runId
+              ) {
+                res.enteredActive = !retained.inFlight;
+                res.activatedGoal = retained.inFlight ? null : target;
+                res.after = target;
+              }
+              assertV2CommandCanDispatch({
+                sessionID,
+                rawArgs,
+                hasAttachments,
+                commandName,
+                res,
+                canDriveSession: hooks.runtime?.canDriveSession?.(sessionID),
+              });
+              logV2DiagnosticEvent(
+                `command.transform ${sessionID} cmd=${res.subcmd || 'status'} enteredActive=${String(res.enteredActive)}`,
+              );
+              const activated = res.activatedGoal ?? res.after;
+              if (!res.enteredActive || !activated) {
+                // Non-activating commands (status/list/history/pause/clear/
+                // handback/review) need a passive display channel: even a
+                // synthetic with resume:false enters the host's model inbox.
+                if (res.ok && res.rendered) {
+                  const publishOutput =
+                    deps.publishOutput ?? pluginOptions.goalMessenger;
+                  if (!publishOutput)
+                    throw new Error(
+                      `Goal command output is unavailable.\n${res.rendered}`,
+                    );
+                  await publishOutput(sessionID, res.rendered);
+                }
+                return;
+              }
+              const live = runtime.sessionGoals
+                .get(sessionID)
+                ?.find(m => m.snapshot().goalId === activated.goalId)
+                ?.snapshot();
+              if (
+                !live ||
+                live.runId !== activated.runId ||
+                live.status !== 'active'
+              )
+                throw new Error(
+                  'Goal changed before kickoff admission; no prompt was sent.',
+                );
+              const previous = runtime.pendingKickoffDispatch
+                ?.get(sessionID)
+                ?.get(live.goalId);
+              const waitForPrevious = previous?.inFlight === true;
+              const previousPayload =
+                previous?.runId === live.runId
+                  ? (previous.dispatch as {payload?: Record<string, unknown>})
+                      .payload
+                  : undefined;
+              const inherited = normalizeInheritedAgentForPrompt(
+                live.executionContext?.agent,
+              );
+              const mergedPrompt: Record<string, unknown> = {...prompt};
+              for (const key of ['files', 'agents', 'skills'] as const) {
+                const before = Array.isArray(previousPayload?.[key])
+                  ? (previousPayload[key] as unknown[])
+                  : [];
+                const added = Array.isArray(prompt?.[key])
+                  ? (prompt[key] as unknown[])
+                  : [];
+                if (before.length || added.length) {
+                  const seen = new Set<string>();
+                  mergedPrompt[key] = [...before, ...added].filter(item => {
+                    const k =
+                      typeof item === 'string'
+                        ? `s:${item}`
+                        : `j:${JSON.stringify(item)}`;
+                    if (seen.has(k)) return false;
+                    seen.add(k);
+                    return true;
                   });
-                } catch {
-                  /* output delivery is best-effort */
                 }
               }
-              return;
-            }
-            const inherited = normalizeInheritedAgentForPrompt(
-              activated.executionContext?.agent,
-            );
-            const dispatch = buildV2CommandKickoffDispatch({
-              sessionID,
-              goalID: activated.goalId,
-              condition: activated.condition,
-              kickoffText: buildContinueMessage(activated, {}),
-              tuiMetadataKey: GOAL_TUI_METADATA_KEY,
-              prompt,
-              hasAttachments,
-              delivery,
-              resolvedAgent: inherited
-                ? stripAgentListSortPrefix(inherited)
-                : undefined,
-            });
-            try {
-              hooks.runtime?.promptInFlightSessions.add(sessionID);
+              const carriesAttachments = ['files', 'agents', 'skills'].some(
+                key =>
+                  Array.isArray(mergedPrompt[key]) &&
+                  (mergedPrompt[key] as unknown[]).length > 0,
+              );
+              const dispatch = buildV2CommandKickoffDispatch({
+                sessionID,
+                goalID: live.goalId,
+                condition: live.condition,
+                kickoffText: buildContinueMessage(live, {}),
+                tuiMetadataKey: GOAL_TUI_METADATA_KEY,
+                prompt: mergedPrompt,
+                hasAttachments: carriesAttachments,
+                delivery:
+                  delivery ??
+                  (typeof previousPayload?.delivery === 'string'
+                    ? previousPayload.delivery
+                    : undefined),
+                resolvedAgent: inherited
+                  ? stripAgentListSortPrefix(inherited)
+                  : undefined,
+              });
+              const pending: PendingKickoffDispatch = {
+                goalId: live.goalId,
+                runId: live.runId,
+                dispatch,
+                attempts: 0,
+                inFlight: !waitForPrevious,
+              };
+              // Claim this goal's dispatch before the await. Late completion can
+              // only remove this exact object, never another goal or replacement.
+              runtime.clearKickoffTimer?.(sessionID, live.goalId);
+              retainKickoffDispatch(runtime, sessionID, pending);
+              if (waitForPrevious) {
+                // Another command can claim admission while this command awaits
+                // its state commit. Keep the new inputs as the successor; the
+                // older call's completion cannot remove this dispatch identity.
+                runtime.scheduleKickoff?.(sessionID, live.goalId, live.runId);
+                return;
+              }
+              const releasePrompt = acquirePromptInFlight(runtime, sessionID);
+              let admitted = false;
               try {
+                if (!runtime.prepareKickoffAdmission)
+                  throw new Error(
+                    'Kickoff admission persistence is unavailable.',
+                  );
+                await runtime.prepareKickoffAdmission(sessionID, pending);
+                const beforeAdmission = runtime.sessionGoals
+                  .get(sessionID)
+                  ?.find(m => m.snapshot().goalId === live.goalId)
+                  ?.snapshot();
+                if (
+                  runtime.canDriveSession?.(sessionID) === false ||
+                  runtime.pendingKickoffDispatch
+                    ?.get(sessionID)
+                    ?.get(live.goalId) !== pending ||
+                  beforeAdmission?.status !== 'active' ||
+                  beforeAdmission.runId !== live.runId
+                )
+                  throw new Error(
+                    'Goal changed before kickoff admission; no prompt was sent.',
+                  );
                 if (dispatch.method === 'prompt') {
                   recentKickoffTexts.record(
                     sessionID,
@@ -178,29 +301,50 @@ export async function registerV2GoalCommandBridge(
                 } else {
                   await ctx.session.synthetic(dispatch.payload);
                 }
+                admitted = true;
+              } catch (error) {
+                const current = runtime.sessionGoals
+                  .get(sessionID)
+                  ?.find(m => m.snapshot().goalId === live.goalId);
+                const currentGoal = current?.snapshot();
+                const owns =
+                  runtime.pendingKickoffDispatch
+                    ?.get(sessionID)
+                    ?.get(live.goalId) === pending;
+                if (owns && !runtime.disposed) {
+                  if (
+                    !current ||
+                    current.isTerminal() ||
+                    currentGoal?.runId !== live.runId
+                  ) {
+                    removeKickoffDispatch(runtime, sessionID, pending);
+                  } else if (currentGoal.status === 'active') {
+                    runtime.scheduleKickoff?.(
+                      sessionID,
+                      live.goalId,
+                      live.runId,
+                    );
+                  }
+                }
+                logV2DiagnosticEvent(
+                  `command.transform ${sessionID} kickoff admission failed: ${error instanceof Error ? error.message : String(error)}`,
+                );
+                throw error;
               } finally {
-                hooks.runtime?.promptInFlightSessions.delete(sessionID);
+                pending.inFlight = false;
+                try {
+                  if (admitted)
+                    await runtime.completeKickoffAdmission?.(
+                      sessionID,
+                      pending,
+                    );
+                } finally {
+                  releasePrompt();
+                }
               }
-            } catch (error) {
-              // A failed admission must not leave an active goal with no way
-              // to start. Re-arm the delayed kickoff so a recovered host can
-              // retry; surface the original failure to the caller.
-              hooks.runtime?.pendingKickoffDispatch?.set(sessionID, {
-                goalId: activated.goalId,
-                runId: activated.runId,
-                dispatch,
-              });
-              hooks.runtime?.scheduleKickoff?.(
-                sessionID,
-                activated.goalId,
-                activated.runId,
-              );
-              logV2DiagnosticEvent(
-                `command.transform ${sessionID} kickoff admission failed; retry scheduled: ${error instanceof Error ? error.message : String(error)}`,
-              );
-              throw error;
+            } finally {
+              releaseCommand();
             }
-            hooks.runtime?.pendingKickoffDispatch?.delete(sessionID);
           },
         });
         return;
@@ -224,4 +368,3 @@ export async function registerV2GoalCommandBridge(
     return false;
   }
 }
-// (isReadOnlyGoalCommand is imported directly from commands-args.ts above.)

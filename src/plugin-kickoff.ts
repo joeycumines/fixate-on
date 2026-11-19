@@ -6,6 +6,7 @@
  * continuation prompts when goals become active.
  */
 
+import {parseGoalCommand} from './commands-args.ts';
 import {markCommandDispatch, markSlashDispatch} from './command-dispatch.ts';
 import {buildContinueMessage} from './steering.ts';
 import {
@@ -15,10 +16,15 @@ import {
 import {findLatestAssistantMessage, getMessageID} from './message-helpers.ts';
 import {GOAL_TUI_METADATA_KEY} from './tui-state.ts';
 import type {SessionContext} from './hooks-types.ts';
-import type {RuntimeState} from './session-runtime.ts';
+import {
+  acquirePromptInFlight,
+  removeKickoffDispatch,
+  type RuntimeState,
+  type PendingKickoffDispatch,
+} from './session-runtime.ts';
 import type {SessionStateManager} from './session-state-manager.ts';
 import type {OpenCodeSessionApi} from './session-api.ts';
-import type {GoalState} from './state-machine.ts';
+import {TERMINAL_STATUSES, type GoalState} from './state-machine.ts';
 
 export interface SlashCommandResult {
   handled: boolean;
@@ -33,12 +39,13 @@ export interface SlashCommandResult {
   after: GoalState | null;
   activatedGoal: GoalState | null;
   enteredActive: boolean;
+  targetGoalId?: string;
   error?: string;
 }
 
 export interface KickoffWiring {
   kickoffTimers: Map<string, ReturnType<typeof setTimeout>>;
-  clearKickoffTimer: (sessionID: string) => void;
+  clearKickoffTimer: (sessionID: string, goalId?: string) => void;
   scheduleKickoff: (sessionID: string, goalId: string, runId: string) => void;
   executeSlashCommand: (
     input: {sessionID?: string; command?: string; arguments?: string},
@@ -47,6 +54,9 @@ export interface KickoffWiring {
       skipReplayRecord?: boolean;
       clearKickoffOnSkip?: boolean;
       preserveKickoffOnSkip?: boolean;
+      hasAttachments?: boolean;
+      userCommandStartedAt?: number;
+      source?: 'user-command' | 'goal-command';
     },
   ) => Promise<SlashCommandResult>;
   commandExecuteBefore: (
@@ -90,177 +100,340 @@ export function createKickoffWiring(args: {
   // active status. The kickoff sends an initial continuation prompt unless an agent turn
   // materialized in the interim. (v2 routes commands via templates and does not use this hook.)
   const kickoffTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  /** Bound on admission retries for a retained kickoff dispatch. */
+  const timerOwners = new Map<
+    string,
+    {sessionID: string; goalId: string; runId: string}
+  >();
   const MAX_KICKOFF_RETRY_ATTEMPTS = 3;
-  const clearKickoffTimer = (sessionID: string): void => {
-    const t = kickoffTimers.get(sessionID);
-    if (t !== undefined) {
-      clearTimeout(t);
-      kickoffTimers.delete(sessionID);
+  const clearKickoffTimer = (sessionID: string, goalId?: string): void => {
+    for (const [key, owner] of timerOwners) {
+      if (
+        owner.sessionID !== sessionID ||
+        (goalId !== undefined && owner.goalId !== goalId)
+      )
+        continue;
+      const timer = kickoffTimers.get(key);
+      if (timer !== undefined) clearTimeout(timer);
+      kickoffTimers.delete(key);
+      timerOwners.delete(key);
     }
   };
   const machineByGoalId = (
     sessionID: string,
-    goalID: string,
+    goalId: string,
   ): ReturnType<SessionStateManager['getMachine']> => {
     const context = getSessionContext(sessionID);
-    return (
-      context?.getMachineById?.(goalID) ??
-      context
-        ?.listMachines?.()
-        ?.find(machine => machine.snapshot().goalId === goalID) ??
-      stateManager.getMachine(sessionID)
+    const machine =
+      context?.getMachineById?.(goalId) ??
+      context?.listMachines?.().find(m => m.snapshot().goalId === goalId) ??
+      stateManager.getMachine(sessionID);
+    return machine?.snapshot().goalId === goalId ? machine : null;
+  };
+  const ownsDispatch = (
+    sessionID: string,
+    pending: PendingKickoffDispatch,
+  ): boolean =>
+    !runtime.disposed &&
+    runtime.pendingKickoffDispatch?.get(sessionID)?.get(pending.goalId) ===
+      pending;
+  const prepareKickoffAdmission = async (
+    sessionID: string,
+    pending: PendingKickoffDispatch,
+  ): Promise<void> => {
+    if (!ownsDispatch(sessionID, pending))
+      throw new Error('Kickoff changed before admission.');
+    if ((pending.dispatch as {method?: string}).method !== 'prompt') return;
+    const machine = machineByGoalId(sessionID, pending.goalId);
+    if (!machine || machine.snapshot().runId !== pending.runId)
+      throw new Error('Goal changed before kickoff admission.');
+    const marked = await machine.mutate(
+      goal => {
+        if (ownsDispatch(sessionID, pending))
+          goal.kickoffAdmissionPending = true;
+      },
+      {
+        source: 'idle-handler',
+        detail: 'Retain required kickoff inputs until host admission succeeds',
+        skipRevision: true,
+      },
     );
+    if (!marked.ok || !(await getSessionContext(sessionID)?.persist()))
+      throw new Error(
+        'NOT SAVED — kickoff inputs were not admitted because the recovery marker could not be saved.',
+      );
+    if (!ownsDispatch(sessionID, pending))
+      throw new Error('Kickoff changed before admission.');
+  };
+  const completeKickoffAdmission = async (
+    sessionID: string,
+    pending: PendingKickoffDispatch,
+  ): Promise<void> => {
+    // Acceptance is final even if saving its receipt fails: never retry an
+    // accepted host input merely because the local persistence step failed.
+    if (!removeKickoffDispatch(runtime, sessionID, pending)) return;
+    const machine = machineByGoalId(sessionID, pending.goalId);
+    if (!machine || machine.snapshot().runId !== pending.runId) return;
+    if (!machine.snapshot().kickoffAdmissionPending) return;
+    try {
+      const cleared = await machine.mutate(
+        goal => {
+          if (
+            !runtime.pendingKickoffDispatch?.get(sessionID)?.has(pending.goalId)
+          )
+            goal.kickoffAdmissionPending = false;
+        },
+        {
+          source: 'idle-handler',
+          detail: 'Host accepted the required kickoff inputs',
+          skipRevision: true,
+        },
+      );
+      if (!cleared.ok) throw new Error(cleared.error);
+      if (!(await getSessionContext(sessionID)?.persist()))
+        throw new Error('session persistence returned false');
+    } catch (error) {
+      throw new Error(
+        `Kickoff was admitted, but its cleared recovery marker could not be saved. It will not be retried automatically. ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  };
+  runtime.prepareKickoffAdmission = prepareKickoffAdmission;
+  runtime.completeKickoffAdmission = completeKickoffAdmission;
+  runtime.hasKickoffTimer = (sessionID: string, goalId: string) =>
+    kickoffTimers.has(JSON.stringify([sessionID, goalId]));
+  const lastAssistantIdOf = (messages: unknown[]): string | null => {
+    if (!Array.isArray(messages)) return null;
+    const latest = findLatestAssistantMessage(messages);
+    return latest ? getMessageID(latest) : '';
   };
   const scheduleKickoff = (
     sessionID: string,
     goalId: string,
     runId: string,
+    overrideDelayMs?: number,
   ): void => {
-    if (!sessionID) return;
-    clearKickoffTimer(sessionID);
-    const delayMs = kickoffDelayMs ?? 2500;
-    // Capture the baseline assistant message ID at scheduling time.
-    // The kickoff should only proceed if no new assistant message appeared
-    // (indicating an active agent turn whose idle event will drive the loop).
-    const lastAssistantIdOf = (messages: unknown[]): string | null => {
-      if (!Array.isArray(messages)) return null;
-      // Use latest assistant message regardless of array ordering (v1 returns messages
-      // ascending, whereas v2 returns them descending).
-      const latest = findLatestAssistantMessage(messages);
-      return latest ? getMessageID(latest) : '';
-    };
-    const baselinePromise: Promise<string | null> = sessionApi
-      .messages(sessionID, {limit: 5})
-      .then(r => lastAssistantIdOf(Array.isArray(r) ? r : []))
-      .catch(() => null);
-    const timer = setTimeout(
-      () => {
-        kickoffTimers.delete(sessionID);
-        if (runtime.disposed) return;
-        // Ensure the session is still eligible to be driven. A fenced session (e.g. read ceiling
-        // reached or leased by another process) must not be prompted or execute work.
-        if (!runtime.canDriveSession?.(sessionID)) return;
-        if (runtime.promptInFlightSessions.has(sessionID)) return;
-        const machineNow = machineByGoalId(sessionID, goalId);
-        if (!machineNow) return;
-        const snap = machineNow.snapshot();
+    if (!sessionID || runtime.disposed) return;
+    clearKickoffTimer(sessionID, goalId);
+    const key = JSON.stringify([sessionID, goalId]);
+    const hasPendingAtSchedule =
+      runtime.pendingKickoffDispatch?.get(sessionID)?.has(goalId) ?? false;
+    const baselinePromise = hasPendingAtSchedule
+      ? Promise.resolve(null)
+      : sessionApi
+          .messages(sessionID, {limit: 5})
+          .then(r => lastAssistantIdOf(Array.isArray(r) ? r : []))
+          .catch(() => null);
+    const baseDelayMs = Math.max(0, kickoffDelayMs ?? 2500);
+    const delayMs =
+      overrideDelayMs !== undefined ? overrideDelayMs : baseDelayMs;
+    const busyDeferDelayMs = Math.max(baseDelayMs, 50);
+    const timer = setTimeout(() => {
+      if (kickoffTimers.get(key) !== timer) return;
+      kickoffTimers.delete(key);
+      timerOwners.delete(key);
+      void (async () => {
+        if (runtime.disposed || !runtime.canDriveSession?.(sessionID)) return;
+        let machine = machineByGoalId(sessionID, goalId);
+        let snap = machine?.snapshot();
+        let pending = runtime.pendingKickoffDispatch
+          ?.get(sessionID)
+          ?.get(goalId);
+        if (!machine || snap?.runId !== runId || machine.isTerminal()) {
+          if (pending && pending.runId === runId)
+            removeKickoffDispatch(runtime, sessionID, pending);
+          return;
+        }
+        if (snap.status !== 'active') return;
+        if (pending && (pending.runId !== runId || pending.exhausted)) return;
+        // Busy admissions defer their timer instead of silently losing the retry.
         if (
-          snap.goalId !== goalId ||
-          snap.runId !== runId ||
+          runtime.promptInFlightSessions.has(sessionID) ||
+          pending?.inFlight
+        ) {
+          scheduleKickoff(sessionID, goalId, runId, busyDeferDelayMs);
+          return;
+        }
+        // New assistant activity supersedes a generic kickoff, but can never
+        // stand in for an attachment payload the host has not admitted.
+        if (!pending) {
+          const [baseline, recent] = await Promise.all([
+            baselinePromise,
+            sessionApi.messages(sessionID, {limit: 5}).catch(() => null),
+          ]);
+          const fresh = lastAssistantIdOf(Array.isArray(recent) ? recent : []);
+          if (
+            baseline !== null &&
+            fresh !== null &&
+            fresh !== '' &&
+            fresh !== baseline
+          )
+            return;
+        }
+        machine = machineByGoalId(sessionID, goalId);
+        snap = machine?.snapshot();
+        if (
+          !machine ||
+          runtime.disposed ||
+          !runtime.canDriveSession?.(sessionID) ||
+          snap?.runId !== runId ||
           snap.status !== 'active'
         )
           return;
-        void (async () => {
-          try {
-            const [baseline, recent] = await Promise.all([
-              baselinePromise,
-              sessionApi.messages(sessionID, {limit: 5}).catch(() => null),
-            ]);
-            const freshId = lastAssistantIdOf(
-              Array.isArray(recent) ? recent : [],
-            );
-            // Skip if a new assistant message appeared since dispatch, meaning an agent turn
-            // materialized and its idle event will take over driving continuation.
-            if (
-              freshId !== null &&
-              baseline !== null &&
-              freshId !== '' &&
-              freshId !== baseline
-            )
-              return;
-          } catch {
-            // If fetching messages fails, proceed with kickoff; continuation claims and
-            // in-flight guards provide fallback deduplication.
-          }
-          const machineAtFire = machineByGoalId(sessionID, goalId);
-          if (!machineAtFire || runtime.disposed) return;
-          // Re-check after async calls in case the session fence was established during message retrieval.
-          if (!runtime.canDriveSession?.(sessionID)) return;
-          const fireSnap = machineAtFire.snapshot();
+        pending = runtime.pendingKickoffDispatch?.get(sessionID)?.get(goalId);
+        if (
+          runtime.promptInFlightSessions.has(sessionID) ||
+          pending?.inFlight
+        ) {
+          scheduleKickoff(sessionID, goalId, runId, busyDeferDelayMs);
+          return;
+        }
+        if (pending) {
           if (
-            fireSnap.goalId !== goalId ||
-            fireSnap.runId !== runId ||
-            fireSnap.status !== 'active'
+            pending.runId !== runId ||
+            pending.exhausted ||
+            !runtime.retryPendingKickoffDispatch
           )
             return;
-          const pending = runtime.pendingKickoffDispatch?.get(sessionID);
-          if (pending && pending.goalId === goalId && pending.runId === runId) {
-            // Retain the dispatch until the retry actually succeeds: deleting
-            // before the attempt strands the attachment payload when the retry
-            // fails a second time (a later resume builds a fresh dispatch
-            // without attachments).
-            runtime.promptInFlightSessions.add(sessionID);
-            try {
-              await runtime.retryPendingKickoffDispatch?.(
-                sessionID,
-                pending.dispatch,
+          const retained = pending;
+          retained.inFlight = true;
+          const releasePrompt = acquirePromptInFlight(runtime, sessionID);
+          let admitted = false;
+          let exhaustionAnnouncement: string | undefined;
+          try {
+            const dispatch = retained.dispatch as {
+              payload?: Record<string, unknown>;
+            };
+            if (dispatch.payload)
+              dispatch.payload.text = buildContinueMessage(snap, {});
+            await prepareKickoffAdmission(sessionID, retained);
+            const beforeAdmission = machineByGoalId(
+              sessionID,
+              goalId,
+            )?.snapshot();
+            if (
+              runtime.canDriveSession?.(sessionID) === false ||
+              !ownsDispatch(sessionID, retained) ||
+              beforeAdmission?.status !== 'active' ||
+              beforeAdmission.runId !== runId
+            )
+              return;
+            await runtime.retryPendingKickoffDispatch(
+              sessionID,
+              retained.dispatch,
+            );
+            admitted = true;
+          } catch {
+            if (
+              runtime.canDriveSession?.(sessionID) === false ||
+              !ownsDispatch(sessionID, retained)
+            )
+              return;
+            const current = machineByGoalId(sessionID, goalId);
+            const goal = current?.snapshot();
+            if (!current || goal?.runId !== runId || current.isTerminal()) {
+              removeKickoffDispatch(runtime, sessionID, retained);
+              return;
+            }
+            if (goal.status !== 'active') return;
+            retained.attempts = (retained.attempts ?? 0) + 1;
+            if (retained.attempts >= MAX_KICKOFF_RETRY_ATTEMPTS) {
+              retained.exhausted = true;
+              const isPromptDispatch =
+                (retained.dispatch as {method?: string}).method === 'prompt';
+              const message = isPromptDispatch
+                ? `Kickoff admission failed after ${retained.attempts} retries; attachments are retained. Run \`/${commandName} resume ${goalId}\` after the host recovers.`
+                : `Kickoff failed after ${retained.attempts} retries. Run \`/${commandName} resume ${goalId}\` after the host recovers.`;
+              const paused = await current.transition('paused', {
+                source: 'idle-handler',
+                stopReason: isPromptDispatch
+                  ? 'kickoff admission failed'
+                  : 'kickoff failed',
+                detail: message,
+              });
+              if (
+                !paused.ok ||
+                !ownsDispatch(sessionID, retained) ||
+                current.snapshot().status !== 'paused'
+              )
+                return;
+              await current.mutate(
+                g => {
+                  g.lastStatus = message;
+                },
+                {
+                  source: 'idle-handler',
+                  detail: 'Retained failed kickoff for explicit resume',
+                  skipPersist: true,
+                },
               );
-              runtime.pendingKickoffDispatch?.delete(sessionID);
-            } catch {
-              // Re-arm a bounded retry so a transient second failure does not
-              // permanently drop the retained dispatch.
-              const attempts = (pending.attempts ?? 0) + 1;
-              if (attempts >= MAX_KICKOFF_RETRY_ATTEMPTS) {
-                runtime.pendingKickoffDispatch?.delete(sessionID);
-                const target = machineAtFire;
-                if (target && !target.isTerminal()) {
-                  await target.addNotice(
-                    'prompt-failure',
-                    `Kickoff admission failed ${attempts} times; the retained dispatch was dropped. Run \`/goal resume\` after the host recovers.`,
+              await current.addNotice('prompt-failure', message);
+              await getSessionContext(sessionID)?.persist();
+              if (ownsDispatch(sessionID, retained))
+                exhaustionAnnouncement = message;
+            } else {
+              scheduleKickoff(sessionID, goalId, runId);
+            }
+          } finally {
+            retained.inFlight = false;
+            try {
+              if (admitted) {
+                try {
+                  await completeKickoffAdmission(sessionID, retained);
+                } catch (error) {
+                  await runtime.announceKickoffFailure?.(
+                    sessionID,
+                    error instanceof Error ? error.message : String(error),
                   );
                 }
-              } else {
-                runtime.pendingKickoffDispatch?.set(sessionID, {
-                  ...pending,
-                  attempts,
-                });
-                scheduleKickoff(sessionID, goalId, runId);
               }
             } finally {
-              runtime.promptInFlightSessions.delete(sessionID);
+              releasePrompt();
             }
-            return;
           }
-          let message: string = buildContinueMessage(fireSnap, {});
-          if (typeof message !== 'string') message = String(message ?? '');
-          const resolvedAgent = normalizeInheritedAgentForPrompt(
-            fireSnap.executionContext?.agent,
-          );
-          const promptInput: Record<string, unknown> = {
-            parts: [
-              {
-                type: 'text',
-                text: message,
-                metadata: {[GOAL_TUI_METADATA_KEY]: {kind: 'kickoff'}},
-                synthetic: true,
-              },
-            ],
-          };
-          if (resolvedAgent)
-            promptInput.agent = stripAgentListSortPrefix(resolvedAgent);
-          runtime.promptInFlightSessions.add(sessionID);
-          try {
-            await sessionApi.promptAsync(
+          if (exhaustionAnnouncement && ownsDispatch(sessionID, retained)) {
+            await runtime.announceKickoffFailure?.(
               sessionID,
-              promptInput as unknown as {
-                parts: unknown[];
-              } & Record<string, unknown>,
+              exhaustionAnnouncement,
             );
-          } catch {
-            // If the prompt fails, subsequent idle events or explicit resumes can retry.
-          } finally {
-            runtime.promptInFlightSessions.delete(sessionID);
           }
-        })();
-      },
-      Math.max(0, delayMs),
-    );
-    kickoffTimers.set(sessionID, timer);
-    // Avoid holding the Node.js event loop open for delayed kickoff probes.
-    if (typeof timer === 'object' && timer !== null && 'unref' in timer) {
+          return;
+        }
+        let message = buildContinueMessage(snap, {});
+        if (typeof message !== 'string') message = String(message ?? '');
+        const resolvedAgent = normalizeInheritedAgentForPrompt(
+          snap.executionContext?.agent,
+        );
+        const promptInput: Record<string, unknown> = {
+          parts: [
+            {
+              type: 'text',
+              text: message,
+              metadata: {[GOAL_TUI_METADATA_KEY]: {kind: 'kickoff'}},
+              synthetic: true,
+            },
+          ],
+        };
+        if (resolvedAgent)
+          promptInput.agent = stripAgentListSortPrefix(resolvedAgent);
+        const releasePrompt = acquirePromptInFlight(runtime, sessionID);
+        try {
+          await sessionApi.promptAsync(
+            sessionID,
+            promptInput as {parts: unknown[]},
+          );
+        } catch {
+          // The regular idle path owns continuation prompt failures.
+        } finally {
+          releasePrompt();
+        }
+      })().catch(() => {
+        // A failed persistence/receipt must not escape as an unhandled rejection.
+      });
+    }, delayMs);
+    kickoffTimers.set(key, timer);
+    timerOwners.set(key, {sessionID, goalId, runId});
+    if (typeof timer === 'object' && timer !== null && 'unref' in timer)
       (timer as {unref: () => void}).unref();
-    }
   };
 
   const executeSlashCommand = async (
@@ -270,8 +443,12 @@ export function createKickoffWiring(args: {
       skipReplayRecord?: boolean;
       clearKickoffOnSkip?: boolean;
       preserveKickoffOnSkip?: boolean;
+      hasAttachments?: boolean;
+      userCommandStartedAt?: number;
+      source?: 'user-command' | 'goal-command';
     },
   ): Promise<SlashCommandResult> => {
+    const userCommandStartedAt = options?.userCommandStartedAt ?? Date.now();
     const emptyResult = (
       overrides: Partial<SlashCommandResult>,
     ): SlashCommandResult => ({
@@ -349,20 +526,23 @@ export function createKickoffWiring(args: {
       ),
     );
     // Mark slash dispatch so that v1 replaying the command as a chat message can be suppressed.
-    markSlashDispatch(sessionID, args);
+    if (options?.source !== 'goal-command') markSlashDispatch(sessionID, args);
 
     const subcmd = args.toLowerCase().split(/\s+/)[0] ?? '';
     const {handleCommandOutcome, formatCommandHeader} =
       await import('./commands.ts');
     try {
-      const outcome = await handleCommandOutcome(args, session, commandName);
+      const outcome = await handleCommandOutcome(args, session, commandName, {
+        hasAttachments: options?.hasAttachments,
+        userCommandStartedAt,
+      });
       const text = outcome.text;
       const afterCommand = session.getMachine()?.snapshot() ?? null;
       const {receipt, changed: dispatchChanged} = await transitionReceipt(
         sessionID,
         before,
         afterCommand,
-        'user-command',
+        options?.source ?? 'user-command',
       );
       // Record dispatch to prevent duplicate mutations if the host also invokes the command template.
       // Native v2 commands are the only invocation (no duplicate template channel), so they must
@@ -390,11 +570,20 @@ export function createKickoffWiring(args: {
       // `add`), prefer that goal over the first newly-active machine: two
       // concurrent `add` commands would otherwise both attach the first goal.
       const namedGoalId = outcome.targetGoalId;
-      if (namedGoalId) {
+      const action = parseGoalCommand(args).action;
+      const canActivate = ['set', 'add', 'sequence', 'resume', 'edit'].includes(
+        action,
+      );
+      if (canActivate && namedGoalId) {
         const named = afterByGoal.get(namedGoalId) ?? null;
-        if (named && named.status === 'active') activatedGoal = named;
+        const prior = beforeByGoal.get(namedGoalId);
+        if (
+          named?.status === 'active' &&
+          (!prior || prior.status !== 'active' || prior.runId !== named.runId)
+        )
+          activatedGoal = named;
       }
-      if (activatedGoal === null) {
+      if (canActivate && !namedGoalId) {
         for (const [goalId, afterGoal] of afterByGoal) {
           if (afterGoal.status !== 'active') continue;
           const beforeGoal = beforeByGoal.get(goalId) ?? null;
@@ -409,15 +598,104 @@ export function createKickoffWiring(args: {
           }
         }
       }
+      if (outcome.ok && action === 'resume' && namedGoalId) {
+        const retained = runtime.pendingKickoffDispatch
+          ?.get(sessionID)
+          ?.get(namedGoalId);
+        const resumed = afterByGoal.get(namedGoalId);
+        if (
+          retained &&
+          resumed?.status === 'active' &&
+          retained.runId === resumed.runId
+        ) {
+          if (retained.inFlight) {
+            activatedGoal = null;
+          } else {
+            retained.exhausted = false;
+            retained.attempts = 0;
+            activatedGoal = resumed;
+          }
+        }
+        if (
+          !retained &&
+          options?.hasAttachments &&
+          resumed?.status === 'active' &&
+          resumed.kickoffAdmissionPending
+        )
+          activatedGoal = resumed;
+      }
+      if (outcome.ok && action === 'edit' && namedGoalId) {
+        const edited = afterByGoal.get(namedGoalId);
+        const retained = runtime.pendingKickoffDispatch
+          ?.get(sessionID)
+          ?.get(namedGoalId);
+        if (
+          retained &&
+          edited?.status === 'active' &&
+          retained.runId === edited.runId
+        ) {
+          if (retained.inFlight) {
+            activatedGoal = null;
+          } else {
+            retained.exhausted = false;
+            retained.attempts = 0;
+            activatedGoal = edited;
+          }
+        }
+        if (
+          !retained &&
+          options?.hasAttachments &&
+          edited?.status === 'active' &&
+          edited.kickoffAdmissionPending
+        )
+          activatedGoal = edited;
+        if (
+          edited?.status === 'active' &&
+          beforeByGoal.get(namedGoalId)?.kickoffAdmissionPending &&
+          !edited.kickoffAdmissionPending
+        )
+          activatedGoal = edited;
+      }
       const after = activatedGoal ?? focusedAfter;
       const enteredActive = outcome.ok && activatedGoal !== null;
-      if (enteredActive && registerCommand && !options?.skipKickoff) {
+      // Cancel only work whose own goal actually stopped or disappeared.
+      // A rejected/unrelated command cannot cancel another goal's admission.
+      if (outcome.ok) {
+        for (const owner of [...timerOwners.values()]) {
+          if (owner.sessionID !== sessionID) continue;
+          const current = afterByGoal.get(owner.goalId);
+          if (
+            !current ||
+            current.runId !== owner.runId ||
+            current.status !== 'active'
+          )
+            clearKickoffTimer(sessionID, owner.goalId);
+        }
+        for (const pending of runtime.pendingKickoffDispatch
+          ?.get(sessionID)
+          ?.values() ?? []) {
+          const current = afterByGoal.get(pending.goalId);
+          if (
+            !current ||
+            current.runId !== pending.runId ||
+            TERMINAL_STATUSES.has(current.status)
+          )
+            removeKickoffDispatch(runtime, sessionID, pending);
+        }
+      }
+      if (
+        enteredActive &&
+        (registerCommand || options?.source === 'goal-command') &&
+        !options?.skipKickoff
+      ) {
         scheduleKickoff(sessionID, after!.goalId, after!.runId);
       } else if (
+        outcome.ok &&
         !options?.preserveKickoffOnSkip &&
-        (options?.clearKickoffOnSkip || after?.status !== 'active')
+        options?.clearKickoffOnSkip &&
+        outcome.targetGoalId
       ) {
-        clearKickoffTimer(sessionID);
+        clearKickoffTimer(sessionID, outcome.targetGoalId);
       }
       return {
         handled: true,
@@ -432,6 +710,7 @@ export function createKickoffWiring(args: {
         after,
         activatedGoal,
         enteredActive,
+        ...(outcome.targetGoalId ? {targetGoalId: outcome.targetGoalId} : {}),
         ...(outcome.ok ? {} : {error: text}),
       };
     } catch (err) {

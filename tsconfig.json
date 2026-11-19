@@ -37,6 +37,8 @@
     "src/**/*.ts",
     "src/**/*.tsx",
     "test/**/*.ts",
+    "hack/verify-pr-fixes.ts",
+    "hack/verify-child-session.ts",
     "*.d.ts"
   ],
   "exclude": [

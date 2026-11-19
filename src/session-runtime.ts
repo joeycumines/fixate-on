@@ -162,14 +162,26 @@ export interface RuntimeState {
    * Prevents competing instances from dispatching actions on owned sessions.
    */
   canDriveSession?: (sessionID: string) => boolean;
+  /** Escalates an expired background-work deferral to a bounded pause with receipt. */
+  escalateBackgroundDeferral?: (sessionID: string) => Promise<void>;
   /** Clears any pending delayed kickoff timer for a session. */
-  clearKickoffTimer?: (sessionID: string) => void;
+  clearKickoffTimer?: (sessionID: string, goalId?: string) => void;
+  hasKickoffTimer?: (sessionID: string, goalId: string) => boolean;
   scheduleKickoff?: (sessionID: string, goalId: string, runId: string) => void;
-  /** Original v2 command dispatch retained for a fenced admission retry. */
-  pendingKickoffDispatch?: Map<
-    string,
-    {goalId: string; runId: string; dispatch: unknown; attempts?: number}
-  >;
+  /** Retained admissions per session and goal; unrelated goals never overwrite each other. */
+  pendingKickoffDispatch?: Map<string, Map<string, PendingKickoffDispatch>>;
+  /** Passive host receipt for exhausted admission retries. */
+  announceKickoffFailure?: (sessionID: string, text: string) => Promise<void>;
+  /** Persist the input requirement before admitting an attachment-bearing kickoff. */
+  prepareKickoffAdmission?: (
+    sessionID: string,
+    pending: PendingKickoffDispatch,
+  ) => Promise<void>;
+  /** Forget a known accepted dispatch and persist its cleared input requirement. */
+  completeKickoffAdmission?: (
+    sessionID: string,
+    pending: PendingKickoffDispatch,
+  ) => Promise<void>;
   /** Retries a retained v2 dispatch after a delayed kickoff's guards pass. */
   retryPendingKickoffDispatch?: (
     sessionID: string,
@@ -188,6 +200,9 @@ export interface RuntimeState {
       skipReplayRecord?: boolean;
       clearKickoffOnSkip?: boolean;
       preserveKickoffOnSkip?: boolean;
+      hasAttachments?: boolean;
+      userCommandStartedAt?: number;
+      source?: 'user-command' | 'goal-command';
     },
   ) => Promise<{
     handled: boolean;
@@ -202,10 +217,76 @@ export interface RuntimeState {
     after: GoalState | null;
     activatedGoal: GoalState | null;
     enteredActive: boolean;
+    targetGoalId?: string;
     error?: string;
   }>;
   drainPersistence: (() => Promise<boolean>) | null;
   disposed: boolean;
+}
+
+export interface PendingKickoffDispatch {
+  goalId: string;
+  runId: string;
+  dispatch: unknown;
+  attempts?: number;
+  exhausted?: boolean;
+  inFlight?: boolean;
+}
+
+/** Each release belongs to one admission; another admission keeps the fence held. */
+const promptOwners = new WeakMap<RuntimeState, Map<string, Set<object>>>();
+
+export function acquirePromptInFlight(
+  runtime: RuntimeState | undefined,
+  sessionID: string,
+): () => void {
+  if (!runtime) return () => {};
+  let sessions = promptOwners.get(runtime);
+  if (!sessions) promptOwners.set(runtime, (sessions = new Map()));
+  let owners = sessions.get(sessionID);
+  if (!owners) sessions.set(sessionID, (owners = new Set()));
+  const token = {};
+  owners.add(token);
+  runtime.promptInFlightSessions.add(sessionID);
+  return () => {
+    if (!owners.delete(token) || sessions.get(sessionID) !== owners) return;
+    if (owners.size === 0) {
+      sessions.delete(sessionID);
+      runtime.promptInFlightSessions.delete(sessionID);
+    }
+  };
+}
+
+export function clearPromptInFlight(
+  runtime: RuntimeState,
+  sessionID: string,
+): void {
+  promptOwners.get(runtime)?.delete(sessionID);
+  runtime.promptInFlightSessions.delete(sessionID);
+}
+
+export function retainKickoffDispatch(
+  runtime: RuntimeState,
+  sessionID: string,
+  pending: PendingKickoffDispatch,
+): void {
+  const sessions = (runtime.pendingKickoffDispatch ??= new Map());
+  let goals = sessions.get(sessionID);
+  if (!goals) sessions.set(sessionID, (goals = new Map()));
+  goals.set(pending.goalId, pending);
+}
+
+/** Identity, rather than only goal/run, fences a completion from a replaced payload. */
+export function removeKickoffDispatch(
+  runtime: RuntimeState,
+  sessionID: string,
+  pending: PendingKickoffDispatch,
+): boolean {
+  const goals = runtime.pendingKickoffDispatch?.get(sessionID);
+  if (goals?.get(pending.goalId) !== pending) return false;
+  goals.delete(pending.goalId);
+  if (goals.size === 0) runtime.pendingKickoffDispatch?.delete(sessionID);
+  return true;
 }
 
 export function createRuntimeState(): RuntimeState {

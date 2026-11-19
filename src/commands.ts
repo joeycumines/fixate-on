@@ -15,15 +15,13 @@ import {
   formatStatus,
 } from './commands-format.ts';
 import {
-  CLEAR_COMMANDS,
-  LIST_COMMANDS,
-  NO_ARG_SUBCOMMANDS,
+  parseGoalCommand,
+  ATTACHMENT_ACTIVATION_ERROR,
   parseGoalArguments,
   resolveGoalRef,
   resolveOperandMachine,
   splitLeadingGoalId,
   splitObjectives,
-  STATUS_COMMANDS,
   stripWrappingQuotes,
 } from './commands-args.ts';
 import type {CreateGoalOptions} from './tools.ts';
@@ -76,6 +74,8 @@ export interface CommandSessionContext {
    * else's process, so the `NOT SAVED` line asks rather than assumes.
    */
   isOwnedElsewhere?: () => boolean;
+  hasRetainedKickoff?: (goalId: string) => boolean;
+  kickoffAdmissionInFlight?: (goalId: string) => boolean;
 }
 
 export interface CommandOutcome {
@@ -89,7 +89,11 @@ export interface CommandOutcome {
   targetGoalId?: string;
 }
 
-const passOutcome = (text: string): CommandOutcome => ({ok: true, text});
+const passOutcome = (text: string, targetGoalId?: string): CommandOutcome => ({
+  ok: true,
+  text,
+  ...(targetGoalId ? {targetGoalId} : {}),
+});
 const failOutcome = (text: string): CommandOutcome => ({ok: false, text});
 
 export async function handleCommand(
@@ -105,7 +109,9 @@ export async function handleCommandOutcome(
   args: string,
   session: CommandSessionContext,
   commandName = 'goal',
+  options: {hasAttachments?: boolean; userCommandStartedAt?: number} = {},
 ): Promise<CommandOutcome> {
+  const userCommandStartedAt = options.userCommandStartedAt ?? Date.now();
   if (args.length > MAX_COMMAND_ARGUMENT_LENGTH) {
     return failOutcome(
       `Goal command arguments must be ${MAX_COMMAND_ARGUMENT_LENGTH} characters or fewer.`,
@@ -113,18 +119,14 @@ export async function handleCommandOutcome(
   }
 
   const trimmed = args.trim();
-  // Status defaults to a concise headline; --verbose/--full opt into the full wall.
-  let verbose = false;
-  let statusKey = trimmed;
-  if (/--(?:verbose|full)$/i.test(statusKey)) {
-    const candidate = statusKey.replace(/\s*--(?:verbose|full)$/i, '').trim();
-    if (!candidate || STATUS_COMMANDS.has(candidate.toLowerCase())) {
-      verbose = true;
-      statusKey = candidate;
-    }
-  }
-
-  if (!statusKey || STATUS_COMMANDS.has(statusKey.toLowerCase())) {
+  const command = parseGoalCommand(trimmed);
+  if (
+    options.hasAttachments &&
+    !['set', 'add', 'sequence', 'resume', 'edit'].includes(command.action)
+  )
+    return failOutcome(ATTACHMENT_ACTIVATION_ERROR);
+  const verbose = command.verbose;
+  if (command.action === 'status') {
     const machine = session.getMachine();
     if (machine) {
       return passOutcome(
@@ -142,11 +144,8 @@ export async function handleCommandOutcome(
 
   // `history [--verbose|--full]`: bare shows signal lifecycle entries; the flag
   // adds the raw trail (including bookkeeping mutations the bare view filters).
-  const historyMatch = /^(?:history|log)(?:\s+(--verbose|--full))?$/i.exec(
-    trimmed,
-  );
-  if (historyMatch) {
-    const historyVerbose = historyMatch[1] !== undefined;
+  if (command.action === 'history') {
+    const historyVerbose = command.verbose;
     const machine = session.getMachine();
     if (machine) {
       const goal = machine.snapshot();
@@ -185,10 +184,7 @@ export async function handleCommandOutcome(
   // `list` (and `list all` / `ls all`, the documented explicit form of the same
   // listing: live goals plus the settled archive) share one body. Anything
   // else after `list` is rejected rather than treated as an objective.
-  if (
-    LIST_COMMANDS.has(trimmed.toLowerCase()) ||
-    /^(?:list|ls)\s+all$/i.test(trimmed)
-  ) {
+  if (command.action === 'list') {
     const goals = session.listActiveGoals();
     const archived = session.listArchivedResults();
     const focusedMachine = session.getMachine();
@@ -207,9 +203,8 @@ export async function handleCommandOutcome(
   // `clear <goalId>` clears a specific goal. The bare `clear` command wipes the
   // whole session and warns if multiple active goals exist to prevent accidental deletion.
   // Match verb case-insensitively while preserving the goal reference case verbatim.
-  const clearMatch = /^([A-Za-z]+)(?:\s+(\S+))?$/.exec(trimmed);
-  if (clearMatch && CLEAR_COMMANDS.has(clearMatch[1].toLowerCase())) {
-    const requestedRef = clearMatch[2];
+  if (command.action === 'clear') {
+    const requestedRef = command.operand;
     if (requestedRef) {
       const target = session
         .listActiveGoals()
@@ -243,11 +238,8 @@ export async function handleCommandOutcome(
   }
 
   // Bare form targets the focused goal; `pause <ref>` targets an explicit goal.
-  if (
-    trimmed.toLowerCase() === 'pause' ||
-    trimmed.toLowerCase().startsWith('pause ')
-  ) {
-    const ref = trimmed.slice('pause'.length).trim();
+  if (command.action === 'pause') {
+    const ref = command.operand;
     let machine = session.getMachine();
     if (ref) {
       const resolved = resolveGoalRef(session.listActiveGoals(), ref);
@@ -292,11 +284,8 @@ export async function handleCommandOutcome(
   }
 
   // Resume follows the same explicit-identifier contract as pause.
-  if (
-    trimmed.toLowerCase() === 'resume' ||
-    trimmed.toLowerCase().startsWith('resume ')
-  ) {
-    const ref = trimmed.slice('resume'.length).trim();
+  if (command.action === 'resume') {
+    const ref = command.operand;
     let machine = session.getMachine();
     if (ref) {
       const resolved = resolveGoalRef(session.listActiveGoals(), ref);
@@ -320,17 +309,44 @@ export async function handleCommandOutcome(
       );
     }
     const goal = machine.snapshot();
+    if (
+      options.hasAttachments &&
+      session.kickoffAdmissionInFlight?.(goal.goalId)
+    ) {
+      return failOutcome(
+        'The previous kickoff admission is still in flight. Wait for it to finish before resuming with attachments.',
+      );
+    }
+    if (
+      (goal.kickoffAdmissionPending ||
+        goal.stopReason === 'kickoff admission failed') &&
+      !options.hasAttachments &&
+      !session.hasRetainedKickoff?.(goal.goalId)
+    ) {
+      return failOutcome(
+        `The original kickoff inputs are no longer available. Resubmit \`/${commandName} resume ${goal.goalId}\` with the original attachments, or explicitly edit the objective to start a new kickoff.`,
+      );
+    }
     if (goal.status === 'active') {
-      return passOutcome('Goal is already running.');
+      if (
+        options.hasAttachments &&
+        !goal.kickoffAdmissionPending &&
+        !session.hasRetainedKickoff?.(goal.goalId)
+      ) {
+        return failOutcome(ATTACHMENT_ACTIVATION_ERROR);
+      }
+      return passOutcome('Goal is already running.', goal.goalId);
     }
     if (TERMINAL_STATUSES.has(goal.status)) {
       return failOutcome(
         `Goal is ${goal.status} (terminal) and cannot be resumed. Run \`/${commandName} clear\` and create a new goal.`,
       );
     }
+    const priorKickoffAdmissionPending = goal.kickoffAdmissionPending;
     await machine.mutate(
       g => {
         g.turnCount = 0;
+        if (options.hasAttachments) g.kickoffAdmissionPending = true;
         // A fresh window restarts the pressure ladder from r1.
         g.pressureRung = undefined;
         // Turn count is reset here; recoveryTurns, unchangedResults, blockedTurns,
@@ -348,20 +364,28 @@ export async function handleCommandOutcome(
       detail: 'User resumed the goal.',
     });
     if (!resumeResult.ok) {
+      if (options.hasAttachments) {
+        await machine.mutate(
+          g => {
+            g.kickoffAdmissionPending = priorKickoffAdmissionPending;
+          },
+          {
+            source: 'slash-command',
+            detail: 'Restore kickoff admission marker after failed resume',
+            skipPersist: true,
+          },
+        );
+      }
       return failOutcome(`Failed to resume goal: ${resumeResult.error}`);
     }
     await session.persist();
     return passOutcome(
       `Goal resumed: ${goal.condition} (turn count restarted at 0 for a fresh budget window.)`,
+      goal.goalId,
     );
   }
 
-  if (
-    trimmed.toLowerCase() === 'accept' ||
-    trimmed.toLowerCase().startsWith('accept ') ||
-    trimmed.toLowerCase() === 'accept-proposal' ||
-    trimmed.toLowerCase().startsWith('accept-proposal ')
-  ) {
+  if (command.action === 'accept') {
     const machine = session.getMachine();
     if (!machine) {
       return failOutcome(
@@ -373,7 +397,7 @@ export async function handleCommandOutcome(
       return failOutcome('No pending proposal to accept.');
     }
     const proposal = goal.pendingProposal;
-    const rawArg = trimmed.replace(/^accept(-proposal)?\s*/i, '').trim();
+    const rawArg = command.operand;
     if (rawArg && rawArg !== proposal.proposalId) {
       return failOutcome(
         `Proposal ID mismatch: pending proposal is "${proposal.proposalId}", but "${rawArg}" was requested.`,
@@ -403,12 +427,7 @@ export async function handleCommandOutcome(
     );
   }
 
-  if (
-    trimmed.toLowerCase() === 'reject' ||
-    trimmed.toLowerCase().startsWith('reject ') ||
-    trimmed.toLowerCase() === 'reject-proposal' ||
-    trimmed.toLowerCase().startsWith('reject-proposal ')
-  ) {
+  if (command.action === 'reject') {
     const machine = session.getMachine();
     if (!machine) {
       return failOutcome(
@@ -420,7 +439,7 @@ export async function handleCommandOutcome(
       return failOutcome('No pending proposal to reject.');
     }
     const proposal = goal.pendingProposal;
-    const rawArg = trimmed.replace(/^reject(-proposal)?\s*/i, '').trim();
+    const rawArg = command.operand;
     if (rawArg && rawArg !== proposal.proposalId) {
       return failOutcome(
         `Proposal ID mismatch: pending proposal is "${proposal.proposalId}", but "${rawArg}" was requested.`,
@@ -440,10 +459,7 @@ export async function handleCommandOutcome(
     return passOutcome(`Rejected proposal [${proposal.proposalId}].`);
   }
 
-  if (
-    trimmed.toLowerCase() === 'handback' ||
-    trimmed.toLowerCase().startsWith('handback ')
-  ) {
+  if (command.action === 'handback') {
     const machine = session.getMachine();
     if (!machine) {
       return failOutcome(
@@ -467,12 +483,7 @@ export async function handleCommandOutcome(
     );
   }
 
-  if (
-    trimmed.toLowerCase() === 'review' ||
-    trimmed.toLowerCase().startsWith('review ') ||
-    trimmed.toLowerCase() === 'review-payload' ||
-    trimmed.toLowerCase().startsWith('review-payload ')
-  ) {
+  if (command.action === 'review') {
     const machine = session.getMachine();
     if (!machine) {
       return failOutcome(
@@ -489,13 +500,10 @@ export async function handleCommandOutcome(
 
   // Edit objective: accepts either `edit <objective>` (focused goal) or
   // `edit <goalId> <objective>` (explicit goal).
-  if (
-    trimmed.toLowerCase() === 'edit' ||
-    trimmed.toLowerCase().startsWith('edit ')
-  ) {
+  if (command.action === 'edit') {
     const {goalId: namedGoalId, rest: editOperand} = splitLeadingGoalId(
       session.listActiveGoals(),
-      trimmed.slice('edit'.length).trim(),
+      command.operand,
     );
     const resolvedEdit = resolveOperandMachine(session, namedGoalId);
     if (resolvedEdit.error) return failOutcome(resolvedEdit.error);
@@ -517,9 +525,36 @@ export async function handleCommandOutcome(
       );
     }
     const editGoal = machine.snapshot();
+    if (session.kickoffAdmissionInFlight?.(editGoal.goalId)) {
+      return failOutcome(
+        'The previous kickoff admission is still in flight. Wait for it to finish before editing this goal.',
+      );
+    }
+    if (
+      options.hasAttachments &&
+      editGoal.status === 'active' &&
+      !(
+        editGoal.kickoffAdmissionPending &&
+        !session.hasRetainedKickoff?.(editGoal.goalId)
+      )
+    )
+      return failOutcome(ATTACHMENT_ACTIVATION_ERROR);
     if (TERMINAL_STATUSES.has(editGoal.status)) {
       return failOutcome(
         `Goal is ${editGoal.status} (terminal) and cannot be edited. Run \`/${commandName} clear\` and create a new goal.`,
+      );
+    }
+    const priorEditKickoffAdmissionPending = editGoal.kickoffAdmissionPending;
+    if (options.hasAttachments) {
+      await machine.mutate(
+        goal => {
+          goal.kickoffAdmissionPending = true;
+        },
+        {
+          source: 'slash-command',
+          detail: 'Require attached kickoff inputs before activation',
+          skipPersist: true,
+        },
       );
     }
     if (editGoal.status !== 'active') {
@@ -529,6 +564,18 @@ export async function handleCommandOutcome(
         detail: 'User edited the goal objective',
       });
       if (!editTransitionResult.ok) {
+        if (options.hasAttachments) {
+          await machine.mutate(
+            goal => {
+              goal.kickoffAdmissionPending = priorEditKickoffAdmissionPending;
+            },
+            {
+              source: 'slash-command',
+              detail: 'Restore kickoff admission marker after failed edit',
+              skipPersist: true,
+            },
+          );
+        }
         return failOutcome(
           `Failed to edit goal: ${editTransitionResult.error}`,
         );
@@ -537,10 +584,18 @@ export async function handleCommandOutcome(
     await machine.mutate(
       goal => {
         goal.condition = newObjective;
+        // An explicit replacement objective can waive inputs lost on restart.
+        // Live retained inputs stay required until they are actually admitted.
+        if (
+          !options.hasAttachments &&
+          !session.hasRetainedKickoff?.(goal.goalId)
+        )
+          goal.kickoffAdmissionPending = false;
         goal.objectiveUpdatedPending = true;
         goal.noProgressTurns = 0;
         goal.noToolCallTurns = 0;
         goal.lastCountedProgressMessageID = '';
+        goal.stalledTurnCounted = false;
         goal.lastNoToolCallMessageID = '';
         goal.lastStatus = 'Goal objective updated.';
       },
@@ -558,14 +613,12 @@ export async function handleCommandOutcome(
         '',
         `Budgets and history are preserved. Run \`/${commandName} resume\` for a fresh budget window, or \`/${commandName} status\` to review.`,
       ].join('\n'),
+      editGoal.goalId,
     );
   }
 
-  if (
-    trimmed.toLowerCase() === 'focus' ||
-    trimmed.toLowerCase().startsWith('focus ')
-  ) {
-    const ref = trimmed.slice('focus'.length).trim();
+  if (command.action === 'focus') {
+    const ref = command.operand;
     const goals = session.listActiveGoals();
     if (goals.length === 0) {
       return failOutcome(
@@ -601,13 +654,10 @@ export async function handleCommandOutcome(
   }
 
   // Checkpoint: supports optional leading goal ID addressing, matching `edit`.
-  if (
-    trimmed.toLowerCase() === 'checkpoint' ||
-    trimmed.toLowerCase().startsWith('checkpoint ')
-  ) {
+  if (command.action === 'checkpoint') {
     const {goalId: namedGoalId, rest: checkpointOperand} = splitLeadingGoalId(
       session.listActiveGoals(),
-      trimmed.slice('checkpoint'.length).trim(),
+      command.operand,
     );
     const resolvedCheckpoint = resolveOperandMachine(session, namedGoalId);
     if (resolvedCheckpoint.error) return failOutcome(resolvedCheckpoint.error);
@@ -648,11 +698,8 @@ export async function handleCommandOutcome(
     return passOutcome(`Checkpoint saved: ${summary}`);
   }
 
-  if (
-    trimmed.toLowerCase() === 'add' ||
-    trimmed.toLowerCase().startsWith('add ')
-  ) {
-    const createArgs = trimmed.slice('add'.length).trim();
+  if (command.action === 'add') {
+    const createArgs = command.operand;
     const parsed = parseGoalArguments(createArgs);
     if (parsed.errors.length > 0) {
       return failOutcome(parsed.errors.join('\n'));
@@ -680,7 +727,11 @@ export async function handleCommandOutcome(
 
     // Adding a goal does not pause running work; all unfinished goals continue
     // running per idle event. The new goal becomes the focused target.
-    const machine = session.createGoal(parsed.condition, parsed.options);
+    const machine = session.createGoal(parsed.condition, {
+      ...parsed.options,
+      kickoffAdmissionPending: options.hasAttachments,
+      userCommandStartedAt,
+    });
     if (parsed.tokenBudget && parsed.tokenBudget > 0) {
       await machine.mutate(
         goal => {
@@ -712,11 +763,8 @@ export async function handleCommandOutcome(
     };
   }
 
-  if (
-    trimmed.toLowerCase() === 'sequence' ||
-    trimmed.toLowerCase().startsWith('sequence ')
-  ) {
-    const rest = trimmed.slice('sequence'.length).trim();
+  if (command.action === 'sequence') {
+    const rest = command.operand;
     const objectives = splitObjectives(rest);
 
     if (!objectives.length) {
@@ -742,7 +790,11 @@ export async function handleCommandOutcome(
 
     let firstGoalId: string | null = null;
     for (let i = 0; i < objectives.length; i++) {
-      const machine = session.createGoal(objectives[i], {mode: 'ordered'});
+      const machine = session.createGoal(objectives[i], {
+        mode: 'ordered',
+        kickoffAdmissionPending: i === 0 && options.hasAttachments,
+        userCommandStartedAt,
+      });
       if (i === 0) {
         firstGoalId = machine.state.goalId;
       } else {
@@ -771,11 +823,11 @@ export async function handleCommandOutcome(
       '',
       `Focused goal 1: ${objectives[0]}`,
     ];
-    return passOutcome(lines.join('\n'));
+    return passOutcome(lines.join('\n'), firstGoalId ?? undefined);
   }
 
-  const firstWord = trimmed.toLowerCase().split(/\s+/)[0];
-  if (NO_ARG_SUBCOMMANDS.has(firstWord)) {
+  const firstWord = command.root;
+  if (command.action === 'invalid') {
     return failOutcome(
       `\`/${commandName} ${firstWord}\` does not accept additional arguments. Run \`/${commandName} ${firstWord}\` without extra text.`,
     );
@@ -796,7 +848,11 @@ export async function handleCommandOutcome(
     );
   }
 
-  const machine = await session.replaceGoals(parsed.condition, parsed.options);
+  const machine = await session.replaceGoals(parsed.condition, {
+    ...parsed.options,
+    kickoffAdmissionPending: options.hasAttachments,
+    userCommandStartedAt,
+  });
   if (parsed.tokenBudget && parsed.tokenBudget > 0) {
     await machine.mutate(
       goal => {
@@ -839,7 +895,7 @@ export async function handleCommandOutcome(
   lines.push(
     'When the goal is fully satisfied, call update_goal with status "complete". If you are truly blocked and need the user, call update_goal with status "blocked".',
   );
-  return passOutcome(lines.join('\n'));
+  return passOutcome(lines.join('\n'), machine.snapshot().goalId);
 }
 
 // Re-export formatters and parsers for backwards compatibility with existing consumers.

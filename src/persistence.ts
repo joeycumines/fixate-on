@@ -108,6 +108,7 @@ export interface SerializedGoal {
   compactionBaselineTokens: number;
   usage: UsageSnapshot;
   createdAt: number;
+  userCommandStartedAt?: number;
   updatedAt: number;
   startedAt: number;
   pausedAt: number;
@@ -136,6 +137,7 @@ export interface SerializedGoal {
   blockedAssertedThisTurn: boolean;
   languageTriage: boolean;
   lastStatus: string;
+  kickoffAdmissionPending?: boolean;
   lastAssistantText: string;
   lastAssistantMessageID: string;
   lastCountedProgressMessageID?: string;
@@ -420,6 +422,12 @@ export function deserializeGoal(raw: unknown): GoalState {
     ),
     usage: normalizeUsage(source.usage),
     createdAt: toNonNegativeInteger(source.createdAt),
+    userCommandStartedAt:
+      typeof source.userCommandStartedAt === 'number' &&
+      Number.isFinite(source.userCommandStartedAt) &&
+      source.userCommandStartedAt > 0
+        ? toNonNegativeInteger(source.userCommandStartedAt)
+        : undefined,
     updatedAt: toNonNegativeInteger(source.updatedAt),
     startedAt: toNonNegativeInteger(source.startedAt),
     pausedAt: toNonNegativeInteger(source.pausedAt),
@@ -462,6 +470,7 @@ export function deserializeGoal(raw: unknown): GoalState {
     // Backward compatibility: default language triage to true when absent.
     languageTriage: source.languageTriage !== false,
     lastStatus: capString(source.lastStatus, MAX_GOAL_META_LENGTH),
+    kickoffAdmissionPending: source.kickoffAdmissionPending === true,
     lastAssistantText: capString(
       source.lastAssistantText,
       MAX_LAST_ASSISTANT_TEXT_LENGTH,
@@ -474,7 +483,10 @@ export function deserializeGoal(raw: unknown): GoalState {
       source.lastCountedProgressMessageID,
       MAX_GOAL_META_LENGTH,
     ),
-    stalledTurnCounted: source.stalledTurnCounted === true,
+    stalledTurnCounted:
+      typeof source.stalledTurnCounted === 'boolean'
+        ? source.stalledTurnCounted
+        : undefined,
     lastNoToolCallMessageID: capString(
       source.lastNoToolCallMessageID,
       MAX_GOAL_META_LENGTH,

@@ -19,6 +19,7 @@ import {
   messageIsSettled,
 } from './message-helpers.ts';
 import {outputTokensForMessage} from './accounting.ts';
+import {MAX_BACKGROUND_WAIT_MS} from './plugin-v2-helpers.ts';
 import type {HookDeps, PluginHooks, SessionContext} from './hooks-types.ts';
 import {POLL_EVENT_PREFIX} from './hooks-types.ts';
 import {
@@ -134,6 +135,55 @@ export function createHooks(deps: HookDeps): PluginHooks {
   let pollSeq = 0;
   const quietSince = new Map<string, {key: string; since: number}>();
 
+  const escalateBackgroundDeferral = async (
+    sessionID: string,
+  ): Promise<void> => {
+    if (
+      deps.runtime?.canDriveSession &&
+      !deps.runtime.canDriveSession(sessionID)
+    )
+      return;
+    // Bounded escalation: pause with an explicit receipt rather than
+    // continue past an unattested completion or loop indefinitely.
+    // Only active/finalizing goals can transition to paused per
+    // TRANSITION_TABLE; already-paused/blocked goals keep their state
+    // and stop reason but still receive the notice and announcement.
+    const session = getSessionContext(sessionID);
+    const allMachines = sessionMachines(session);
+    for (const target of allMachines) {
+      if (target.isTerminal()) continue;
+      const snap = target.snapshot();
+      if (
+        snap.status === 'active' ||
+        snap.status === 'finalizing' ||
+        snap.finalizing
+      ) {
+        await target.transition('paused', {
+          source: 'idle-handler',
+          stopReason: 'background completion unreported',
+          detail:
+            'A background subagent/image job did not report completion within the wait bound; resume after it finishes.',
+        });
+      }
+      await target.addNotice(
+        'background-completion-unreported',
+        'Background job completion was not reported; goal paused. Resume once the job has finished.',
+      );
+    }
+    if (deps.announceGoalDecision) {
+      await deps.announceGoalDecision(
+        sessionID,
+        'A background subagent/image job did not report completion within the wait bound; goal(s) paused. Resume once the job has finished.',
+      );
+    }
+    if (session) await session.persist();
+    deps.runtime?.backgroundDeferrals?.delete(sessionID);
+    deps.runtime?.backgroundBlockedUntil.delete(sessionID);
+  };
+  if (deps.runtime) {
+    deps.runtime.escalateBackgroundDeferral = escalateBackgroundDeferral;
+  }
+
   const pollTick = async (): Promise<void> => {
     if (deps.runtime?.disposed) {
       poller.stop();
@@ -157,49 +207,18 @@ export function createHooks(deps: HookDeps): PluginHooks {
         if (deferral || backgroundDeadline !== undefined) {
           const now = Date.now();
           const deadline = backgroundDeadline ?? deferral!.nextRecheckAt;
-          if (deadline > now) continue;
           if (
             deps.runtime?.canDriveSession &&
             !deps.runtime.canDriveSession(sessionID)
           )
             continue;
-          const MAX_BACKGROUND_WAIT_MS = 15 * 60_000;
           const since = deferral?.since ?? now;
           if (now - since >= MAX_BACKGROUND_WAIT_MS) {
-            // Bounded escalation: pause with an explicit receipt rather than
-            // continue past an unattested completion or loop indefinitely.
-            // Only active/finalizing goals can transition to paused per
-            // TRANSITION_TABLE; already-paused/blocked goals keep their state
-            // and stop reason but still receive the notice and announcement.
-            const session = getSessionContext(sessionID);
-            const allMachines = sessionMachines(session);
-            for (const target of allMachines) {
-              if (target.isTerminal()) continue;
-              const snap = target.snapshot();
-              if (snap.status === 'active' || snap.finalizing) {
-                await target.transition('paused', {
-                  source: 'idle-handler',
-                  stopReason: 'background completion unreported',
-                  detail:
-                    'A background subagent/image job did not report completion within the wait bound; resume after it finishes.',
-                });
-              }
-              await target.addNotice(
-                'background-completion-unreported',
-                'Background job completion was not reported; goal paused. Resume once the job has finished.',
-              );
-            }
-            if (deps.announceGoalDecision) {
-              await deps.announceGoalDecision(
-                sessionID,
-                'A background subagent/image job did not report completion within the wait bound; goal(s) paused. Resume once the job has finished.',
-              );
-            }
-            if (session) await session.persist();
-            deps.runtime?.backgroundDeferrals?.delete(sessionID);
-            deps.runtime?.backgroundBlockedUntil.delete(sessionID);
+            await escalateBackgroundDeferral(sessionID);
             continue;
           }
+          // A rolling recheck deadline cannot postpone the absolute wait bound.
+          if (deadline > now) continue;
           // Still within the bound: extend the deferral with bounded backoff.
           // The host's next experimental.idle with empty background clears it.
           const extensions = (deferral?.extensions ?? 0) + 1;

@@ -254,6 +254,8 @@ export interface GoalState {
   compactionBaselineTokens: number;
   usage: UsageSnapshot;
   createdAt: number;
+  /** Native command admission time, before asynchronous goal replacement. */
+  userCommandStartedAt?: number;
   updatedAt: number;
   startedAt: number;
   pausedAt: number;
@@ -317,6 +319,13 @@ export interface GoalState {
    */
   languageTriage: boolean;
   lastStatus: string;
+  /**
+   * The host has not durably confirmed admission of this goal's kickoff inputs.
+   * The payload is process-local, so recovery must request the original inputs
+   * when this marker survives without a retained dispatch. Ordinary resumes
+   * preserve it until admission succeeds or the user replaces the objective.
+   */
+  kickoffAdmissionPending?: boolean;
   lastAssistantText: string;
   lastAssistantMessageID: string;
   /**
@@ -325,11 +334,10 @@ export interface GoalState {
    */
   lastCountedProgressMessageID?: string;
   /**
-   * Whether the turn pinned in `lastCountedProgressMessageID` was counted as a
-   * STALL. When false, the pin came from a productive evaluation (tool call or
-   * prose) and a duplicate idle must not reclassify the same turn as low
-   * progress; when true, the turn is already counted and must not be counted
-   * again. The flag resets whenever a new turn is evaluated.
+   * Evaluation of the turn pinned in `lastCountedProgressMessageID`: true when
+   * one stall was counted, false when progress was confirmed, and undefined
+   * while a first short prose observation is still tentative. The value only
+   * applies to that key and is reset together with progress tracking.
    */
   stalledTurnCounted?: boolean;
   /**

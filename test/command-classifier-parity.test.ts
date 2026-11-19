@@ -1,7 +1,7 @@
 // Parity between the operation classifier, the bare-objective detector, the canonical
 // dispatch identity, and the read-only detector: every one must agree on the
-// whole-token root rule (a root is followed by a space/tab or end-of-line,
-// never another word character or a newline).
+// execution grammar. Lifecycle roots require a horizontal separator; reporting
+// commands retain their documented flag/whitespace forms, including bare --full.
 import {describe, expect, test} from 'bun:test';
 import {
   canonicalGoalDispatch,
@@ -20,9 +20,12 @@ const CASES: Array<[string, GoalCommandOperation]> = [
   ['status-page needs dark mode', 'set'],
   ['status', 'other'],
   ['status --full', 'other'],
+  ['status\n--full', 'other'],
   ['status\nsecond line', 'set'],
   ['history --verbose', 'other'],
+  ['history\n--full', 'other'],
   ['list all', 'other'],
+  ['list\nall', 'other'],
   ['ls', 'other'],
   ['info', 'other'],
   ['log', 'other'],
@@ -34,8 +37,11 @@ const CASES: Array<[string, GoalCommandOperation]> = [
   ['pause', 'other'],
   ['handback', 'other'],
   ['review', 'other'],
+  ['review-payload', 'other'],
   ['fix the login bug', 'set'],
-  ['--full', 'set'],
+  // The command handler has always treated bare status flags as status output.
+  ['--full', 'other'],
+  ['--verbose', 'other'],
 ];
 
 describe('classifier / bare-objective / canonical / read-only parity', () => {
@@ -51,11 +57,19 @@ describe('classifier / bare-objective / canonical / read-only parity', () => {
       '   ',
       'status',
       'status --full',
+      'status\n--full',
       'info',
       'history --verbose',
+      'history\n--full',
       'log',
       'list all',
+      'list\nall',
       'ls',
+      '--full',
+      '--verbose',
+      'handback',
+      'review',
+      'review-payload',
     ];
     for (const line of readOnly) {
       expect(isReadOnlyGoalCommand(line)).toBe(true);
@@ -70,7 +84,6 @@ describe('classifier / bare-objective / canonical / read-only parity', () => {
       'edit x',
       'add x',
       'fix the login bug',
-      '--full',
     ];
     for (const line of notReadOnly) {
       expect(isReadOnlyGoalCommand(line)).toBe(false);
@@ -85,6 +98,11 @@ describe('classifier / bare-objective / canonical / read-only parity', () => {
       'log',
       'list',
       'ls',
+      '--full',
+      '--verbose',
+      'handback',
+      'review',
+      'review-payload',
     ]);
     for (const [line, op] of CASES) {
       const bare = isBareGoalObjective(line);
@@ -93,10 +111,10 @@ describe('classifier / bare-objective / canonical / read-only parity', () => {
       // read-only but not bare).
       expect(bare && ro).toBe(false);
       // 'other' means a dispatched non-clear root; exactly the read-only
-      // roots dispatch as 'other' AND are read-only. Non-read-only 'other'
-      // roots (pause/handback/review...) are not read-only.
+      // reporting roots and bare status flags dispatch as 'other' AND are
+      // read-only; lifecycle roots such as pause are not read-only.
       if (op === 'other') {
-        const root = line.trim().toLowerCase().split(/[ \t]/)[0] ?? '';
+        const root = line.trim().toLowerCase().split(/\s/)[0] ?? '';
         expect(ro).toBe(READ_ONLY_ROOTS.has(root));
       }
       if (op === 'set') {
@@ -116,6 +134,11 @@ describe('classifier / bare-objective / canonical / read-only parity', () => {
     expect(classifyGoalCommandOperation('clear\nx')).toBe('set');
     expect(canonicalGoalDispatch('status-page x')).toBe(
       canonicalGoalDispatch('status-page x'),
+    );
+    expect(classifyGoalCommandOperation('status--full')).toBe('set');
+    expect(classifyGoalCommandOperation('info--verbose')).toBe('set');
+    expect(canonicalGoalDispatch('list ALL')).toBe(
+      canonicalGoalDispatch('list all'),
     );
   });
 });

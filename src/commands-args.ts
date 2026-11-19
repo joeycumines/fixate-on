@@ -19,25 +19,6 @@ export const STATUS_COMMANDS = new Set(['status', 'info']);
 export const HISTORY_COMMANDS = new Set(['history', 'log']);
 export const LIST_COMMANDS = new Set(['list', 'ls']);
 
-/** Roots that activate or mutate goal lifecycle (never read-only). */
-const MUTATING_SUBCOMMANDS = new Set([
-  ...CLEAR_COMMANDS,
-  'pause',
-  'resume',
-  'edit',
-  'add',
-  'sequence',
-  'accept',
-  'accept-proposal',
-  'reject',
-  'reject-proposal',
-  'handback',
-  'review',
-  'review-payload',
-  'focus',
-  'checkpoint',
-]);
-
 export const NO_ARG_SUBCOMMANDS = new Set([
   'status',
   'info',
@@ -87,30 +68,121 @@ export const SUBCOMMAND_ROOTS = new Set([
   'sequence',
 ]);
 
-/**
- * Subcommand roots whose handler only reports state and never mutates goals:
- * they never start, resume, pause, or clear a goal. Derived from the dispatch
- * roots minus the lifecycle/activating roots, so it cannot drift from the
- * handler. Used by host adapters to decide whether a command preserves a
- * pending kickoff retry.
- */
-export const READ_ONLY_SUBCOMMANDS = new Set(
-  [...SUBCOMMAND_ROOTS].filter(root => !MUTATING_SUBCOMMANDS.has(root)),
-);
+/** Reporting commands never change goal state, including handback/review. */
+export const READ_ONLY_SUBCOMMANDS = new Set([
+  'status',
+  'info',
+  'history',
+  'log',
+  'list',
+  'ls',
+  'handback',
+  'review',
+  'review-payload',
+]);
+
+export type GoalCommandAction =
+  | 'set'
+  | 'status'
+  | 'history'
+  | 'list'
+  | 'clear'
+  | 'pause'
+  | 'resume'
+  | 'accept'
+  | 'reject'
+  | 'handback'
+  | 'review'
+  | 'edit'
+  | 'focus'
+  | 'checkpoint'
+  | 'add'
+  | 'sequence'
+  | 'invalid';
+
+export interface ParsedGoalCommand {
+  action: GoalCommandAction;
+  root: string | null;
+  operand: string;
+  verbose: boolean;
+  readOnly: boolean;
+}
+
+export const ATTACHMENT_ACTIVATION_ERROR =
+  'File, agent, and skill attachments can only be included when starting or resuming a goal.';
 
 /**
- * True when the line dispatches to a read-only subcommand (status/info/history/
- * log/list/ls with an optional operand) or is empty. Mirrors
- * classifyGoalCommandOperation's token rule: the root must be followed by a
- * space/tab or end-of-line, never another word character, so `status-page` is
- * a bare objective, not read-only.
+ * The single syntax decision used by execution, attachment admission and replay.
+ * Reporting flags retain their existing whitespace grammar. Lifecycle verbs use
+ * horizontal separators; a newline immediately after a verb is objective text.
+ * Clear aliases only dispatch with zero or one operand, so natural-language
+ * objectives such as "clear the stale cache" still take the set path.
  */
-export function isReadOnlyGoalCommand(line: string): boolean {
+export function parseGoalCommand(line: string): ParsedGoalCommand {
   const trimmed = line.trim();
-  if (!trimmed) return true;
-  const match = /^([A-Za-z]+)(?:[ \t]+(.*))?$/.exec(trimmed);
-  if (!match) return false;
-  return READ_ONLY_SUBCOMMANDS.has(match[1].toLowerCase());
+  const result = (
+    action: GoalCommandAction,
+    root: string | null,
+    operand = '',
+    verbose = false,
+  ): ParsedGoalCommand => ({
+    action,
+    root,
+    operand,
+    verbose,
+    readOnly:
+      action === 'status' ||
+      action === 'history' ||
+      action === 'list' ||
+      action === 'handback' ||
+      action === 'review',
+  });
+  let statusKey = trimmed;
+  let verbose = false;
+  if (/(?:^|\s+)--(?:verbose|full)$/i.test(statusKey)) {
+    const candidate = statusKey
+      .replace(/(?:^|\s+)--(?:verbose|full)$/i, '')
+      .trim();
+    if (!candidate || STATUS_COMMANDS.has(candidate.toLowerCase())) {
+      statusKey = candidate;
+      verbose = true;
+    }
+  }
+  if (!statusKey || STATUS_COMMANDS.has(statusKey.toLowerCase()))
+    return result('status', statusKey.toLowerCase() || null, '', verbose);
+  const history = /^(history|log)(?:\s+(--verbose|--full))?$/i.exec(trimmed);
+  if (history)
+    return result('history', history[1].toLowerCase(), '', Boolean(history[2]));
+  const list = /^(list|ls)(?:\s+(all))?$/i.exec(trimmed);
+  if (list)
+    return result('list', list[1].toLowerCase(), list[2]?.toLowerCase() ?? '');
+  const clear = /^([A-Za-z]+)(?:[ \t]+(\S+))?$/.exec(trimmed);
+  if (clear && CLEAR_COMMANDS.has(clear[1].toLowerCase()))
+    return result('clear', clear[1].toLowerCase(), clear[2] ?? '');
+  const token = /^([A-Za-z][A-Za-z-]*)(?:[ \t]+([\s\S]*))?$/.exec(trimmed);
+  const root = token?.[1].toLowerCase();
+  if (!root || !SUBCOMMAND_ROOTS.has(root) || CLEAR_COMMANDS.has(root))
+    return result('set', null, trimmed);
+  const operand = token?.[2]?.trim() ?? '';
+  if (
+    STATUS_COMMANDS.has(root) ||
+    HISTORY_COMMANDS.has(root) ||
+    LIST_COMMANDS.has(root)
+  )
+    return result('invalid', root, operand);
+  const action =
+    root === 'accept-proposal'
+      ? 'accept'
+      : root === 'reject-proposal'
+        ? 'reject'
+        : root === 'review-payload'
+          ? 'review'
+          : root;
+  return result(action as GoalCommandAction, root, operand);
+}
+
+export function isReadOnlyGoalCommand(line: string): boolean {
+  return parseGoalCommand(line).readOnly;
 }
 
 export function stripWrappingQuotes(text: string): string {
@@ -380,48 +452,24 @@ const RAW_OPERAND_ROOTS = new Set(['edit', 'focus', 'checkpoint']);
  * objective triggers `replaceGoals`, wiping unfinished goals and rewriting the objective.
  */
 export function isBareGoalObjective(line: string): boolean {
-  const trimmed = line.trim();
-  if (!trimmed) return false;
-  const lower = trimmed.toLowerCase();
-  for (const candidate of SUBCOMMAND_ROOTS) {
-    if (lower === candidate || lower.startsWith(`${candidate} `)) return false;
-  }
-  return true;
+  return parseGoalCommand(line).action === 'set';
 }
 
-/**
- * The dispatched operation for a `/goal` line, mirroring handleCommandOutcome's
- * whole-token/root rules without mutating state. Used by callers that must make
- * the same decision before a state-changing command runs.
- */
 export type GoalCommandOperation =
   'set' | 'clear' | 'resume' | 'edit' | 'add' | 'sequence' | 'other';
 
 export function classifyGoalCommandOperation(
   line: string,
 ): GoalCommandOperation {
-  const trimmed = line.trim();
-  // CLEAR_COMMANDS dispatch only on a bare verb or verb + one operand; longer
-  // sentences are bare objectives even though the first word is a root.
-  const lower = trimmed.toLowerCase();
-  // CLEAR_COMMANDS dispatch only on a bare verb or verb + one space/tab-separated
-  // operand; a newline is not a token separator in the handler's checks, so
-  // 'clear\nfoo' is a bare objective, not a clear.
-  const clearMatch = /^([A-Za-z]+)(?:[ \t]+(\S+))?$/.exec(trimmed);
-  if (clearMatch && CLEAR_COMMANDS.has(clearMatch[1].toLowerCase()))
-    return 'clear';
-  if (lower === 'resume' || lower.startsWith('resume ')) return 'resume';
-  if (lower === 'edit' || lower.startsWith('edit ')) return 'edit';
-  if (lower === 'add' || lower.startsWith('add ')) return 'add';
-  if (lower === 'sequence' || lower.startsWith('sequence ')) return 'sequence';
-  // Remaining roots that dispatch on any `root <rest>` form. A newline is not
-  // a space in the handler's checks, so multiline text is a bare objective.
-  for (const candidate of SUBCOMMAND_ROOTS) {
-    if (CLEAR_COMMANDS.has(candidate)) continue;
-    if (lower === candidate || lower.startsWith(`${candidate} `))
-      return 'other';
-  }
-  return 'set';
+  const {action} = parseGoalCommand(line);
+  return action === 'set' ||
+    action === 'clear' ||
+    action === 'resume' ||
+    action === 'edit' ||
+    action === 'add' ||
+    action === 'sequence'
+    ? action
+    : 'other';
 }
 
 /**
@@ -439,22 +487,12 @@ export function canonicalGoalDispatch(line: string): string {
   const trimmed = line.trim();
   if (!trimmed) return '';
 
-  // Mirror the handler's dispatch rule: a root introduces a subcommand only
-  // as a whole token (`root` or `root <rest>`). Splitting on arbitrary whitespace
-  // would misclassify lines like `sequence\na`, which the handler treats as a bare objective.
-  const lower = trimmed.toLowerCase();
-  let root: string | null = null;
-  for (const candidate of SUBCOMMAND_ROOTS) {
-    if (lower === candidate || lower.startsWith(`${candidate} `)) {
-      root = candidate;
-      break;
-    }
-  }
-  const subcommand = root === null ? 'set' : root === 'add' ? 'set' : root;
-
-  // Preserve internal whitespace and newlines in the remainder, as `splitObjectives`
-  // treats newlines as delimiters and handlers rely on verbatim slicing.
-  const rest = root === null ? trimmed : trimmed.slice(root.length).trim();
+  const command = parseGoalCommand(trimmed);
+  const subcommand = command.action === 'add' ? 'set' : command.action;
+  const rest = command.operand;
+  if (subcommand === 'status' || subcommand === 'history')
+    return `${subcommand}\u0000${command.verbose ? 'full' : ''}`;
+  if (subcommand === 'invalid') return `invalid\u0000${trimmed}`;
   if (subcommand === 'sequence') {
     // Sequences match on parsed objective lists rather than raw text.
     // Duplicate misses on sequences are destructive (replacing all active goals),
@@ -471,6 +509,8 @@ export function canonicalGoalDispatch(line: string): string {
     return `${subcommand}\u0000${operand}`;
   }
 
+  // References and proposal IDs are case-sensitive and do not parse flags.
+  if (subcommand !== 'set') return `${subcommand}\u0000${rest}`;
   // Parse `add` and bare objectives using the standard argument parser so flags are
   // extracted and the objective text is normalized.
   const condition = parseGoalArguments(rest).condition;

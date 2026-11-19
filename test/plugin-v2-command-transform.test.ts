@@ -8,6 +8,10 @@ import {createGoalState} from '../src/state-machine.ts';
 import {hydrateStoreFromDisk} from '../src/tui-disk-state.ts';
 import {createTuiStateStore} from '../src/tui-state.ts';
 import {waitFor} from './wait-for.ts';
+import type {
+  GoalCommandOutput,
+  GoalOutputRpcDomain,
+} from '../src/plugin-v2-command-output.ts';
 
 interface AddCommandEntry {
   name: string;
@@ -49,6 +53,17 @@ function createV2CommandTestCtx(opts: {
 
   const promptCalls: Array<Record<string, unknown>> = [];
   const syntheticCalls: Array<Record<string, unknown>> = [];
+  const commandOutputs: GoalCommandOutput[] = [];
+  const rpc: GoalOutputRpcDomain = {
+    register: async () => ({
+      events: {
+        emit: async (_name, output) => {
+          commandOutputs.push(output);
+        },
+      },
+      dispose: async () => {},
+    }),
+  };
   const eventHandlers: Array<
     (input: {type: string; data?: Record<string, unknown>}) => void
   > = [];
@@ -80,6 +95,7 @@ function createV2CommandTestCtx(opts: {
 
   const ctx = {
     app: {name: 'opencode', version: '2.2.7'},
+    rpc,
     location: {directory: opts.directory},
     options: {logLevel: 'error', ...opts.options},
     session: {
@@ -205,6 +221,7 @@ function createV2CommandTestCtx(opts: {
     legacyCommands,
     promptCalls,
     syntheticCalls,
+    commandOutputs,
     registeredTools,
     hooksByName,
     pushEvent,
@@ -362,25 +379,25 @@ test('v2 command.transform forwards attachments via session.prompt and supports 
     expect(harness.promptCalls[0]?.delivery).toBe('queue');
 
     // Read-only commands spawn zero LLM turns; their output is delivered as
-    // synthetic non-steering messages (one per command).
+    // passive RPC receipts (one per command).
     await goalCmd.execute!({sessionID: 's-cmd-2', prompt: {text: 'status'}});
     await goalCmd.execute!({sessionID: 's-cmd-2', prompt: {text: 'list'}});
     await goalCmd.execute!({sessionID: 's-cmd-2', prompt: {text: 'history'}});
     await goalCmd.execute!({sessionID: 's-cmd-2', prompt: {text: ''}});
     expect(harness.promptCalls).toHaveLength(1);
-    expect(harness.syntheticCalls).toHaveLength(4);
-    for (const call of harness.syntheticCalls) {
-      expect(String(call.text)).toMatch(/goal/i);
-      expect(
-        (call.metadata as Record<string, unknown>)?.['fixate-on'],
-      ).toBeDefined();
+    expect(harness.syntheticCalls).toHaveLength(0);
+    expect(harness.commandOutputs).toHaveLength(4);
+    for (const output of harness.commandOutputs) {
+      expect(output.text).toMatch(/goal/i);
+      expect(output.kind).toBe('command');
     }
 
     // Pause updates persisted state to paused without spawning a turn; its
-    // receipt is also delivered as one synthetic output message.
+    // receipt is delivered without entering the model inbox.
     await goalCmd.execute!({sessionID: 's-cmd-2', prompt: {text: 'pause'}});
     expect(harness.promptCalls).toHaveLength(1);
-    expect(harness.syntheticCalls).toHaveLength(5);
+    expect(harness.syntheticCalls).toHaveLength(0);
+    expect(harness.commandOutputs).toHaveLength(5);
 
     const storeAfterPause = createTuiStateStore();
     await hydrateStoreFromDisk(storeAfterPause, ws);
@@ -388,7 +405,7 @@ test('v2 command.transform forwards attachments via session.prompt and supports 
 
     // Resume transitions back to active and triggers one synthetic kickoff.
     await goalCmd.execute!({sessionID: 's-cmd-2', prompt: {text: 'resume'}});
-    expect(harness.syntheticCalls).toHaveLength(6);
+    expect(harness.syntheticCalls).toHaveLength(1);
     expect(harness.promptCalls).toHaveLength(1);
 
     const storeAfterResume = createTuiStateStore();
@@ -396,9 +413,10 @@ test('v2 command.transform forwards attachments via session.prompt and supports 
     expect(storeAfterResume.getFocused('s-cmd-2')?.status).toBe('active');
 
     // Clear removes the goal without spawning an LLM turn; its receipt is
-    // delivered as one synthetic output message.
+    // delivered through the passive output channel.
     await goalCmd.execute!({sessionID: 's-cmd-2', prompt: {text: 'clear'}});
-    expect(harness.syntheticCalls).toHaveLength(7);
+    expect(harness.syntheticCalls).toHaveLength(1);
+    expect(harness.commandOutputs).toHaveLength(6);
     expect(harness.promptCalls).toHaveLength(1);
 
     const storeAfterClear = createTuiStateStore();
@@ -911,10 +929,10 @@ test('v2 admission retry preserves the full dispatch and survives a status comma
     expect(promptCalls[1]?.agents).toEqual(agents);
     expect(promptCalls[1]?.skills).toEqual(skills);
     expect(promptCalls[1]?.delivery).toBe('queue');
-    // The intervening read-only `status` delivered its output as one synthetic
-    // message; the retried attachment dispatch must stay on session.prompt.
-    expect(harness.syntheticCalls).toHaveLength(1);
-    expect(harness.syntheticCalls[0]?.files).toBeUndefined();
+    // The intervening status uses passive output; only the original attachment
+    // dispatch reaches the host prompt API.
+    expect(harness.syntheticCalls).toHaveLength(0);
+    expect(harness.commandOutputs).toHaveLength(1);
   } finally {
     globalThis.setTimeout = realSetTimeout;
     harness.closeEvents();
@@ -974,7 +992,7 @@ test('v2 queue-to-steer promotion of an inbox stop pauses the goal', async () =>
   }
 });
 
-test('v2 native read-only command output is delivered as a synthetic non-steering message', async () => {
+test('v2 native read-only command output uses the passive receipt channel', async () => {
   const root = mkdtempSync(join(tmpdir(), 'fixate-v2-cmd-output-'));
   const ws = join(root, 'ws');
   mkdirSync(ws, {recursive: true});
@@ -991,14 +1009,11 @@ test('v2 native read-only command output is delivered as a synthetic non-steerin
     await goalCmd.execute!({sessionID: 's-out', prompt: {text: 'status'}});
     // No model turn was spawned for the read-only command...
     expect(harness.promptCalls).toHaveLength(0);
-    // ...but its rendered output was delivered as a synthetic message
-    // carrying GOAL_TUI metadata so chat.message steering ignores it. The
-    // earlier goal-set also produced one synthetic kickoff, so the last
-    // synthetic call is the command output.
-    const out = harness.syntheticCalls.at(-1)!;
-    expect((out.metadata as Record<string, unknown>)?.['fixate-on']).toEqual({
-      kind: 'command-output',
-    });
+    // The only synthetic is the initial kickoff. Status is published to
+    // the passive channel with its full text and session identity.
+    expect(harness.syntheticCalls).toHaveLength(1);
+    const out = harness.commandOutputs.at(-1)!;
+    expect(out.kind).toBe('command');
     expect(out.sessionID).toBe('s-out');
     expect(String(out.text)).toContain('Ship the release');
   } finally {
@@ -1051,6 +1066,50 @@ test('v2 repeated blocked idles with the same job key preserve the escalation cl
     );
     expect(firstAt).toBeLessThanOrEqual(Date.now());
   } finally {
+    harness.closeEvents();
+    await dispose();
+    rmSync(root, {recursive: true, force: true});
+  }
+});
+
+test('v2 experimental.idle escalates after MAX_BACKGROUND_WAIT_MS even when idlePoller is false', async () => {
+  const realNow = Date.now;
+  let now = 1_000_000;
+  Date.now = () => now;
+  const root = mkdtempSync(join(tmpdir(), 'fixate-v2-defer-no-poller-'));
+  const ws = join(root, 'ws');
+  mkdirSync(ws, {recursive: true});
+  const harness = createV2CommandTestCtx({
+    directory: ws,
+    options: {idlePoller: false},
+  });
+  const dispose = await setup(harness.ctx);
+  try {
+    const goalCmd = harness.registeredByAdd.get('goal')!;
+    await goalCmd.execute!({
+      sessionID: 's-escalate',
+      prompt: {text: 'Wait on a stuck background job'},
+    });
+    const idleHook = harness.hooksByName.get('experimental.idle')!;
+    const job = [
+      {kind: 'subagent', sessionID: 's-escalate', childSessionID: 'c1'},
+    ];
+    await idleHook!({sessionID: 's-escalate', background: job});
+    now += 15 * 60 * 1000 + 1;
+    await idleHook!({sessionID: 's-escalate', background: job});
+    const store = createTuiStateStore();
+    await hydrateStoreFromDisk(store, ws);
+    expect(store.getFocused('s-escalate')?.status).toBe('paused');
+    expect(store.getFocused('s-escalate')?.stopReason).toBe(
+      'background completion unreported',
+    );
+    expect(
+      harness.commandOutputs.some(o =>
+        o.text.includes('did not report completion within the wait bound'),
+      ),
+    ).toBe(true);
+  } finally {
+    Date.now = realNow;
     harness.closeEvents();
     await dispose();
     rmSync(root, {recursive: true, force: true});

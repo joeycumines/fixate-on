@@ -8,6 +8,8 @@
 import {appendFileSync} from 'node:fs';
 import {
   classifyGoalCommandOperation,
+  parseGoalCommand,
+  ATTACHMENT_ACTIVATION_ERROR,
   splitLeadingGoalId,
 } from './commands-args.ts';
 import type {GoalState} from './state-machine.ts';
@@ -87,6 +89,7 @@ export function assertV2AttachmentsBeforeRun(args: {
   rawArgs: string;
   hasAttachments: boolean;
   activeGoalStatus?: (goalId: string | null) => string | undefined;
+  canRecoverAttachedEdit?: (goalId: string | null) => boolean;
   goalIds?: () => string[];
 }): void {
   if (!args.hasAttachments) return;
@@ -99,7 +102,7 @@ export function assertV2AttachmentsBeforeRun(args: {
   )
     return;
   if (operation === 'edit') {
-    const operand = args.rawArgs.trim().slice('edit'.length).trim();
+    const operand = parseGoalCommand(args.rawArgs).operand;
     const goalIds = args.goalIds?.() ?? [];
     // Resolve the named goal against the session's real goal list so non-UUID
     // ids (test fixtures, legacy ids) match too; splitLeadingGoalId falls back
@@ -109,18 +112,15 @@ export function assertV2AttachmentsBeforeRun(args: {
       operand,
     );
     const status = args.activeGoalStatus?.(goalId);
-    // An attachment-bearing edit may only proceed when the command will change
-    // lifecycle state. The handler transitions any non-active non-terminal
-    // goal (paused/blocked) to active and rejects terminal goals outright, so
-    // attachments are admitted only for paused/blocked targets; an
-    // already-active goal would be mutated before the post-run guard could
-    // reject the command.
+    // An attachment-bearing edit may proceed when the command transitions a
+    // paused/blocked goal to active, or recovers an active goal whose original
+    // kickoff inputs were lost across a restart (kickoffAdmissionPending with
+    // no retained dispatch).
     if (status === 'paused' || status === 'blocked') return;
+    if (status === 'active' && args.canRecoverAttachedEdit?.(goalId)) return;
     if (status === undefined && !goalId) return;
   }
-  throw new Error(
-    'File, agent, and skill attachments can only be included when starting or resuming a goal.',
-  );
+  throw new Error(ATTACHMENT_ACTIVATION_ERROR);
 }
 
 /** Command names rewritten by the legacy `CommandEditor.update` fallback. */
@@ -301,9 +301,7 @@ export function assertV2CommandCanDispatch(args: {
   }
   if (!res.enteredActive || !res.after) {
     if (args.hasAttachments) {
-      throw new Error(
-        'File, agent, and skill attachments can only be included when starting or resuming a goal.',
-      );
+      throw new Error(ATTACHMENT_ACTIVATION_ERROR);
     }
     return;
   }

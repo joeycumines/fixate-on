@@ -28,6 +28,10 @@ import {
 import {DashboardRoute, type HostTheme} from './tui-dashboard-route.tsx';
 import {createSignal, onCleanup} from 'solid-js';
 import {type V2EventContext, wireV2Events} from './tui-v2-events.ts';
+import {
+  type GoalOutputTuiContext,
+  wireGoalCommandOutput,
+} from './tui-v2-command-output.ts';
 
 // Minimal Context interface consumed by the plugin until @opencode-ai/plugin/tui
 // is officially published. Unknown-shaped fields are typed as `unknown` and narrowed at use sites.
@@ -53,6 +57,7 @@ interface V2Context {
    */
   readonly location?: {directory: string; workspaceID?: string};
   readonly client: {
+    rpc?: GoalOutputTuiContext['client']['rpc'];
     session: {
       synthetic(params: {
         sessionID: string;
@@ -1140,8 +1145,10 @@ export const GoalTuiPluginV2 = {
       activeWatchdogs,
       log,
     });
+    const disposeOutput = wireGoalCommandOutput(context);
 
     return () => {
+      disposeOutput();
       events.dispose();
     };
   },

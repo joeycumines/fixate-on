@@ -13,6 +13,7 @@ import {createGoalState, GoalStateMachine} from '../src/state-machine.ts';
 import {createLoopPolicy} from '../src/continuation-loop.ts';
 import {
   blockingBackgroundJobKeys,
+  MAX_BACKGROUND_WAIT_MS,
   nextDeferralOnBlockedIdle,
   shouldSuppressTrailingIdle,
 } from '../src/plugin-v2-helpers.ts';
@@ -386,7 +387,7 @@ describe('nextDeferralOnBlockedIdle (clock preservation)', () => {
     expect(next.jobKeys).toEqual(['subagent:c1', 'image:img-2']);
   });
 
-  test('a disjoint job set starts a fresh clock', () => {
+  test('a disjoint job set cannot restart a live escalation clock', () => {
     const now = 1_000_000;
     const existing = {
       jobKeys: ['subagent:c1'],
@@ -399,8 +400,12 @@ describe('nextDeferralOnBlockedIdle (clock preservation)', () => {
       existing,
       now,
     });
-    expect(next.since).toBe(now);
-    expect(next.extensions).toBe(0);
+    expect(next.since).toBe(500_000);
+    expect(next.extensions).toBe(4);
+    expect(next.jobKeys).toEqual(['image:img-9']);
+    expect(next.nextRecheckAt).toBe(
+      Math.min(now + 30_000, 500_000 + MAX_BACKGROUND_WAIT_MS),
+    );
   });
 
   test('no existing deferral starts fresh', () => {

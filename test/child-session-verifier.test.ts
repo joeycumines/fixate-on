@@ -5,6 +5,7 @@ import {
   parseVerdictFromJudge,
 } from '../src/child-session-verifier.ts';
 import {VERIFIER_SESSION_PERMISSIONS} from '../src/plugin-v2-tools-agents.ts';
+import {verifierSessionID, verifierSessionInfo} from './verifier-fixtures.ts';
 import type {GoalState} from '../src/state-machine.ts';
 import {createGoalState} from '../src/state-machine.ts';
 import type {CandidateIdentity} from '../src/completion-gate.ts';
@@ -436,7 +437,18 @@ describe('verifier child-session isolation', () => {
     return {
       session: {
         create: async () => child,
-        get: async () => child,
+        get: async (arg: unknown) => {
+          const rec = arg as {sessionID?: string; path?: {id?: string}} | null;
+          const id = rec?.sessionID ?? rec?.path?.id;
+          if (id === 'session-1') {
+            return {
+              id: 'session-1',
+              location: {directory: '/target/workspace'},
+              permissions: [],
+            };
+          }
+          return child;
+        },
         prompt: async () => ({
           parts: [
             {
@@ -556,7 +568,9 @@ describe('verifier child-session isolation', () => {
           await new Promise<unknown>(resolve => {
             resolveCreate = resolve;
           }),
-        get: async () => {
+        get: async (arg: unknown) => {
+          if (verifierSessionID(arg) === 'session-1')
+            return verifierSessionInfo(arg, '/target/workspace');
           getCalls += 1;
           throw new Error('lookup failed');
         },
@@ -578,9 +592,9 @@ describe('verifier child-session isolation', () => {
     await timedOut;
     await new Promise(resolve => setTimeout(resolve, 0));
     expect(deleted).toEqual(['late-child']);
-    // The lookup threw on every call, so cleanup must not have depended on a
-    // successful get to identify the late child. The timed-out create path
-    // therefore never consults get at all.
+    // Child lookups still throw; cleanup uses the retained ID and never
+    // consults that path. The one successful lookup reads the parent policy
+    // before creation.
     expect(getCalls).toBe(0);
   });
 
@@ -605,7 +619,17 @@ describe('verifier child-session isolation', () => {
           await new Promise<unknown>(resolve => {
             resolveCreate = resolve;
           }),
-        get: async () => ({id: 'late-child', parentID: 'session-1'}),
+        get: async (arg: unknown) => {
+          const rec = arg as {sessionID?: string; path?: {id?: string}} | null;
+          if ((rec?.sessionID ?? rec?.path?.id) === 'session-1') {
+            return {
+              id: 'session-1',
+              location: {directory: '/target/workspace'},
+              permissions: [],
+            };
+          }
+          return {id: 'late-child', parentID: 'session-1'};
+        },
         prompt: async () => ({}),
         delete: async (input: unknown) => {
           captureDeleteInput(input);
@@ -646,11 +670,21 @@ describe('verifier child-session isolation', () => {
           }
           return {id: 'child-1', parentID: 'session-1'};
         },
-        get: async () => ({
-          id: 'child-1',
-          parentID: 'session-1',
-          location: {directory: '/target/workspace'},
-        }),
+        get: async (arg: unknown) => {
+          const rec = arg as {sessionID?: string; path?: {id?: string}} | null;
+          if ((rec?.sessionID ?? rec?.path?.id) === 'session-1') {
+            return {
+              id: 'session-1',
+              location: {directory: '/target/workspace'},
+              permissions: [],
+            };
+          }
+          return {
+            id: 'child-1',
+            parentID: 'session-1',
+            location: {directory: '/target/workspace'},
+          };
+        },
         prompt: async () => ({
           parts: [
             {

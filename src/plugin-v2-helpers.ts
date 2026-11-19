@@ -7,6 +7,7 @@
 
 import {appendFileSync, realpathSync} from 'node:fs';
 import {basename, dirname, join, resolve} from 'node:path';
+import type {GoalOutputRpcDomain} from './plugin-v2-command-output.ts';
 
 /** Minimal type surface consumed from the OpenCode v2 plugin promise Context. */
 export type V2SessionOp = (input: Record<string, unknown>) => Promise<unknown>;
@@ -117,6 +118,7 @@ export interface V2AgentDraft {
 }
 
 export interface V2Context {
+  readonly rpc?: GoalOutputRpcDomain;
   readonly app: {
     readonly name?: string;
     readonly version?: string;
@@ -644,11 +646,15 @@ export interface BackgroundDeferral {
   extensions: number;
 }
 
+/** Absolute bound for one overlapping set of unreported background jobs. */
+export const MAX_BACKGROUND_WAIT_MS = 15 * 60_000;
+
 /**
- * Computes the next deferral record for a blocked idle. A host re-reporting a
- * job set that overlaps the recorded one must not reset the escalation clock:
- * `since`/`extensions` are preserved and only `nextRecheckAt` moves. A
- * disjoint set starts a fresh clock.
+ * Computes the next deferral record for a blocked idle. Only an authoritative
+ * empty-background idle (or bounded escalation) removes a deferral, so a
+ * surviving record means the session has been blocked continuously — the host
+ * may regenerate job keys on every report. The clock is therefore preserved for
+ * any existing deferral, and only the capped `nextRecheckAt` moves.
  */
 export function nextDeferralOnBlockedIdle(args: {
   jobKeys: string[];
@@ -658,13 +664,15 @@ export function nextDeferralOnBlockedIdle(args: {
 }): BackgroundDeferral {
   const {jobKeys, existing, now} = args;
   const recheckDelayMs = args.recheckDelayMs ?? 30_000;
-  const overlaps =
-    existing !== undefined && jobKeys.some(k => existing.jobKeys.includes(k));
+  const since = existing?.since ?? now;
   return {
     jobKeys,
-    since: overlaps ? existing.since : now,
-    nextRecheckAt: now + recheckDelayMs,
-    extensions: overlaps ? existing.extensions : 0,
+    since,
+    nextRecheckAt: Math.min(
+      now + recheckDelayMs,
+      since + MAX_BACKGROUND_WAIT_MS,
+    ),
+    extensions: existing?.extensions ?? 0,
   };
 }
 
@@ -735,12 +743,14 @@ export function shouldSuppressTrailingIdle(
   now: number,
   stillDeferred?: (sessionID: string) => boolean,
 ): boolean {
+  // Execution/step start may remove the turn record without completing the
+  // background jobs. The authoritative deferral gates all trailing idles.
+  if (stillDeferred?.(sessionID)) return true;
   const entry = records.get(sessionID);
   if (!entry) return false;
   if (entry.backgroundBlocked) {
     // Keep suppressing while a deferral is authoritative; only the native idle
     // that clears the background, or bounded escalation, removes the record.
-    if (stillDeferred?.(sessionID)) return true;
     if (now - entry.ts < 30_000) return true;
     records.delete(sessionID);
     return false;

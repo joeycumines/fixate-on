@@ -550,6 +550,7 @@ export function createEventHook(
               g.noProgressTurns = 0;
               g.noToolCallTurns = 0;
               g.lastCountedProgressMessageID = '';
+              g.stalledTurnCounted = false;
               g.lastNoToolCallMessageID = '';
             },
             {

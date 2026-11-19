@@ -63,6 +63,7 @@ import {
 } from './session-state-manager.ts';
 import type {PluginOptions} from './plugin-options.ts';
 import {createPersistenceWiring} from './plugin-persistence.ts';
+import {clearPromptInFlight} from './session-runtime.ts';
 import {createKickoffWiring} from './plugin-kickoff.ts';
 
 export type {DefaultGoalOptions} from './session-state-manager.ts';
@@ -650,6 +651,12 @@ export async function GoalsPlugin(
         sessionID: ownedSessionID,
         workspaceDirectory,
         getMachine: () => stateManager.getMachine(ownedSessionID),
+        hasRetainedKickoff: goalId =>
+          runtime.pendingKickoffDispatch?.get(ownedSessionID)?.has(goalId) ??
+          false,
+        kickoffAdmissionInFlight: goalId =>
+          runtime.pendingKickoffDispatch?.get(ownedSessionID)?.get(goalId)
+            ?.inFlight ?? false,
         listMachines: () => stateManager.listMachines(ownedSessionID),
         listActiveGoals: () => stateManager.listActiveGoals(ownedSessionID),
         listArchivedResults: () =>
@@ -681,7 +688,9 @@ export async function GoalsPlugin(
           runtime.continuationControllers.get(ownedSessionID)?.abort();
           runtime.continuationControllers.delete(ownedSessionID);
           runtime.activeContinues.delete(ownedSessionID);
-          runtime.promptInFlightSessions.delete(ownedSessionID);
+          clearPromptInFlight(runtime, ownedSessionID);
+          runtime.pendingKickoffDispatch?.delete(ownedSessionID);
+          runtime.clearKickoffTimer?.(ownedSessionID);
           runtime.recoveryPendingSessions.delete(ownedSessionID);
           for (const key of [...runtime.pendingIntents.keys()]) {
             if (key.startsWith(`${ownedSessionID}:`))
@@ -765,7 +774,7 @@ export async function GoalsPlugin(
       registerCommand,
       kickoffDelayMs: pluginOptions.kickoffDelayMs,
     });
-    const {kickoffTimers, scheduleKickoff, clearKickoffTimer} = kickoff;
+    const {kickoffTimers} = kickoff;
     runtime.clearKickoffTimer = kickoff.clearKickoffTimer;
     runtime.scheduleKickoff = kickoff.scheduleKickoff;
     runtime.getGoalStatus = (sessionID, goalId) => {
@@ -895,29 +904,13 @@ export async function GoalsPlugin(
                 ? `${duplicate.result}\n\n${duplicate.receipt}`
                 : duplicate.result;
             }
-            const before = session.getMachine()?.snapshot() ?? null;
-            const {handleCommand} = await import('./commands.ts');
-            const result = await handleCommand(sub, session, commandName);
-            const after = session.getMachine()?.snapshot() ?? null;
-            const {receipt} = await transitionReceipt(
-              sessionID,
-              before,
-              after,
-              'goal-command',
+            const result = await kickoff.executeSlashCommand(
+              {sessionID, command: commandName, arguments: sub},
+              {skipReplayRecord: true, source: 'goal-command'},
             );
-            const enteredActive =
-              after !== null &&
-              after.status === 'active' &&
-              (before === null ||
-                before.goalId !== after.goalId ||
-                before.runId !== after.runId ||
-                before.status !== 'active');
-            if (enteredActive) {
-              scheduleKickoff(sessionID, after.goalId, after.runId);
-            } else if (after?.status !== 'active') {
-              clearKickoffTimer(sessionID);
-            }
-            return receipt ? `${result}\n\n${receipt}` : result;
+            return result.receipt
+              ? `${result.text}\n\n${result.receipt}`
+              : result.text;
           },
         };
         runtime.threadToolsRegistered = true;
@@ -931,6 +924,10 @@ export async function GoalsPlugin(
         runtime.executeSlashCommand = undefined;
         runtime.clearKickoffTimer = undefined;
         runtime.scheduleKickoff = undefined;
+        runtime.pendingKickoffDispatch?.clear();
+        runtime.announceKickoffFailure = undefined;
+        runtime.prepareKickoffAdmission = undefined;
+        runtime.completeKickoffAdmission = undefined;
         runtime.recoveryPendingSessions.clear();
         runtime.queuedInputMessageIDs.clear();
         runtime.steeredInputMessageIDs.clear();

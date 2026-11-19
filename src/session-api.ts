@@ -26,6 +26,15 @@ export type SdkShape = 'flat' | 'legacy';
 
 export interface SessionApiOptions {
   preferredShape?: SdkShape;
+  /** Opt-in adapters can stop a pending prompt before its next host call. */
+  signal?: AbortSignal;
+}
+
+/** Explicit adapter capabilities that cannot be inferred from wrapper methods. */
+export interface SessionClientCapabilities {
+  deleteSession?: boolean;
+  promptAbortSignal?: boolean;
+  selectAgent?: (sessionID: string, agent: string) => Promise<void>;
 }
 
 export interface OpenCodeSessionApi {
@@ -67,7 +76,49 @@ function isArgumentShapeError(error: unknown): boolean {
   return SHAPE_ERROR_PATTERNS.some(pattern => pattern.test(message));
 }
 
-function unwrapData(response: unknown): unknown {
+/** Preserve the SDK's structured failure for callers that inspect its cause. */
+export class SessionApiError extends Error {
+  readonly status: number | undefined;
+
+  constructor(operation: string, error: unknown, response: unknown) {
+    const detail = error as {
+      message?: unknown;
+      data?: {message?: unknown};
+      _tag?: unknown;
+    } | null;
+    const nonEmpty = (value: unknown): string | undefined =>
+      typeof value === 'string' && value.trim().length > 0 ? value : undefined;
+    const message =
+      nonEmpty(detail?.message) ??
+      nonEmpty(detail?.data?.message) ??
+      nonEmpty(detail?._tag) ??
+      String(error);
+    super(`OpenCode session.${operation} failed: ${message}`, {cause: error});
+    this.name = 'SessionApiError';
+    const status = (response as {status?: unknown} | null)?.status;
+    this.status = typeof status === 'number' ? status : undefined;
+  }
+}
+
+function unwrapData(response: unknown, operation: string): unknown {
+  // The HTTP SDK returns an error envelope unless throwOnError was enabled by
+  // its caller. A fulfilled transport promise does not establish that the
+  // operation succeeded (particularly deletion during verifier cleanup).
+  if (
+    response &&
+    typeof response === 'object' &&
+    'error' in response &&
+    response.error !== undefined &&
+    response.error !== null
+  ) {
+    const envelope = response as {error?: unknown; response?: unknown};
+    if (envelope.error instanceof Error) throw envelope.error;
+    throw new SessionApiError(
+      operation,
+      envelope.error,
+      envelope.response ?? response,
+    );
+  }
   if (
     response &&
     typeof response === 'object' &&
@@ -89,6 +140,9 @@ export function createOpenCodeSessionApi(
     throw new TypeError('OpenCode client.session is required');
   }
   const sessionClient: SessionClient = {session: sessionObj};
+  const capabilities = (
+    client as {sessionCapabilities?: SessionClientCapabilities}
+  ).sessionCapabilities;
 
   const preferredShape: SdkShape = options.preferredShape ?? 'flat';
   if (preferredShape !== 'flat' && preferredShape !== 'legacy') {
@@ -112,9 +166,17 @@ export function createOpenCodeSessionApi(
     const firstShape: SdkShape = knownShape ?? preferredShape;
     const firstInput = firstShape === 'flat' ? flatInput : legacyInput;
     try {
-      const response = await method.call(sessionClient.session, firstInput);
+      // Only adapters advertising this convention receive the request option.
+      // Deletion/abort stay usable after cancellation so cleanup can finish.
+      const response =
+        operation === 'prompt' && capabilities?.promptAbortSignal
+          ? await method.call(sessionClient.session, firstInput, {
+              signal: options.signal,
+            })
+          : await method.call(sessionClient.session, firstInput);
+      const unwrapped = unwrapData(response, operation) as T;
       shapes.set(operation, firstShape);
-      return unwrapData(response) as T;
+      return unwrapped;
     } catch (error) {
       if (
         knownShape ||
@@ -125,9 +187,15 @@ export function createOpenCodeSessionApi(
       }
       const fallbackShape: SdkShape = firstShape === 'flat' ? 'legacy' : 'flat';
       const fallbackInput = fallbackShape === 'flat' ? flatInput : legacyInput;
-      const response = await method.call(sessionClient.session, fallbackInput);
+      const response =
+        operation === 'prompt' && capabilities?.promptAbortSignal
+          ? await method.call(sessionClient.session, fallbackInput, {
+              signal: options.signal,
+            })
+          : await method.call(sessionClient.session, fallbackInput);
+      const unwrapped = unwrapData(response, operation) as T;
       shapes.set(operation, fallbackShape);
-      return unwrapData(response) as T;
+      return unwrapped;
     }
   }
 

@@ -86,7 +86,9 @@ The same template text is installed automatically: on 2.x the plugin's `command.
 
 With `/goal` wired, `/goal <objective> --pointer SPEC.md --max-turns 10` creates the goal with artifact pointers on disk, drives continuations, and settles through the claim ledger. On stock OpenCode 1.x this template is unnecessary because the plugin intercepts the auto-registered command directly.
 
-**What each version registers:** on 1.x the `config` hook registers the `/goal` slash command (plus `goal <sub>` subcommands), the `goal` agent, and the hidden read-only `goal-verify` subagent. On 2.x the adapter registers the goal tools, registers the same `goal`/`goal-verify` agents through its `agent.transform` bridge, and registers the `/goal` command through `command.transform`; the built-in judge there runs through a child session bound to the workspace, so agent selection and `/goal status` output behave the same on both versions.
+**What each version registers:** on 1.x the `config` hook registers the `/goal` slash command (plus `goal <sub>` subcommands), the `goal` agent, and the hidden read-only `goal-verify` subagent. On 2.x the adapter registers the goal tools, registers the same `goal`/`goal-verify` agents through its `agent.transform` bridge, and registers the `/goal` command through `command.transform`. The built-in judge runs through a child session bound to the workspace.
+
+**Native command output on 2.x:** reporting commands and lifecycle receipts use the host's passive RPC event channel. The v2 TUI companion displays the full receipt in a dialog for the current session and session-scoped toasts for other sessions or notices. These receipts do not enter the model inbox or start a turn, including while the model is busy. Install the companion to see them in the TUI. Headless clients can subscribe to `rpc.fixate-on-output.output` or retrieve the latest receipt for a session through the `fixate-on-output` RPC's `latest` method; see [passive command receipts](docs/tui-integration.md#passive-command-receipts-on-2x). An older host without RPC needs a configured `goalMessenger`; otherwise the command returns an explicit output-delivery error containing its result. The `goal-command` tool continues to return its result through the ordinary tool channel.
 
 ### TUI companion setup
 
@@ -249,6 +251,10 @@ Natural language is the primary interface: `/goal <objective>` works with zero f
 | `/goal clear [<goalId>]` | Removes live goal state and saved status (aliases: `stop`, `off`, `reset`, `none`, `cancel`). Clears immediately when only one live goal exists; when several exist, bare `/goal clear` refuses and requires a `<goalId>` (or unique prefix). Terminal ledger tombstones remain on disk for crash-safe recovery. |
 
 Every action that accepts a `<goalId>` (`pause`, `resume`, `focus`, `clear`) matches either the full ID or a unique prefix, rejecting ambiguous prefixes with an error instead of guessing.
+
+For `clear` and its aliases, separate the optional goal ID with a space or tab. A newline immediately after `clear`, or a longer sentence such as `clear the stale cache`, is a bare objective and follows the normal set/replace behavior. Attachment validation uses the same parsed command as execution: an attached `clear <goalId>` is rejected before changing goal state, while a multiline objective may carry attachments.
+
+On 2.x, failed kickoff admissions retain the original files, agents, skills, and delivery mode separately for each goal. After three delayed retries fail, the goal pauses with a receipt; `/goal resume <goalId>` retries the retained inputs in the same process. Ordinary idle cannot bypass those inputs. An attachment-bearing goal also persists an admission marker from its first saved state. The attachment payload itself stays in memory: after a restart with admission still unresolved, the goal pauses and asks for the original attachments again, or an explicit objective edit. A failure to save the local receipt after host acceptance never triggers an automatic resend.
 
 ### Per-goal flags
 

@@ -81,6 +81,8 @@ export function createGoalOwned(
       options.maxUnchangedResults ?? mgr.defaultOpts.maxUnchangedResults,
     maxBlockedTurns: options.maxBlockedTurns ?? mgr.defaultOpts.maxBlockedTurns,
     languageTriage: options.languageTriage ?? mgr.defaultOpts.languageTriage,
+    kickoffAdmissionPending: options.kickoffAdmissionPending,
+    userCommandStartedAt: options.userCommandStartedAt,
   });
   const machine = new GoalStateMachine(goal, {
     onCommit: mgr.createOnCommit(),
@@ -487,6 +489,7 @@ export async function autoPromoteOwned(
           g.noProgressTurns = 0;
           g.noToolCallTurns = 0;
           g.lastCountedProgressMessageID = '';
+          g.stalledTurnCounted = false;
           g.lastNoToolCallMessageID = '';
           g.promptFailures = 0;
           g.recoveryTurns = 0;

@@ -66,6 +66,15 @@ export async function processIdleEvent(
   if (goal.status !== 'active' && !goal.finalizing) return;
 
   const runtime = deps.runtime;
+  const retainedKickoff = () => {
+    const pending = runtime?.pendingKickoffDispatch
+      ?.get(sessionID)
+      ?.get(goal.goalId);
+    return pending?.runId === goal.runId ? pending : undefined;
+  };
+  const waitingForKickoff = (): boolean =>
+    Boolean(retainedKickoff()) ||
+    machine.snapshot().kickoffAdmissionPending === true;
   if (runtime && !runtime.threadToolsRegistered && !machine.isTerminal()) {
     await machine.transition('paused', {
       source: 'idle-handler',
@@ -177,41 +186,16 @@ export async function processIdleEvent(
   const latestHasToolCall =
     messageHasToolCall(latestAssistant) || windowHasToolCall;
 
-  // Track turns rather than raw idle ticks. The idle handler fires repeatedly on the
-  // same message during polling cycles, so state changes are keyed by turn identity
-  // to avoid prematurely tripping stall thresholds. An id-less turn keys on its
-  // creation timestamp; a truly key-less turn (no id, no timestamp) gets the empty
-  // key and is never counted (alreadyCountedThisTurn is true for it).
-  const alreadyCountedThisTurn =
-    !turnKey || turnKey === goal.lastCountedProgressMessageID;
+  // Turn identity scopes both the progress decision and its count. A host may
+  // supply a creation timestamp instead of an ID; without either, a repeated
+  // observation cannot establish a distinct turn and must not advance a brake.
+  const sameProgressTurn =
+    Boolean(turnKey) && turnKey === goal.lastCountedProgressMessageID;
   const alreadyCountedNoToolCall =
     !turnKey || turnKey === goal.lastNoToolCallMessageID;
-  // A turn whose key was pinned by a PRODUCTIVE evaluation (tool call or
-  // prose) in a previous idle is exempt from low-progress re-evaluation: a
-  // duplicate idle on the same turn recomputes assistantChanged=false /
-  // assistantRepeated=true, which isLowProgressTurn would read as a stall and
-  // wrongly increment noProgressTurns for an already-judged turn. Only an
-  // unpinned or stall-pinned turn remains eligible to be counted once.
-  // The productive flag is tri-state: undefined on the FIRST observation of a
-  // turn (so a duplicate idle can still count a genuine stall exactly once),
-  // false on a confirmed productive re-observation, true on a counted stall.
   const turnPinnedProductive =
-    Boolean(turnKey) &&
-    turnKey === goal.lastCountedProgressMessageID &&
-    goal.stalledTurnCounted === false;
-  // A duplicate idle must not count a stall for a turn that has ALREADY been
-  // counted as a stall (key pinned with flag=true). The first observation of
-  // a turn always has an empty pin, so it is never "already counted"; the
-  // duplicate observation of the same stalled turn IS already-counted only
-  // AFTER the stall branch pinned it. Between the first (productive-looking)
-  // observation and the stall-counting duplicate, the pin is set with
-  // flag=undefined, which is NOT stall-counted — that is what lets the
-  // duplicate count the stall exactly once, and later duplicates (flag=true)
-  // are blocked.
-  const turnStallCounted =
-    Boolean(turnKey) &&
-    turnKey === goal.lastCountedProgressMessageID &&
-    goal.stalledTurnCounted === true;
+    sameProgressTurn && goal.stalledTurnCounted === false;
+  const turnStallCounted = sameProgressTurn && goal.stalledTurnCounted === true;
   // Detect new turns using the pre-update snapshot before `lastAssistantMessageID` is overwritten.
   const isNewAssistantTurn =
     Boolean(latestAssistantID) &&
@@ -219,103 +203,80 @@ export async function processIdleEvent(
   const repetitionInfo = detectRepetitiveDegeneration(latestText);
   const hasRepetition = repetitionInfo.isRepetitive;
 
-  await machine.mutate(
-    g => {
-      g.lastAssistantText = latestText;
-      g.lastAssistantMessageID = latestAssistantID;
+  if (!waitingForKickoff())
+    await machine.mutate(
+      g => {
+        g.lastAssistantText = latestText;
+        g.lastAssistantMessageID = latestAssistantID;
 
-      // Record progress on a new turn rather than token growth so long-running
-      // tool calls do not register as stalls, while hung turns still trip the brake.
-      if (isNewAssistantTurn) {
-        g.lastProgressAt = Date.now();
-      }
-      if (latestHasToolCall) {
-        g.noToolCallTurns = 0;
-        // Keep the evaluated assistant identity as the dedupe key even on a
-        // productive cycle. A duplicate idle before the next assistant reply
-        // must not reclassify this same turn as tool-free.
-        g.lastNoToolCallMessageID = turnKey;
-      } else if (g.turnCount > 0 && !alreadyCountedNoToolCall) {
-        g.noToolCallTurns += 1;
-        g.lastNoToolCallMessageID = turnKey;
-      }
-      const noProgressThreshold =
-        g.noProgressTokenThreshold ??
-        deps.defaultOpts?.noProgressTokenThreshold ??
-        50;
-
-      // Evaluate progress using the canonical predicate, treating repetitive
-      // degeneration as an additional stall indicator. A turn already pinned by
-      // a PRODUCTIVE evaluation (tool call or prose) must not be re-evaluated
-      // as low progress by a duplicate idle.
-      const isLowProgress =
-        hasRepetition ||
-        (isLowProgressTurn(
-          {
-            goal: g,
-            pendingIntent: null,
-            latestOutputTokens,
-            latestHasToolCall,
-            latestHasThinkingTokens,
-            assistantChanged,
-            assistantRepeated: Boolean(assistantRepeated),
-            userInterventionDetected: false,
-            activationBoundary: false,
-          },
-          noProgressThreshold,
-        ) &&
-          !turnPinnedProductive &&
-          // A turn already counted as a stall must not be re-counted by a
-          // duplicate idle.
-          !turnStallCounted);
-      if (isLowProgress) {
-        // Advance stall count only once per turn. The first observation of a
-        // stalled turn is NOT low progress (assistantChanged=true on first
-        // sight of the text), so it falls through to the productive-prose
-        // branch below, which pins the key WITHOUT the productive flag; the
-        // duplicate idle then counts the stall exactly once here.
-        g.noProgressTurns += 1;
-        g.lastCountedProgressMessageID = turnKey;
-        g.stalledTurnCounted = true;
-      } else if (latestHasToolCall) {
-        g.noProgressTurns = 0;
-        // The cycle was just evaluated as productive. Remember that evaluation
-        // so a duplicate idle, whose re-sliced window may hide the tool call,
-        // cannot reclassify the same turn as low progress.
-        g.lastCountedProgressMessageID = turnKey;
-        g.stalledTurnCounted = false;
-      } else {
-        // The turn was just evaluated as productive prose; pin the dedupe key
-        // so a duplicate idle on the same turn cannot reclassify it as low
-        // progress and double-count the stall brake. This mirrors the
-        // tool-call branch above (the F9 fix): without this pin a duplicate
-        // idle on a productive prose turn recomputes assistantChanged=false /
-        // assistantRepeated=true and wrongly increments noProgressTurns.
-        // The flag is left UNSET (undefined) on the first observation of the
-        // turn so the duplicate idle remains eligible to count a genuine
-        // stall exactly once; it becomes false (confirmed-productive) only
-        // when the same turn is re-observed, and true when counted as a
-        // stall. A stall-counted turn (flag=true) must keep its flag AND its
-        // streak so later duplicates stay blocked.
-        g.lastCountedProgressMessageID = turnKey;
-        if (g.stalledTurnCounted === true) {
-          // already counted as a stall: keep the flag and the streak
-        } else {
-          g.noProgressTurns = 0;
-          g.stalledTurnCounted = alreadyCountedThisTurn ? false : undefined;
+        // Record progress on a new turn rather than token growth so long-running
+        // tool calls do not register as stalls, while hung turns still trip the brake.
+        if (isNewAssistantTurn) {
+          g.lastProgressAt = Date.now();
         }
-      }
-      // A low-progress evaluation also pins the turn key, so a duplicate idle
-      // cannot re-count it; the key only moves on with a genuinely new turn.
-    },
-    {
-      source: 'idle-handler',
-      detail: 'Updated tracking fields',
-      skipRevision: true,
-    },
-  );
+        if (latestHasToolCall) {
+          g.noToolCallTurns = 0;
+          // Keep the evaluated assistant identity as the dedupe key even on a
+          // productive cycle. A duplicate idle before the next assistant reply
+          // must not reclassify this same turn as tool-free.
+          g.lastNoToolCallMessageID = turnKey;
+        } else if (g.turnCount > 0 && !alreadyCountedNoToolCall) {
+          g.noToolCallTurns += 1;
+          g.lastNoToolCallMessageID = turnKey;
+        }
+        const noProgressThreshold =
+          g.noProgressTokenThreshold ??
+          deps.defaultOpts?.noProgressTokenThreshold ??
+          50;
 
-  if (goal.lastContinueAt && runtime) {
+        // Repetition and the ordinary stall predicate share the same eligibility
+        // check. Neither may count a keyless turn or recount a decided turn.
+        const isLowProgress =
+          hasRepetition ||
+          isLowProgressTurn(
+            {
+              goal: g,
+              pendingIntent: null,
+              latestOutputTokens,
+              latestHasToolCall,
+              latestHasThinkingTokens,
+              assistantChanged,
+              assistantRepeated: Boolean(assistantRepeated),
+              userInterventionDetected: false,
+              activationBoundary: false,
+            },
+            noProgressThreshold,
+          );
+        const confirmedProductive =
+          latestHasToolCall ||
+          latestHasThinkingTokens ||
+          (latestOutputTokens !== null &&
+            latestOutputTokens >= noProgressThreshold);
+        if (isLowProgress) {
+          if (turnKey && !turnPinnedProductive && !turnStallCounted) {
+            g.noProgressTurns += 1;
+            g.lastCountedProgressMessageID = turnKey;
+            g.stalledTurnCounted = true;
+          }
+        } else if (!turnStallCounted || confirmedProductive) {
+          g.noProgressTurns = 0;
+          g.lastCountedProgressMessageID = turnKey;
+          // A first, short prose observation remains tentative: observing it
+          // unchanged may count one stall. Tools, thinking, or substantial output
+          // confirm progress immediately, even if a later slice omits that work.
+          // Preserve a counted stall only while its own turn remains unchanged.
+          g.stalledTurnCounted =
+            confirmedProductive || sameProgressTurn ? false : undefined;
+        }
+      },
+      {
+        source: 'idle-handler',
+        detail: 'Updated tracking fields',
+        skipRevision: true,
+      },
+    );
+
+  if (!waitingForKickoff() && goal.lastContinueAt && runtime) {
     const elapsed = Math.max(0, Date.now() - goal.lastContinueAt);
     const minDelay = goal.minDelayMs ?? deps.defaultOpts?.minDelayMs ?? 1500;
     if (elapsed < minDelay) {
@@ -407,11 +368,15 @@ export async function processIdleEvent(
     const messageTime =
       (msg as {time?: {created?: unknown}}).time?.created ??
       (msg as {info?: {time?: {created?: unknown}}}).info?.time?.created;
+    // A replacement goal is created after the command began. A human stop that
+    // arrived in the removal/persistence gap is newer than the command but older
+    // than the replacement object, so creation time cannot bound interventions.
+    const interventionBoundary = goal.userCommandStartedAt ?? goal.createdAt;
     if (
       typeof messageTime === 'number' &&
       Number.isFinite(messageTime) &&
-      goal.createdAt > 0 &&
-      messageTime < goal.createdAt
+      interventionBoundary > 0 &&
+      messageTime < interventionBoundary
     )
       return;
     const {surfaced} = currentDeliverySets();
@@ -482,20 +447,20 @@ export async function processIdleEvent(
       matchSlashEcho(sessionID, text)
     )
       continue;
-    // The newest interrupting message wins. Messages that predate the goal's
-    // creation cannot be interventions in this goal: they were already answered
-    // (or deliberately ignored) before the goal existed.
-    const messageTimeOf = (msg: unknown): number | undefined => {
-      const t =
-        (msg as {time?: {created?: unknown}}).time?.created ??
-        (msg as {info?: {time?: {created?: unknown}}}).info?.time?.created;
-      return typeof t === 'number' && Number.isFinite(t) ? t : undefined;
-    };
+    // A command can await removal persistence before creating its replacement.
+    // Human input in that gap is newer than the command but older than the new
+    // goal object; the command's admission time is the ordering boundary. Old
+    // records without it fall back to creation time.
+    const interventionBoundary = goal.userCommandStartedAt ?? goal.createdAt;
+    const messageTime =
+      (msg as {time?: {created?: unknown}}).time?.created ??
+      (msg as {info?: {time?: {created?: unknown}}}).info?.time?.created;
     if (
       latestHumanIntervention === null &&
-      goal.createdAt > 0 &&
-      messageTimeOf(msg) !== undefined &&
-      messageTimeOf(msg)! < goal.createdAt
+      interventionBoundary > 0 &&
+      typeof messageTime === 'number' &&
+      Number.isFinite(messageTime) &&
+      messageTime < interventionBoundary
     )
       continue;
     if (latestHumanIntervention === null) latestHumanIntervention = text;
@@ -554,6 +519,42 @@ export async function processIdleEvent(
       await session.persist();
       return;
     }
+  }
+
+  // The host has not admitted this goal's original inputs yet. An ordinary
+  // continuation would omit its retained attachments or settle it using an
+  // unrelated turn. Human intervention still reaches the pause policy below;
+  // the admission retry owns starting work, independently for each goal.
+  if (waitingForKickoff() && latestHumanIntervention === null) {
+    const retained = retainedKickoff();
+    if (retained) {
+      if (
+        !retained.inFlight &&
+        !retained.exhausted &&
+        runtime?.canDriveSession?.(sessionID) !== false &&
+        !runtime?.hasKickoffTimer?.(sessionID, goal.goalId)
+      ) {
+        runtime?.scheduleKickoff?.(sessionID, goal.goalId, goal.runId);
+      }
+      return;
+    }
+    if (!runtime?.promptInFlightSessions.has(sessionID)) {
+      const message =
+        'The original kickoff inputs are no longer available after recovery. ' +
+        `Resubmit \`/${deps.commandName} resume ${goal.goalId}\` with the original attachments, ` +
+        'or explicitly edit the objective to start a new kickoff.';
+      const paused = await machine.transition('paused', {
+        source: 'idle-handler',
+        stopReason: 'kickoff admission failed',
+        detail: message,
+      });
+      if (paused.ok) {
+        await machine.addNotice('prompt-failure', message);
+        await session.persist();
+        await deps.announceGoalDecision?.(sessionID, message);
+      }
+    }
+    return;
   }
 
   const idleCtx: IdleContext = {

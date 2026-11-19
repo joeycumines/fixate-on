@@ -138,14 +138,12 @@ test('concurrent add commands each dispatch their own goalID', async () => {
       () => prompts.length >= 1,
       'the kickoff prompt to be dispatched',
     );
-    // scheduleKickoff clears the per-session timer on re-arm, so only the last
-    // scheduled goal actually prompts. The dispatch identity is what matters:
-    // each command result must name its own goal, and the prompt must target
-    // one of them (never a goal neither command created).
+    // Each concurrent add dispatches its own retained kickoff. A prompt must
+    // target each command's own objective — neither may be lost or overwritten
+    // by the other's dispatch, and no prompt may target an unrelated goal.
     const texts = prompts.map(p => p.text).join('\n');
-    const promptTargetsA = texts.includes('first objective');
-    const promptTargetsB = texts.includes('second objective');
-    expect(promptTargetsA !== promptTargetsB).toBe(true);
+    expect(texts).toContain('first objective');
+    expect(texts).toContain('second objective');
   } finally {
     for (const t of wiring.kickoffTimers.values()) clearTimeout(t);
     rmSync(root, {recursive: true, force: true});

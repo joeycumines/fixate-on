@@ -23,6 +23,7 @@ import {
   hasAssistantReplyContent,
   latestTurnSignatureFromMessages,
   loadZodV2,
+  MAX_BACKGROUND_WAIT_MS,
   nextDeferralOnBlockedIdle,
   normalizeV2Messages,
   reconcileSystemParts,
@@ -36,6 +37,8 @@ import {
 import {v1PartsToV2Text} from './plugin-v2-event-leaf.ts';
 import {runV2EventLoop} from './plugin-v2-event-bridge.ts';
 import {registerV2GoalCommandBridge} from './plugin-v2-command-bridge.ts';
+import type {SessionClientCapabilities} from './session-api.ts';
+import {createGoalOutputPublisher} from './plugin-v2-command-output.ts';
 import {
   type RecentKickoffTextTracker,
   createRecentKickoffTextTracker,
@@ -59,8 +62,26 @@ export function createV2ClientShim(
   recentKickoffTexts?: RecentKickoffTextTracker,
 ): {
   session: Record<string, V2SessionOp | undefined>;
+  sessionCapabilities: SessionClientCapabilities;
 } {
   const session = ctx.session;
+  const selectAgent = async (
+    sessionID: string,
+    agent: string,
+  ): Promise<void> => {
+    if (typeof session.switchAgent !== 'function') {
+      throw new Error(
+        `cannot select agent ${JSON.stringify(agent)}: host has no switchAgent operation`,
+      );
+    }
+    try {
+      await session.switchAgent({sessionID, agent});
+    } catch (error) {
+      throw new Error(
+        `failed to select agent ${JSON.stringify(agent)}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  };
 
   // v1 promptAsync callers mark steers with `synthetic: true`. Route to v2's
   // synthetic op to wake execution without injecting a genuine user turn.
@@ -77,38 +98,57 @@ export function createV2ClientShim(
   // Regular prompt used for synchronous turns such as child-session verifiers.
   // On v2.2.7, session.prompt admits input and runs asynchronously; wait for idle
   // when no assistant reply parts are present and the host exposes session.wait.
-  const prompt: V2SessionOp = async input => {
+  const prompt = async (
+    input: Record<string, unknown>,
+    options?: {signal?: AbortSignal},
+  ): Promise<unknown> => {
+    options?.signal?.throwIfAborted();
     const translated = v1PartsToV2Text(input);
     const targetSessionID = translated.sessionID ?? '';
     if (translated.agent && targetSessionID) {
-      if (typeof session.switchAgent !== 'function') {
-        throw new Error(
-          `cannot select agent ${JSON.stringify(translated.agent)}: host has no switchAgent operation`,
-        );
-      }
-      try {
-        await session.switchAgent({
-          sessionID: targetSessionID,
-          agent: translated.agent,
-        });
-      } catch (error) {
-        throw new Error(
-          `failed to select agent ${JSON.stringify(translated.agent)}: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
+      await selectAgent(targetSessionID, translated.agent);
     }
+    options?.signal?.throwIfAborted();
     const res = await session.prompt({
       sessionID: targetSessionID,
       text: translated.text,
       ...(translated.metadata ? {metadata: translated.metadata} : {}),
       ...(translated.agent ? {agent: translated.agent} : {}),
     });
+    options?.signal?.throwIfAborted();
     if (
       !hasAssistantReplyContent(res) &&
       targetSessionID &&
       typeof session.wait === 'function'
     ) {
-      await session.wait({sessionID: targetSessionID});
+      const waitPromise = Promise.resolve(
+        session.wait({sessionID: targetSessionID}),
+      );
+      if (options?.signal) {
+        const signal = options.signal;
+        await new Promise<void>((resolve, reject) => {
+          if (signal.aborted) {
+            reject(signal.reason ?? new Error('aborted'));
+            return;
+          }
+          const onAbort = () => {
+            reject(signal.reason ?? new Error('aborted'));
+          };
+          signal.addEventListener('abort', onAbort, {once: true});
+          waitPromise.then(
+            () => {
+              signal.removeEventListener('abort', onAbort);
+              resolve();
+            },
+            err => {
+              signal.removeEventListener('abort', onAbort);
+              reject(err);
+            },
+          );
+        });
+      } else {
+        await waitPromise;
+      }
     }
     return res;
   };
@@ -228,6 +268,11 @@ export function createV2ClientShim(
   };
 
   return {
+    sessionCapabilities: {
+      deleteSession: typeof session.remove === 'function',
+      promptAbortSignal: true,
+      selectAgent,
+    },
     session: {
       promptAsync,
       prompt,
@@ -275,13 +320,13 @@ export function shapeToolResult(
 
 export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
   // Validate static agent names before acquiring any runtime/persistence resources.
-  const rawOptionsEarly = ctx.options as PluginOptions;
+  const rawOptionsEarly = (ctx.options ?? {}) as PluginOptions;
   const earlyGoalName =
-    (typeof rawOptionsEarly?.goalAgentName === 'string' &&
+    (typeof rawOptionsEarly.goalAgentName === 'string' &&
       rawOptionsEarly.goalAgentName.trim()) ||
     'goal';
   const earlyVerifierName =
-    (typeof rawOptionsEarly?.verifierAgentName === 'string' &&
+    (typeof rawOptionsEarly.verifierAgentName === 'string' &&
       rawOptionsEarly.verifierAgentName.trim()) ||
     'goal-verify';
   if (earlyGoalName === earlyVerifierName) {
@@ -294,11 +339,13 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
   // push channel, buffered state events are drained into Result.metadata, which
   // core broadcasts over `session.tool.success`.
   const tuiTransport = createBufferingTransport();
-  const rawOptions = ctx.options as PluginOptions;
+  const rawOptions = (ctx.options ?? {}) as PluginOptions;
+  const goalOutput = createGoalOutputPublisher(rawOptions.goalMessenger);
   const pluginOptions: PluginOptions = {
     ...rawOptions,
-    sdkShape: rawOptions?.sdkShape ?? 'flat',
+    sdkShape: rawOptions.sdkShape ?? 'flat',
     tuiTransport: tuiTransport.publish,
+    goalMessenger: goalOutput.publish,
   };
 
   const buffer: MessageBuffer = {bySession: new Map()};
@@ -338,7 +385,7 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
     runtime?: import('./session-state-manager.ts').RuntimeState;
   };
 
-  const disposers: Array<() => Promise<void> | void> = [];
+  const disposers: Array<() => Promise<void> | void> = [goalOutput.dispose];
   let stopEventLoop = false;
   let stopEventLoopResolve: (() => void) | undefined;
   const stopEventLoopSignal = new Promise<void>(resolve => {
@@ -401,6 +448,7 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
   return disposeAll;
 
   async function registerBridges(): Promise<void> {
+    await goalOutput.register(ctx.rpc);
     // Bridge 1: session.hook("context") -> chat.params + system.transform
     if (typeof ctx.session?.hook === 'function') {
       try {
@@ -508,10 +556,16 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
               sessionID,
               deferral.nextRecheckAt,
             );
-            // A host re-reporting the same stuck job set must not reset the
-            // escalation clock: preserve `since`/`extensions` when the new job
-            // keys overlap the recorded ones, and only extend the recheck.
+            // Only an authoritative empty-background idle clears a deferral,
+            // so any surviving record means continuous blocking even if the
+            // host regenerated its job keys. Preserve the escalation clock.
             hooks.runtime?.backgroundDeferrals?.set(sessionID, deferral);
+            if (
+              now - deferral.since >= MAX_BACKGROUND_WAIT_MS &&
+              hooks.runtime?.escalateBackgroundDeferral
+            ) {
+              await hooks.runtime.escalateBackgroundDeferral(sessionID);
+            }
             return;
           }
           // An idle with no blocking jobs is the authoritative clear: the
@@ -574,19 +628,14 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
         method: 'prompt' | 'synthetic';
         payload: Record<string, unknown>;
       };
-      hooks.runtime!.promptInFlightSessions.add(sessionID);
-      try {
-        if (dispatch.method === 'prompt') {
-          recentKickoffTexts.record(
-            sessionID,
-            String(dispatch.payload.text ?? ''),
-          );
-          await ctx.session.prompt(dispatch.payload);
-        } else {
-          await ctx.session.synthetic(dispatch.payload);
-        }
-      } finally {
-        hooks.runtime!.promptInFlightSessions.delete(sessionID);
+      if (dispatch.method === 'prompt') {
+        recentKickoffTexts.record(
+          sessionID,
+          String(dispatch.payload.text ?? ''),
+        );
+        await ctx.session.prompt(dispatch.payload);
+      } else {
+        await ctx.session.synthetic(dispatch.payload);
       }
     };
 
@@ -620,7 +669,12 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
       pluginOptions,
       recentKickoffTexts,
       disposers,
+      publishOutput: (sessionID, text) =>
+        goalOutput.publish(sessionID, text, 'command'),
     });
+    if (hooks.runtime) {
+      hooks.runtime.announceKickoffFailure = goalOutput.publish;
+    }
 
     // Bridge 5: Register `goal` and read-only `goal-verify` agents on OpenCode v2 so
     // child-session completion verification has its dedicated hidden subagent without

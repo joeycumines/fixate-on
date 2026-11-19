@@ -5,6 +5,7 @@
  * `executeDecision` calls `sendRecoveryPrompt`, and idle lifecycle handlers import this module.
  */
 
+import {acquirePromptInFlight} from './session-runtime.ts';
 import type {GoalStateMachine} from './state-machine.ts';
 import type {ContinuationDecision, IdleContext} from './continuation-loop.ts';
 import {validatePendingIntent} from './continuation-loop.ts';
@@ -132,7 +133,7 @@ export async function executeDecision(
         return;
       }
 
-      if (runtime) runtime.promptInFlightSessions.add(sessionID);
+      const releasePrompt = acquirePromptInFlight(runtime, sessionID);
       // Ensure message is a string to satisfy the host's Effect Schema validation.
       if (typeof message !== 'string') {
         message = String(message ?? '');
@@ -178,7 +179,7 @@ export async function executeDecision(
           response = {error: errObj};
         }
       } finally {
-        runtime?.promptInFlightSessions.delete(sessionID);
+        releasePrompt();
         await machine.mutate(
           g => {
             g.finalizing = false;
@@ -362,7 +363,7 @@ export async function executeDecision(
       if (typeof message !== 'string') {
         message = String(message ?? '');
       }
-      if (deps.runtime) deps.runtime.promptInFlightSessions.add(sessionID);
+      const releasePrompt = acquirePromptInFlight(deps.runtime, sessionID);
       try {
         const promptInput: Record<string, unknown> = {
           parts: [
@@ -389,7 +390,7 @@ export async function executeDecision(
       } catch (error) {
         await deps.logError('Failed to send budget limit prompt', error);
       } finally {
-        deps.runtime?.promptInFlightSessions.delete(sessionID);
+        releasePrompt();
       }
       // Retain focus on the terminating goal until its synthetic prompt completes.
       if (session.autoPromote && session.isOrdered()) {
@@ -691,7 +692,7 @@ export async function executeDecision(
       // Send a final wrap-up prompt to notify the session rather than stopping silently.
       const stopGoal = machine.snapshot();
       const stopMessage = renderStopLimit(stopGoal, decision.reason);
-      if (deps.runtime) deps.runtime.promptInFlightSessions.add(sessionID);
+      const releasePrompt = acquirePromptInFlight(deps.runtime, sessionID);
       try {
         await sessionApi.promptAsync(sessionID, {
           parts: [
@@ -706,7 +707,7 @@ export async function executeDecision(
       } catch (error) {
         await deps.logError('Failed to send stop wrap-up prompt', error);
       } finally {
-        deps.runtime?.promptInFlightSessions.delete(sessionID);
+        releasePrompt();
       }
       // Retain focus on the stopped goal until its synthetic wrap-up prompt completes.
       if (session.autoPromote && session.isOrdered()) {
@@ -779,7 +780,7 @@ export async function sendRecoveryPrompt(
   }
 
   // Send recovery prompt as a synthetic continuation, inheriting the active agent name when set.
-  if (deps.runtime) deps.runtime.promptInFlightSessions.add(sessionID);
+  const releasePrompt = acquirePromptInFlight(deps.runtime, sessionID);
   try {
     const promptInput: Record<string, unknown> = {
       parts: [
@@ -803,6 +804,6 @@ export async function sendRecoveryPrompt(
   } catch (error) {
     await deps.logError('Failed to send recovery prompt', error);
   } finally {
-    deps.runtime?.promptInFlightSessions.delete(sessionID);
+    releasePrompt();
   }
 }

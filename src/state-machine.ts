@@ -617,6 +617,8 @@ export function createGoalState(
     maxUnchangedResults?: number;
     maxBlockedTurns?: number;
     languageTriage?: boolean;
+    kickoffAdmissionPending?: boolean;
+    userCommandStartedAt?: number;
   } = {},
 ): GoalState {
   const now = Date.now();
@@ -654,6 +656,7 @@ export function createGoalState(
       costKnown: false,
     },
     createdAt: now,
+    userCommandStartedAt: options.userCommandStartedAt,
     updatedAt: now,
     startedAt: now,
     pausedAt: 0,
@@ -681,6 +684,7 @@ export function createGoalState(
     blockedAssertedThisTurn: false,
     languageTriage: options.languageTriage ?? true,
     lastStatus: 'Goal set.',
+    kickoffAdmissionPending: options.kickoffAdmissionPending ?? false,
     lastAssistantText: '',
     lastAssistantMessageID: '',
     lastCountedProgressMessageID: '',

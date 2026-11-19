@@ -26,9 +26,10 @@ chord — is the guaranteed path, and every live campaign in
 `hack/e2e-harness/` drives the palette. The 1.x companion therefore keeps
 its slash + state-file surfaces first-class.
 
-On OpenCode 2.x the server→TUI channel rides `tool Result.metadata`
+On OpenCode 2.x goal state rides `tool Result.metadata`
 (`tool Result.metadata` → `session.tool.success` → `context.data.on` → store),
-not `client.tui.publish`. On stock 1.x the transport is disk hydration +
+and native command receipts use a separate passive RPC event channel. Neither
+uses `client.tui.publish`. On stock 1.x the transport is disk hydration +
 a state-file refresh loop plus curated human-readable toasts — the publish
 channel is never used as a data transport there (1.x renders every published
 toast on screen, so data events would flood the UI).
@@ -108,7 +109,7 @@ With the pair in place, smoke-test the pairing:
 
 ```sh
 # from a session running the server plugin, in the TUI companion:
-/goal status          # shows [TUI mode] header when the companion is attached
+/goal status          # on 2.x, the companion displays the full receipt in a dialog
 /goal list all         # the dashboard mirrors this list within one refresh poll
 ```
 
@@ -128,9 +129,11 @@ in two modes:
 
 ### TUI Mode (companion attached)
 
-When the TUI companion is registered, the server plugin detects
-`client.tui.publish` and sets the `hasTuiCompanion` flag. Command output
-includes a header noting the interactive dashboard is available:
+The command dispatcher labels receipts `[TUI mode]` when a TUI transport is
+configured. On 2.x the server's buffering transport supplies this capability;
+the header is not a handshake confirming that a companion is connected. Confirm
+the pairing by observing the receipt dialog and dashboard update. A receipt
+has this form:
 
 ```
 [TUI mode] /status
@@ -146,7 +149,7 @@ dashboard.
 
 ### Server Mode (headless / no TUI)
 
-When no TUI companion is registered, commands produce plain-text output with
+On the 1.x command path, when no TUI companion is registered, commands produce plain-text output with
 an explicit header indicating the output is routed to the model as a chat
 turn:
 
@@ -158,7 +161,37 @@ Context tokens: 12,400/200,000
 ...
 ```
 
-This is the default behavior when running in headless/automated environments.
+On 2.x, the `goal-command` tool returns text in its tool result. The native
+`/goal` command instead uses the passive receipt channel below, including in
+headless environments.
+
+### Passive command receipts on 2.x
+
+The server registers the `fixate-on-output` RPC. Its `output` event carries
+`{id, sessionID, text, kind, timestamp}`; `kind` is `command` or `notice`.
+The v2 companion subscribes through `client.rpc(...).events.on('output', ...)`.
+It displays the full command receipt in a dialog when that session is open,
+and shows a session-scoped toast for other sessions or notices. Repeated receipt
+IDs are ignored. Command receipts never call `session.prompt` or
+`session.synthetic`: both admit model input on the verified OpenCode v2.2.7 host.
+
+A headless client can consume the event `rpc.fixate-on-output.output` on the
+host's event stream. After a missed event it can request the latest receipt:
+
+```http
+POST /api/rpc/fixate-on-output/latest
+Content-Type: application/json
+
+{"input":{"sessionID":"ses_example"}}
+```
+
+The response is `{"output": <receipt or null>}`. The server retains one receipt
+per session, up to 256 sessions, for its current process lifetime. This is a
+display channel, not a persisted transcript. The TUI companion is required for
+automatic display of native command receipts; a server-only client must consume
+the event or the RPC result itself. Hosts without RPC can supply `goalMessenger`.
+With neither channel available, the native command reports an explicit delivery
+error containing the completed command's result, rather than silently losing it.
 
 ## Keyboard Shortcuts
 
@@ -370,7 +403,8 @@ requires the lag documented with numbers rather than left implicit.
 | `src/tui-disk-state.ts` | Enumerates and reads every session's persisted goal state | `fs-portable.ts` (the bounded, symlink-refusing read), `session-paths.ts` (the layout), `state-machine.ts`, `tui-state.ts` |
 | `src/tui-companion-refresh.ts` | v1 disk refresh loop | `tui-disk-state.ts`, `tui-state.ts` |
 | `src/tui.ts` | v1 TUI companion entrypoint | `tui-action-labels.ts`, `tui-companion-refresh.ts`, `tui-components.ts`, `tui-disk-state.ts`, `tui-sound.ts`, `tui-state.ts`, `tui-toast-policy.ts`, `tui-views.ts`, plus `@opencode-ai/plugin` and `@opencode-ai/plugin/tui` |
-| `src/tui-v2.ts` | v2 TUI companion entrypoint | `tui-action-labels.ts`, `tui-components.ts`, `tui-dashboard-route.tsx`, `tui-disk-state.ts`, `tui-state.ts`, `tui-v2-events.ts`, `tui-views.ts` |
+| `src/tui-v2.ts` | v2 TUI companion entrypoint | `tui-action-labels.ts`, `tui-components.ts`, `tui-dashboard-route.tsx`, `tui-disk-state.ts`, `tui-state.ts`, `tui-v2-command-output.ts`, `tui-v2-events.ts`, `tui-views.ts` |
+| `src/tui-v2-command-output.ts` | Passive native command receipts and notices | `plugin-v2-command-output.ts`, `tui-components.ts` |
 | `src/tui-v2-events.ts` | v2 event-driven truth channels: disk-refresh loop, curated toasts, briefing, tool-metadata subscription | `state-machine.ts`, `tui-action-labels.ts`, `tui-companion-refresh.ts`, `tui-components.ts`, `tui-sound.ts`, `tui-state.ts`, `tui-toast-policy.ts` |
 
 ## Host API Requirements
