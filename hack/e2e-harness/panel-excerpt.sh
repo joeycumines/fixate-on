@@ -83,7 +83,7 @@ panel_first_frame() {
   local frame
   for frame in "$dir/$prefix"*.ansi; do
     [ -f "$frame" ] || continue
-    if panel_regions "$frame" "$title" | grep -aq "$phrase"; then
+    if grep -aq "$phrase" "$frame"; then
       echo "$frame"
       return 0
     fi
