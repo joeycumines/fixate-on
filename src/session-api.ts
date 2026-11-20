@@ -28,16 +28,32 @@ export interface SessionApiOptions {
   preferredShape?: SdkShape;
   /** Opt-in adapters can stop a pending prompt before its next host call. */
   signal?: AbortSignal;
+  /** Verifiers must read post-turn messages, never a pre-turn context cache. */
+  requireFreshMessages?: boolean;
+  /** Revalidates child policy at the host's post-activation admission boundary. */
+  beforePromptAdmission?: () => Promise<void>;
 }
 
 /** Explicit adapter capabilities that cannot be inferred from wrapper methods. */
 export interface SessionClientCapabilities {
   deleteSession?: boolean;
   promptAbortSignal?: boolean;
+  /** The adapter can run a callback after activation and before admitting input. */
+  promptAdmissionHook?: boolean;
+  /** Reads the host's durable session totals before a continuation decision. */
+  readCumulativeUsage?: (sessionID: string) => Promise<unknown>;
   selectAgent?: (sessionID: string, agent: string) => Promise<void>;
+  readFreshMessages?: (
+    sessionID: string,
+    options: {limit?: number},
+  ) => Promise<unknown[]>;
+  /** Resolved agent rules, including the host's global and project config. */
+  readAgentPermissions?: (agent: string) => Promise<unknown[]>;
 }
 
 export interface OpenCodeSessionApi {
+  agentPermissions?: (agent: string) => Promise<unknown[]>;
+  usage?: (sessionID: string) => Promise<unknown>;
   messages: (
     sessionID: string,
     options?: {limit?: number},
@@ -143,6 +159,24 @@ export function createOpenCodeSessionApi(
   const capabilities = (
     client as {sessionCapabilities?: SessionClientCapabilities}
   ).sessionCapabilities;
+  const app = (client as {app?: {agents?: () => Promise<unknown>}}).app;
+  const readAgentPermissions = capabilities?.readAgentPermissions
+    ? capabilities.readAgentPermissions
+    : typeof app?.agents === 'function'
+      ? async (agent: string): Promise<unknown[]> => {
+          const agents = unwrapData(await app.agents!(), 'agents');
+          if (!Array.isArray(agents))
+            throw new Error('Resolved agent permission policy is unavailable.');
+          const info = agents.find(
+            value => value && typeof value === 'object' && value.name === agent,
+          );
+          if (!info || !Array.isArray(info.permission))
+            throw new Error(
+              `Resolved permission policy for agent ${agent} is unavailable.`,
+            );
+          return info.permission;
+        }
+      : undefined;
 
   const preferredShape: SdkShape = options.preferredShape ?? 'flat';
   if (preferredShape !== 'flat' && preferredShape !== 'legacy') {
@@ -169,9 +203,15 @@ export function createOpenCodeSessionApi(
       // Only adapters advertising this convention receive the request option.
       // Deletion/abort stay usable after cancellation so cleanup can finish.
       const response =
-        operation === 'prompt' && capabilities?.promptAbortSignal
+        operation === 'prompt' &&
+        (capabilities?.promptAbortSignal || capabilities?.promptAdmissionHook)
           ? await method.call(sessionClient.session, firstInput, {
-              signal: options.signal,
+              ...(capabilities.promptAbortSignal
+                ? {signal: options.signal}
+                : {}),
+              ...(capabilities.promptAdmissionHook
+                ? {beforeAdmission: options.beforePromptAdmission}
+                : {}),
             })
           : await method.call(sessionClient.session, firstInput);
       const unwrapped = unwrapData(response, operation) as T;
@@ -188,9 +228,15 @@ export function createOpenCodeSessionApi(
       const fallbackShape: SdkShape = firstShape === 'flat' ? 'legacy' : 'flat';
       const fallbackInput = fallbackShape === 'flat' ? flatInput : legacyInput;
       const response =
-        operation === 'prompt' && capabilities?.promptAbortSignal
+        operation === 'prompt' &&
+        (capabilities?.promptAbortSignal || capabilities?.promptAdmissionHook)
           ? await method.call(sessionClient.session, fallbackInput, {
-              signal: options.signal,
+              ...(capabilities.promptAbortSignal
+                ? {signal: options.signal}
+                : {}),
+              ...(capabilities.promptAdmissionHook
+                ? {beforeAdmission: options.beforePromptAdmission}
+                : {}),
             })
           : await method.call(sessionClient.session, fallbackInput);
       const unwrapped = unwrapData(response, operation) as T;
@@ -200,14 +246,26 @@ export function createOpenCodeSessionApi(
   }
 
   return Object.freeze({
+    ...(readAgentPermissions ? {agentPermissions: readAgentPermissions} : {}),
+    ...(capabilities?.readCumulativeUsage
+      ? {
+          usage: async (sessionID: string): Promise<unknown> =>
+            unwrapData(
+              await capabilities.readCumulativeUsage!(sessionID),
+              'get',
+            ),
+        }
+      : {}),
     messages(
       sessionID: string,
-      options: {limit?: number} = {},
+      messageOptions: {limit?: number} = {},
     ): Promise<unknown[]> {
+      if (options.requireFreshMessages && capabilities?.readFreshMessages)
+        return capabilities.readFreshMessages(sessionID, messageOptions);
       return invoke<unknown[]>(
         'messages',
-        {sessionID, ...options},
-        {path: {id: sessionID}, query: options},
+        {sessionID, ...messageOptions},
+        {path: {id: sessionID}, query: messageOptions},
       );
     },
     promptAsync(

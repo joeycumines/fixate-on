@@ -108,6 +108,15 @@ reports. If a release ever *does* depend on it, promote it then.
    directory, which is why a new file dropped into `docs/` cannot reach the
    tarball at all.
 
+   The only installed runtime dependency is `zod`. The OpenCode SDK and TUI
+   peer ranges describe host compatibility and are optional: none of the
+   bundles imports `@opencode-ai/plugin` at runtime, and the 2.x host supplies
+   Solid/OpenTUI. Keep the pinned SDK in `devDependencies` for type checking.
+   Making the SDK peer required would also install its unused transitive
+   dependencies into a server-only consumer. Repository overrides and the
+   compiler compatibility patch apply to development installs; consumers do
+   not need that patch.
+
     Do not record a size. `bun pm pack --destination <dir>` prints
     `Packed size`; any number written down here is wrong the moment a dependency or a document changes.
 
@@ -116,11 +125,17 @@ reports. If a release ever *does* depend on it, promote it then.
 
 ## The safety nets, and what each one actually covers
 
-`bun pm pack` and `bun publish` run **no** lifecycle scripts (measured), and the
-generated bundle is gitignored, so a pack performed before `bun run bundle`
-produces a tarball that cannot load. `npm publish` from a CHECKOUT is
-different: it runs `prepack` (which is `bun run bundle`) and then
-`prepublishOnly` (which is `bun run release:check`).
+On the pinned Bun 1.4.2, `bun pm pack` runs `prepack`, which invokes
+`bun run bundle`. A local `bun publish --dry-run` from an isolated checkout
+also runs `prepublishOnly` before `prepack`; the tarball form runs neither.
+These lifecycle checks made no registry requests. The
+[Bun pack](https://bun.sh/docs/pm/cli/pm#pack) and
+[publish](https://bun.sh/docs/pm/cli/publish) documentation describe these hooks.
+`npm publish` from a checkout likewise runs `prepublishOnly`
+(`bun run release:check`) before `prepack` (`bun run bundle`), as documented in
+[npm's lifecycle order](https://docs.npmjs.com/cli/v11/using-npm/scripts/#npm-publish).
+Keep the explicit build in Prepare: generated bundles are gitignored, and
+`--ignore-scripts` can bypass the automatic rebuild.
 
 **`npm publish <tarball>` runs neither, and neither does `bun publish
 <tarball>`.** Publishing a
@@ -135,11 +150,8 @@ expected shape is listed under [Prepare](#prepare); if a release goes wrong,
 follow [If a release goes wrong](#if-a-release-goes-wrong).
 
 Do not change `prepack` to `prepare`: `prepare` also fires on `npm install` from
-a git URL, which is a worse failure mode. The bun path is covered by the other
-two mechanisms:
-
-- `release:check` begins with `bun run bundle`, so the pack step always has
-  something to pack.
+a git URL. `release:check` begins with `bun run bundle`, so the pack step has
+the bundles even when lifecycle scripts are disabled.
 
 There is a second net, and it is the only one that gates rather than
 repairs. `prepublishOnly` is `bun run release:check`, so `npm publish` from a
@@ -149,8 +161,7 @@ unverified tarball.
 
 **Both npm-side nets are disabled by one setting.** If any reachable `.npmrc`
 sets `ignore-scripts=true`, npm skips `prepack` AND `prepublishOnly`. That is
-the default in the maintainer's own `~/.npmrc` on this machine. Check it
-before relying on either net:
+an install-specific setting; check it before relying on either net:
 
 ```sh
 npm config get ignore-scripts   # must print false for these nets to exist
@@ -159,18 +170,19 @@ npm config get ignore-scripts   # must print false for these nets to exist
 ## Publish
 
 1. Merge to `main`. Wait for the required checks.
-2. Create and push an **annotated** tag at that commit:
+2. Create an **annotated** tag at that commit, then check its object type and
+   package version:
 
    ```sh
    git tag -a v1.0.0 -m "fixate-on 1.0.0"
-   git push origin v1.0.0
+   test "$(git cat-file -t refs/tags/v1.0.0)" = tag
+   bun -e 'const p = await Bun.file("package.json").json(); if (`v${p.version}` !== "v1.0.0") throw new Error("Tag does not match package version")'
    ```
 
-   Verify the tag is annotated and matches the version before pushing:
+   Only after both checks succeed, push the tag:
 
    ```sh
-   git tag -n9 v1.0.0          # the annotation must be present
-   bun -e 'console.log(JSON.parse(require("fs").readFileSync("package.json","utf8")).version)'
+   git push origin v1.0.0
    ```
 
    The tag must be exactly `v<version>`. The workflow rejects anything else
@@ -203,9 +215,11 @@ npm config get ignore-scripts   # must print false for these nets to exist
 - **No rebuild at publish time.** `npm publish <tarball>` publishes the artifact
   byte-for-byte. The publish job cannot accidentally ship something the gate did
   not check.
-- **No `bun publish`.** Bun skips lifecycle scripts, which is fine for packing
-  but means npm is the right client for the OIDC handshake and the provenance
-  statement.
+- **No `bun publish`.** The workflow uses npm for its configured OIDC handshake
+  and provenance statement; the quality gate is the separate `gate` job. The
+  [Bun publish documentation](https://bun.sh/docs/pm/cli/publish#provenance)
+  lists provenance generation as unsupported, so Bun is not a publishing
+  fallback for this package's `publishConfig.provenance: true` requirement.
 
 ## If a release goes wrong
 
@@ -226,25 +240,25 @@ If the release environment or trusted publishing is misconfigured, the
 artifact from the **gate job's workflow artifact** can be published manually.
 
 **Which tarball matters, because nothing downstream can tell them apart.**
-Publishing a `.tgz` runs no lifecycle script under either client, so a local
-`bun pm pack` in a checkout whose `plugin/fixate-on/` is stale produces
-a package that installs and then cannot load. So:
+Publishing a `.tgz` runs no lifecycle script under either client. A normal
+`bun pm pack` rebuilds through `prepack`, but it does not run the quality gate;
+with scripts disabled it can also package stale or missing bundles. So:
 
 - **The gate job's artifact is the safe one.** Download it, and check it first.
 - **A locally packed tarball is not**, and nothing will check it for you.
 
 Whichever you use, check the shape before publishing. The name
 `fixate-on` is consumed permanently on first publish, and this path has no
-environment gate, no provenance statement and no gate run:
+automatic environment approval or gate run. Keep the provenance requirement:
+run npm from a supported CI environment, following
+[npm's provenance prerequisites](https://docs.npmjs.com/generating-provenance-statements/#prerequisites),
+with the repository and source revision that produced the artifact. A local
+shell without that environment cannot replace this step; repair and rerun the
+release workflow instead of disabling provenance.
 
 ```sh
-# Works on a tarball from EITHER source. From the repository root — bun reads
-# the local package.json, so run this where one exists, not from a directory
-# holding only the.tgz.
-bun publish dist/fixate-on-X.Y.Z.tgz --access public
-
-# npm needs the./ prefix for a relative path, per the note above.
-npm publish ./dist/fixate-on-X.Y.Z.tgz --access public
+# npm needs the ./ prefix for a relative path, per the note above.
+npm publish ./dist/fixate-on-X.Y.Z.tgz --access public --provenance
 ```
 
 To check a tarball before publishing it, read its member list against the
@@ -258,5 +272,4 @@ expected shape from the Prepare section:
 
 Use this to recover, then fix the configuration before the next release. Prefer
 re-running the workflow on the same tag once it is fixed: that path has the gate,
-the environment approval and the provenance statement, and this one has none of
-the three.
+the environment approval and the provenance statement together.

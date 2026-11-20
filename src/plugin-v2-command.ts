@@ -283,6 +283,7 @@ export function assertV2CommandCanDispatch(args: {
   rawArgs: string;
   hasAttachments: boolean;
   commandName: string;
+  cancelledByHuman?: boolean;
   res: {
     handled: boolean;
     ok: boolean;
@@ -300,7 +301,7 @@ export function assertV2CommandCanDispatch(args: {
     throw new Error(res.error || res.rendered || 'Goal command failed.');
   }
   if (!res.enteredActive || !res.after) {
-    if (args.hasAttachments) {
+    if (args.hasAttachments && !args.cancelledByHuman) {
       throw new Error(ATTACHMENT_ACTIVATION_ERROR);
     }
     return;

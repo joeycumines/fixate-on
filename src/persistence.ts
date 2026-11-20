@@ -21,7 +21,11 @@ import type {
   TransitionSource,
 } from './state-machine.ts';
 import type {UsageSnapshot} from './accounting.ts';
-import {normalizeUsage, toNonNegativeInteger} from './accounting.ts';
+import {
+  normalizeUsage,
+  toNonNegativeInteger,
+  USAGE_TOKEN_FIELDS,
+} from './accounting.ts';
 import {MAX_STATE_FILE_BYTES, portableReadBounded} from './fs-portable.ts';
 
 // Bounds: state files are untrusted input, so lengths are capped and
@@ -107,6 +111,7 @@ export interface SerializedGoal {
   totalTokens: number;
   compactionBaselineTokens: number;
   usage: UsageSnapshot;
+  lastSessionUsage?: UsageSnapshot | null;
   createdAt: number;
   userCommandStartedAt?: number;
   updatedAt: number;
@@ -287,9 +292,30 @@ function normalizeBaseline(raw: unknown): RunBaseline | null {
   };
 }
 
+function normalizeSessionUsageWatermark(
+  value: unknown,
+): UsageSnapshot | null | undefined {
+  if (value === null) return null;
+  if (
+    !isPlainObject(value) ||
+    !USAGE_TOKEN_FIELDS.every(
+      field => Number.isSafeInteger(value[field]) && Number(value[field]) >= 0,
+    ) ||
+    typeof value.cost !== 'number' ||
+    !Number.isFinite(value.cost) ||
+    value.cost < 0 ||
+    typeof value.costKnown !== 'boolean'
+  )
+    return undefined;
+  return normalizeUsage(value);
+}
+
 export function serializeGoal(goal: GoalState): SerializedGoal {
   return {
     ...goal,
+    lastSessionUsage: goal.lastSessionUsage
+      ? {...goal.lastSessionUsage}
+      : goal.lastSessionUsage,
     artifactPointers: [...goal.artifactPointers],
     pendingProposal: goal.pendingProposal
       ? {
@@ -421,6 +447,7 @@ export function deserializeGoal(raw: unknown): GoalState {
       source.compactionBaselineTokens,
     ),
     usage: normalizeUsage(source.usage),
+    lastSessionUsage: normalizeSessionUsageWatermark(source.lastSessionUsage),
     createdAt: toNonNegativeInteger(source.createdAt),
     userCommandStartedAt:
       typeof source.userCommandStartedAt === 'number' &&

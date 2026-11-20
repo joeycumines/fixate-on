@@ -442,7 +442,9 @@ test('exhaustion pauses, persists, announces and resumes the original complete d
     expect(h.announcements[0]).toContain('/goal resume goal-1');
     expect(clock.callbacks.size).toBe(0);
     h.setPrompt(async () => ({}));
-    await h.execute('resume');
+    // Native SessionCommand fills an omitted delivery with "steer" before
+    // invoking the plugin. That default must not rewrite the retained queue.
+    await h.execute('resume', undefined, {delivery: 'steer'});
     expect(h.context.getMachine()?.snapshot().status).toBe('active');
     expect(h.prompts).toHaveLength(5);
     expect(h.prompts[4]).toMatchObject({

@@ -7,7 +7,8 @@ import type {GoalStateMachine} from './state-machine.ts';
 import type {IdleContext, LoopPolicy} from './continuation-loop.ts';
 import {isLowProgressTurn} from './continuation-loop.ts';
 import type {HookDeps, SessionContext} from './hooks-types.ts';
-import {trackTokenUsage} from './hooks-usage.ts';
+import {cumulativeSessionUsageMessage, trackTokenUsage} from './hooks-usage.ts';
+import {isSessionGoneError} from './hooks-errors.ts';
 import {executeDecision} from './hooks-decision.ts';
 import {
   assistantTurnKey,
@@ -55,6 +56,60 @@ export function sleep(ms: number, signal?: AbortSignal): Promise<boolean> {
   });
 }
 
+export async function recordIdleReadFailure(
+  sessionID: string,
+  session: SessionContext,
+  machine: GoalStateMachine,
+  deps: HookDeps,
+  observed: {runId: string; revision: number},
+  error: unknown,
+): Promise<void> {
+  if (deps.runtime?.canDriveSession && !deps.runtime.canDriveSession(sessionID))
+    return;
+  const sessionGone = isSessionGoneError(error);
+  const maxFailures = deps.defaultOpts?.maxPromptFailures ?? 3;
+  let failures = 0;
+  const mutation = await machine.mutate(
+    goal => {
+      if (
+        goal.runId !== observed.runId ||
+        goal.revision !== observed.revision ||
+        (goal.status !== 'active' && !goal.finalizing)
+      )
+        return;
+      failures = ++goal.promptFailures;
+      goal.lastStatus = sessionGone
+        ? "Cannot continue: the goal's session no longer exists."
+        : 'Cannot continue until the host session state can be read.';
+      if (goal.promptFailures >= maxFailures) goal.finalizing = false;
+    },
+    {
+      source: 'idle-handler',
+      detail: 'Session state read failed before continuation',
+      skipPersist: true,
+    },
+  );
+  if (!failures) return;
+  let receipt: string | undefined;
+  if (failures >= maxFailures) {
+    const message = sessionGone
+      ? `The goal's owning session no longer exists; paused after ${failures} failed session reads.`
+      : `The host session state could not be read; paused after ${failures} consecutive failures. Run /${deps.commandName} resume when the host is available.`;
+    const paused = await machine.transition('paused', {
+      source: 'idle-handler',
+      expectedRevision: mutation.revision,
+      stopReason: sessionGone ? 'session not found' : 'auto-continue failures',
+      detail: message,
+    });
+    if (paused.ok) {
+      await machine.addNotice('prompt-failure', message);
+      receipt = message;
+    }
+  }
+  await session.persist();
+  if (receipt) await deps.announceGoalDecision?.(sessionID, receipt);
+}
+
 export async function processIdleEvent(
   sessionID: string,
   session: SessionContext,
@@ -98,6 +153,29 @@ export async function processIdleEvent(
 
   let messages: unknown[] = [];
   try {
+    if (deps.sessionApi.usage) {
+      // On v2, durable totals are projected before experimental.idle, while
+      // the usage event may still be queued behind another session's work.
+      // Refresh every idle path before deciding whether a brake permits work.
+      const usage = cumulativeSessionUsageMessage(
+        sessionID,
+        await deps.sessionApi.usage(sessionID),
+      );
+      runtime?.usageEventsObserved.add(sessionID);
+      const targets = (session.listMachines?.() ?? [machine]).filter(
+        m => !m.isTerminal(),
+      );
+      await trackTokenUsage(
+        sessionID,
+        usage,
+        targets,
+        runtime,
+        session,
+        true,
+        message =>
+          deps.announceGoalDecision?.(sessionID, message) ?? Promise.resolve(),
+      );
+    }
     const hostMessages = await deps.sessionApi.messages(sessionID, {
       limit: deps.defaultOpts?.maxRecentMessages ?? 50,
     });
@@ -105,10 +183,8 @@ export async function processIdleEvent(
       Array.isArray(hostMessages) ? hostMessages : [],
     );
   } catch (error) {
-    await deps.logError(
-      'Failed to fetch session messages for continuation',
-      error,
-    );
+    await deps.logError('Failed to read session state for continuation', error);
+    await recordIdleReadFailure(sessionID, session, machine, deps, goal, error);
     return;
   }
 

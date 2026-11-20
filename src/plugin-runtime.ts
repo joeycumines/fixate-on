@@ -933,6 +933,7 @@ export async function GoalsPlugin(
         runtime.steeredInputMessageIDs.clear();
         runtime.surfacedQueuedMessageIDs.clear();
         runtime.backgroundBlockedUntil.clear();
+        runtime.userInterventions.clear();
         runtime.backgroundDeferrals?.clear();
         runtime.inboxPayloadsByID?.clear();
         for (const controller of runtime.continuationControllers.values())

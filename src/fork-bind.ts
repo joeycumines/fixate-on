@@ -24,6 +24,8 @@ export interface InheritableGoal {
   maxUnchangedResults: number;
   maxBlockedTurns: number;
   languageTriage: boolean;
+  /** An unresolved attachment requirement remains part of the copied intent. */
+  kickoffAdmissionPending?: boolean;
 }
 
 /** Options accepted when creating an inherited goal copy. */
@@ -44,6 +46,7 @@ export interface InheritOptions {
   maxUnchangedResults?: number;
   maxBlockedTurns?: number;
   languageTriage?: boolean;
+  kickoffAdmissionPending?: boolean;
 }
 
 /**
@@ -118,6 +121,10 @@ export function inheritOptionsFrom(goal: InheritableGoal): InheritOptions {
     maxUnchangedResults: goal.maxUnchangedResults,
     maxBlockedTurns: goal.maxBlockedTurns,
     languageTriage: goal.languageTriage,
+    // The in-memory payload belongs to the parent goal and cannot be replayed
+    // for a newly minted goal ID. Keep its durable requirement so the fork
+    // pauses for the original inputs instead of continuing without them.
+    kickoffAdmissionPending: goal.kickoffAdmissionPending === true,
   };
 }
 

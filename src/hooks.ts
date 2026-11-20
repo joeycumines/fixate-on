@@ -20,6 +20,7 @@ import {
 } from './message-helpers.ts';
 import {outputTokensForMessage} from './accounting.ts';
 import {MAX_BACKGROUND_WAIT_MS} from './plugin-v2-helpers.ts';
+import {recordIdleReadFailure} from './hooks-idle.ts';
 import type {HookDeps, PluginHooks, SessionContext} from './hooks-types.ts';
 import {POLL_EVENT_PREFIX} from './hooks-types.ts';
 import {
@@ -196,6 +197,11 @@ export function createHooks(deps: HookDeps): PluginHooks {
         // this process lifetime, preventing resumption of un-opened persisted sessions.
         if (!deps.runtime?.liveSessions.has(sessionID)) continue;
         if (deps.runtime?.promptInFlightSessions.has(sessionID)) continue;
+        if (
+          deps.runtime?.canDriveSession &&
+          !deps.runtime.canDriveSession(sessionID)
+        )
+          continue;
         // A host-reported background job defers idles. The wall-clock deadline
         // is NOT a completion signal — only a later native idle with an empty
         // background authoritatively clears it. On expiry we keep deferring and
@@ -263,9 +269,34 @@ export function createHooks(deps: HookDeps): PluginHooks {
 
         // Quiet-window gate: prompt only after the newest assistant turn has remained
         // unchanged for QUIET_MS to avoid interrupting in-flight turns.
-        const messages = await deps.sessionApi
-          .messages(sessionID, {limit: 5})
-          .catch(() => []);
+        const observedGoals = machines.map(machine => ({
+          machine,
+          goal: machine.snapshot(),
+        }));
+        let messages: unknown[];
+        try {
+          messages = await deps.sessionApi.messages(sessionID, {limit: 5});
+        } catch (error) {
+          // No quiet-window observation was obtained. A failing host read must
+          // not synthesize idle, but it also must not leave an active goal
+          // silently stranded on hosts without a native idle event channel.
+          quietSince.delete(sessionID);
+          await logError(
+            'Failed to read session state during idle polling',
+            error,
+          );
+          for (const {machine, goal} of observedGoals) {
+            await recordIdleReadFailure(
+              sessionID,
+              session,
+              machine,
+              deps,
+              goal,
+              error,
+            );
+          }
+          continue;
+        }
         if (!Array.isArray(messages) || messages.length === 0) continue;
 
         // Host versions return session.messages() in differing orders (v2 is desc,

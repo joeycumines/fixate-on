@@ -206,11 +206,16 @@ export async function handleCommandOutcome(
   if (command.action === 'clear') {
     const requestedRef = command.operand;
     if (requestedRef) {
-      const target = session
-        .listActiveGoals()
-        .find(
-          g => g.goalId === requestedRef || g.goalId.startsWith(requestedRef),
+      const goals = session.listActiveGoals();
+      const exact = goals.find(g => g.goalId === requestedRef);
+      const matches = exact
+        ? [exact]
+        : goals.filter(g => g.goalId.startsWith(requestedRef));
+      if (matches.length > 1)
+        return failOutcome(
+          `"${requestedRef}" matches ${matches.length} goals; use more of the id to clear one.`,
         );
+      const target = matches[0];
       if (!target) {
         return failOutcome(
           `No active goal matching "${requestedRef}" to clear.`,
@@ -342,40 +347,15 @@ export async function handleCommandOutcome(
         `Goal is ${goal.status} (terminal) and cannot be resumed. Run \`/${commandName} clear\` and create a new goal.`,
       );
     }
-    const priorKickoffAdmissionPending = goal.kickoffAdmissionPending;
-    await machine.mutate(
-      g => {
-        g.turnCount = 0;
-        if (options.hasAttachments) g.kickoffAdmissionPending = true;
-        // A fresh window restarts the pressure ladder from r1.
-        g.pressureRung = undefined;
-        // Turn count is reset here; recoveryTurns, unchangedResults, blockedTurns,
-        // and blockedAssertedThisTurn are reset by the transition("active") side effects.
-      },
-      {
-        source: 'slash-command',
-        detail: 'Reset turn count before resume',
-        skipPersist: true,
-      },
-    );
     const resumeResult = await machine.transition('active', {
       source: 'slash-command',
       stopReason: '',
       detail: 'User resumed the goal.',
+      // The marker and budget reset belong to the accepted activation. A
+      // competing resume that loses the transition cannot undo either field.
+      restart: {kickoffAdmissionPending: options.hasAttachments},
     });
     if (!resumeResult.ok) {
-      if (options.hasAttachments) {
-        await machine.mutate(
-          g => {
-            g.kickoffAdmissionPending = priorKickoffAdmissionPending;
-          },
-          {
-            source: 'slash-command',
-            detail: 'Restore kickoff admission marker after failed resume',
-            skipPersist: true,
-          },
-        );
-      }
       return failOutcome(`Failed to resume goal: ${resumeResult.error}`);
     }
     await session.persist();

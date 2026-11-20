@@ -115,6 +115,13 @@ function createV2CommandTestCtx(opts: {
       }),
       get: async (input: Record<string, unknown>) => ({
         id: input.sessionID,
+        cost: 0,
+        tokens: {
+          input: 0,
+          output: 0,
+          reasoning: 0,
+          cache: {read: 0, write: 0},
+        },
       }),
       interrupt: async () => ({}),
       generate: async () => ({}),

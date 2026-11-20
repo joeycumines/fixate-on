@@ -36,9 +36,12 @@
   "include": [
     "src/**/*.ts",
     "src/**/*.tsx",
+    "scripts/**/*.ts",
     "test/**/*.ts",
     "hack/verify-pr-fixes.ts",
     "hack/verify-child-session.ts",
+    "hack/verify-child-permissions.ts",
+    "hack/verify-verifier-context.ts",
     "*.d.ts"
   ],
   "exclude": [

@@ -160,7 +160,17 @@ function toV1PermissionRules(rules: ReadonlyArray<V2PermissionRule>): Array<{
 /** Fallback verifier capability ceiling shaped for the active host SDK. */
 export function verifierCeilingPermissions(
   sdkShape: 'flat' | 'legacy',
+  agentRules: ReadonlyArray<unknown> = [],
 ): Record<string, unknown> {
+  if (agentRules.length > 0) {
+    return buildVerifierChildPermissions(
+      sdkShape === 'legacy'
+        ? {id: 'unavailable-parent', permission: []}
+        : {id: 'unavailable-parent', permissions: []},
+      'unavailable-parent',
+      agentRules,
+    );
+  }
   const rules = VERIFIER_SESSION_PERMISSIONS.map(rule => ({...rule}));
   return sdkShape === 'legacy'
     ? {permission: toV1PermissionRules(rules)}
@@ -194,6 +204,7 @@ function matchesPermissionAction(action: string, pattern: string): boolean {
 export function buildVerifierChildPermissions(
   parent: unknown,
   parentID: string,
+  agentRules: ReadonlyArray<unknown> = [],
 ): Record<string, unknown> {
   if (!parent || typeof parent !== 'object' || Array.isArray(parent)) {
     throw new Error('parent session permission policy is unavailable');
@@ -218,7 +229,10 @@ export function buildVerifierChildPermissions(
     throw new Error('parent session permission policy is malformed');
   }
   const projected: V2PermissionRule[] = [];
-  for (const value of (raw ?? []) as unknown[]) {
+  // Match the host's precedence: resolved agent rules (including config),
+  // followed by session rules. Starting from read:* alone would override
+  // global/project denials when this policy is installed at session level.
+  for (const value of [...agentRules, ...((raw ?? []) as unknown[])]) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       throw new Error('parent session permission rule is malformed');
     }
@@ -243,7 +257,10 @@ export function buildVerifierChildPermissions(
   let restrictedRead = false;
   for (const rule of projected) {
     if (rule.action !== 'read') continue;
-    if (rule.resource === '*' && rule.effect === 'allow') {
+    if (
+      (rule.resource === '*' || rule.resource === '*.env.example') &&
+      rule.effect === 'allow'
+    ) {
       restrictedRead = false;
     } else if (rule.effect !== 'allow') {
       restrictedRead = true;

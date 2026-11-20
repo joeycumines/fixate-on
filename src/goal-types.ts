@@ -75,6 +75,7 @@ export type NoticeKind =
   | 'hard-limit'
   | 'prompt-failure'
   | 'persistence-failure'
+  | 'usage-baseline'
   | 'tool-surface-unavailable'
   | 'background-completion-unreported'
   | 'user-intervention'
@@ -253,6 +254,11 @@ export interface GoalState {
   totalTokens: number;
   compactionBaselineTokens: number;
   usage: UsageSnapshot;
+  /**
+   * Last host cumulative reading charged to this goal. Null means a new goal
+   * has not observed usage; undefined identifies a legacy restored record.
+   */
+  lastSessionUsage?: UsageSnapshot | null;
   createdAt: number;
   /** Native command admission time, before asynchronous goal replacement. */
   userCommandStartedAt?: number;
@@ -365,12 +371,16 @@ export interface GoalState {
 
 export interface TransitionOptions {
   source: TransitionSource;
+  /** Refuse a transition if another semantic mutation won while work was awaited. */
+  expectedRevision?: number;
   stopReason?: string;
   blockedReason?: string;
   detail?: string;
   historyType?: string;
   /** If true, omit calling onCommit (the caller will handle persistence). */
   skipPersist?: boolean;
+  /** Reset the run window atomically with a successful transition to active. */
+  restart?: {kickoffAdmissionPending?: boolean};
 }
 
 export interface TransitionResult {

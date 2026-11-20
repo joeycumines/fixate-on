@@ -26,6 +26,11 @@ export interface V2SessionIdleContext {
   readonly background?: ReadonlyArray<unknown>;
 }
 
+export interface V2SessionPromptContext {
+  readonly sessionID: string;
+  readonly messageID: string;
+}
+
 export interface V2SessionDomain {
   prompt: V2SessionOp;
   synthetic: V2SessionOp;
@@ -39,12 +44,14 @@ export interface V2SessionDomain {
   update?: V2SessionOp;
   wait?: V2SessionOp;
   switchAgent?: V2SessionOp;
-  hook: <N extends 'context' | 'compaction' | 'experimental.idle'>(
+  hook: <N extends 'context' | 'compaction' | 'experimental.idle' | 'prompt'>(
     name: N,
     cb: (
       input: N extends 'experimental.idle'
         ? V2SessionIdleContext
-        : V2SessionContext,
+        : N extends 'prompt'
+          ? V2SessionPromptContext
+          : V2SessionContext,
     ) => Promise<void> | void,
   ) => Promise<{dispose: () => Promise<void>}>;
 }
@@ -143,6 +150,7 @@ export interface V2Context {
     ) => Promise<{dispose: () => Promise<void>}>;
   };
   readonly agent?: {
+    get?: V2SessionOp;
     transform?: (
       cb: (draft: V2AgentDraft) => void,
     ) => Promise<{dispose: () => Promise<void>}>;
@@ -398,6 +406,9 @@ export function hasAssistantReplyContent(response: unknown): boolean {
   const unwrapped = unwrapV2Data(response);
   if (!unwrapped || typeof unwrapped !== 'object') return false;
   const obj = unwrapped as Record<string, unknown>;
+  const info = obj.info as {role?: unknown} | null | undefined;
+  if (obj.type === 'user' || obj.role === 'user' || info?.role === 'user')
+    return false;
   if (Array.isArray(obj.parts) && obj.parts.length > 0) return true;
   if (typeof obj.content === 'string' && obj.content.length > 0) return true;
   if (Array.isArray(obj.content) && obj.content.length > 0) return true;

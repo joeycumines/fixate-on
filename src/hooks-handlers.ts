@@ -136,37 +136,6 @@ export function createChatMessageHook(
       );
     });
 
-    if (
-      !isSynthetic &&
-      deps.runtime?.promptInFlightSessions.has(input.sessionID)
-    ) {
-      try {
-        await deps.sessionApi.abort?.(input.sessionID);
-      } catch {
-        // Best-effort abort; ignore failures.
-      }
-    }
-
-    const session = getSessionContext(input.sessionID);
-    if (!session) return;
-    const machines = sessionMachines(session);
-    if (machines.length === 0) return;
-    const hasRunnable = machines.some(m => {
-      const g = m.snapshot();
-      return g.status === 'active' || g.finalizing;
-    });
-    // Sessions with solely yielding goals still need this message to renew
-    // their yield timeout.
-    const hasYielding = machines.some(m => {
-      const g = m.snapshot();
-      return (
-        g.status === 'paused' &&
-        g.stopReason === USER_INTERVENTION_STOP_REASON &&
-        !m.isTerminal()
-      );
-    });
-    if (!hasRunnable && !hasYielding) return;
-
     if (isSynthetic) return;
 
     const text = getTextFromParts(output?.parts);
@@ -193,6 +162,28 @@ export function createChatMessageHook(
     // Latest user instruction takes precedence session-wide: pause every active goal.
     // Explicit stop directives remain paused; regular text can be re-armed later.
     const explicitStop = isExplicitStopMessage(text);
+    if (deps.runtime?.canDriveSession?.(input.sessionID) === false) return;
+    // Record before any await and before checking for machines. Replacement
+    // removes the old goal before persisting/creating the new one; a stop in
+    // that gap still cancels the older command's eventual activation.
+    deps.runtime?.userInterventions.set(input.sessionID, {
+      stopReason: explicitStop
+        ? 'explicit pause'
+        : USER_INTERVENTION_STOP_REASON,
+    });
+    deps.runtime?.continuationControllers.get(input.sessionID)?.abort();
+    if (deps.runtime?.promptInFlightSessions.has(input.sessionID)) {
+      // Host interruption can wait for a running tool. Pause plugin state
+      // immediately; waiting for that response would keep admission open.
+      void Promise.resolve()
+        .then(() => deps.sessionApi.abort?.(input.sessionID))
+        .catch(() => {});
+    }
+
+    const session = getSessionContext(input.sessionID);
+    if (!session) return;
+    const machines = sessionMachines(session);
+    if (machines.length === 0) return;
     let pausedAny = false;
     for (const machine of machines) {
       const g = machine.snapshot();
@@ -470,6 +461,9 @@ export function createEventHook(
             runtime,
             session,
             true,
+            message =>
+              deps.announceGoalDecision?.(sessionID, message) ??
+              Promise.resolve(),
           );
         }
       } catch (error) {

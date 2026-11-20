@@ -19,6 +19,23 @@ import type {CreateGoalOptions} from '../src/tools.ts';
 
 // Helpers
 
+test('clear refuses an ambiguous goal prefix without removing either goal', async () => {
+  const removedGoalIds: string[] = [];
+  const activeGoals = [
+    makeGoal({goalId: 'shared-first'}),
+    makeGoal({goalId: 'shared-second'}),
+  ];
+  const session = makeSessionContext({activeGoals, removedGoalIds});
+  expect(await handleCommand('clear shared-', session)).toContain(
+    'matches 2 goals',
+  );
+  expect(removedGoalIds).toEqual([]);
+  expect(await handleCommand('clear shared-first', session)).toContain(
+    'Goal cleared:',
+  );
+  expect(removedGoalIds).toEqual(['shared-first']);
+});
+
 function makeUsage(partial: Partial<UsageSnapshot> = {}): UsageSnapshot {
   return {
     input: 1000,

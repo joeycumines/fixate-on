@@ -118,8 +118,13 @@ writeFileSync(
   ),
 );
 
+writeFileSync(join(root, 'models.json'), '{}');
 const env: NodeJS.ProcessEnv = {
-  ...process.env,
+  PATH: process.env.PATH,
+  HOME: process.env.HOME,
+  OPENCODE_DISABLE_MODELS_FETCH: 'true',
+  OPENCODE_DISABLE_AUTOUPDATE: 'true',
+  OPENCODE_MODELS_PATH: join(root, 'models.json'),
   PWD: work,
   MOCK_API_KEY: 'dummy',
   OPENCODE_PASSWORD: 'e2e',
@@ -199,27 +204,22 @@ let receive: (event: {data: unknown}) => void = () => {};
 let activeSession = '';
 const displayed: string[] = [];
 const events: Array<{type: string; data: Record<string, unknown>}> = [];
-const disposeOutput = wireGoalCommandOutput({
-  client: {
-    rpc: () => ({
-      events: {
-        on: (_name, handler) => {
-          receive = handler;
-          return () => {};
-        },
-      },
-    }),
-  },
-  ui: {
-    router: {current: () => ({type: 'session', sessionID: activeSession})},
-    dialog: {
-      alert: async input => {
-        displayed.push(input.message);
+const disposeOutput = wireGoalCommandOutput(
+  {
+    client: {},
+    data: {
+      on: (type, handler) => {
+        if (type === 'rpc.fixate-on-output.output') receive = handler;
+        return () => {};
       },
     },
-    toast: {show: () => {}},
+    ui: {
+      router: {current: () => ({type: 'session', sessionID: activeSession})},
+      toast: {show: () => {}},
+    },
   },
-});
+  text => displayed.push(text),
+);
 const results: Record<string, unknown> = {hostVersion};
 try {
   await until(() => Boolean(baseURL), 'host startup');

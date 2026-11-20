@@ -125,6 +125,11 @@ export interface RuntimeState {
    * Prevents synthesizing idles or re-arming goals for stale sessions from previous runs.
    */
   liveSessions: Set<string>;
+  /** Human steering survives a command's temporary gap with no live goals. */
+  userInterventions: Map<
+    string,
+    {stopReason: 'explicit pause' | 'user intervention'}
+  >;
   pendingIntents: Map<string, PendingIntent>;
   /**
    * Message ids known to arrive as non-interrupting inbox input (delivery
@@ -313,6 +318,7 @@ export function createRuntimeState(): RuntimeState {
     usageEventsObserved: new Set(),
     hasTuiCompanion: false,
     liveSessions: new Set(),
+    userInterventions: new Map(),
     pendingIntents: new Map(),
     queuedInputMessageIDs: new Map(),
     steeredInputMessageIDs: new Map(),

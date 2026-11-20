@@ -48,6 +48,7 @@ function capturingCtx(
     sessionContext?: (
       input: Record<string, unknown>,
     ) => Promise<unknown> | unknown;
+    sessionGet?: (input: Record<string, unknown>) => Promise<unknown> | unknown;
     onPrompt?: (input: Record<string, unknown>) => Promise<unknown> | unknown;
     onSynthetic?: (
       input: Record<string, unknown>,
@@ -88,7 +89,17 @@ function capturingCtx(
         opts?.createdInputs?.push(input);
         return {data: {id: 's1'}};
       },
-      get: async () => ({}),
+      get: async (input: Record<string, unknown>) =>
+        opts?.sessionGet?.(input) ?? {
+          id: input.sessionID,
+          cost: 0,
+          tokens: {
+            input: 0,
+            output: 0,
+            reasoning: 0,
+            cache: {read: 0, write: 0},
+          },
+        },
       interrupt: async () => ({}),
       generate: async () => ({}),
       ...(opts?.sessionContext ? {context: opts.sessionContext} : {}),
@@ -1234,6 +1245,18 @@ test('v2 experimental.idle drives continuation synchronously, respects backgroun
       options: {logLevel: 'error', minDelayMs: 250},
       location: {directory: wsA},
       events: queue.stream,
+      // Durable cumulative totals match the completed first step below; idle
+      // no longer has to infer them from a potentially compacted context window.
+      sessionGet: async input => ({
+        id: input.sessionID,
+        cost: 0,
+        tokens: {
+          input: 200,
+          output: 100,
+          reasoning: 0,
+          cache: {read: 0, write: 0},
+        },
+      }),
       sessionContext: async (input: Record<string, unknown>) =>
         contextMessagesBySession.get(String(input.sessionID ?? '')) ?? [],
       onSynthetic: async (input: Record<string, unknown>) => {

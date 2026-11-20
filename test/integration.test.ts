@@ -1856,7 +1856,10 @@ test('messages fetch failure is logged via logError', async () => {
   });
   expect(errorLogs.length).toBeGreaterThan(0);
   const firstError = errorLogs[0] as {message?: string};
-  expect(firstError?.message).toContain('Failed to fetch session messages');
+  expect(firstError?.message).toContain(
+    'Failed to read session state for continuation',
+  );
+  expect(firstError?.message).toContain('SDK connection failed');
 });
 
 test('compaction resets budgetWrapupSent to allow wrapup on regrowth', async () => {

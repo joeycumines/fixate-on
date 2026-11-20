@@ -320,7 +320,27 @@ function findLastJsonObject(text: string): string | null {
 
 function extractJudgeVerdictText(response: unknown): string {
   if (typeof response === 'string') return response;
-  const r = response as {parts?: unknown[]; data?: {parts?: unknown[]}} | null;
+  type AssistantResponse = {
+    parts?: unknown[];
+    info?: {error?: unknown; finish?: unknown};
+    error?: unknown;
+    finish?: unknown;
+  };
+  const r = response as (AssistantResponse & {data?: AssistantResponse}) | null;
+  // Waiting for idle establishes settlement, not success: the v2 host's
+  // awaitIdle deliberately ignores execution failures. Failed streams can
+  // retain complete-looking text, which is never an attestation.
+  for (const candidate of [r, r?.data]) {
+    const info = candidate?.info ?? candidate;
+    const failure = info?.error;
+    const finish = info?.finish;
+    if (failure != null || finish === 'error' || finish === 'content-filter') {
+      const detail = (failure as {message?: unknown} | null)?.message;
+      throw new Error(
+        `Child assistant failed: ${typeof detail === 'string' ? detail : String(failure ?? finish)}`,
+      );
+    }
+  }
   return getTextFromParts(r?.parts) || getTextFromParts(r?.data?.parts) || '';
 }
 
@@ -454,9 +474,7 @@ export function createChildSessionJudge(
               const latest = findLatestAssistantMessage(
                 Array.isArray(messages) ? messages : [],
               );
-              verdictText = getTextFromParts(
-                (latest as {parts?: unknown[]} | null)?.parts,
-              );
+              verdictText = extractJudgeVerdictText(latest);
             }
           }
           observedVerdict = parseJudgeVerdict(verdictText);
@@ -533,6 +551,16 @@ async function runChildSession<T>(
     client,
     options.sdkShape,
     controller.signal,
+    capabilities?.promptAdmissionHook
+      ? async () => {
+          checkActive();
+          if (!childID) throw new Error('child session id unavailable');
+          const permissions = await readChildPermissions();
+          checkActive();
+          await api.update(childID, permissions);
+          checkActive();
+        }
+      : undefined,
   );
   let childID: string | undefined;
   let timedOut = false;
@@ -542,6 +570,22 @@ async function runChildSession<T>(
     new Error(`${options.label} timed out after ${options.timeoutMs}ms`);
   const checkActive = () => {
     if (timedOut) throw timeoutError();
+  };
+  const readChildPermissions = async (): Promise<Record<string, unknown>> => {
+    const agentRules = api.agentPermissions
+      ? await api.agentPermissions(options.agent)
+      : [];
+    checkActive();
+    if (typeof session.get === 'function') {
+      const parent = await api.get(options.parentID);
+      checkActive();
+      return buildVerifierChildPermissions(
+        parent,
+        options.parentID,
+        agentRules,
+      );
+    }
+    return verifierCeilingPermissions(options.sdkShape, agentRules);
   };
   const cleanup = (): Promise<void> => {
     if (!childID) return Promise.resolve();
@@ -617,17 +661,16 @@ async function runChildSession<T>(
       // read-only ceiling. When the host exposes session.get, propagate lookup
       // or validation failures (fail closed) rather than widening beyond parent
       // denials; only fall back to the ceiling when session.get is absent.
-      let childPermissions: Record<string, unknown>;
-      if (typeof session.get === 'function') {
-        const parent = await api.get(options.parentID);
-        checkActive();
-        childPermissions = buildVerifierChildPermissions(
-          parent,
-          options.parentID,
-        );
-      } else {
-        childPermissions = verifierCeilingPermissions(options.sdkShape);
-      }
+      const policy = await readChildPermissions();
+      // v2 activation can still be applying configuration when recovery starts.
+      // Keep the child inert until the post-activation prompt hook installs the
+      // freshly resolved policy. Even a host that skips the hook cannot grant
+      // read access using an incomplete policy captured during startup.
+      const childPermissions = capabilities?.promptAdmissionHook
+        ? Object.hasOwn(policy, 'permissions')
+          ? {permissions: [{action: '*', resource: '*', effect: 'deny'}]}
+          : {permission: [{permission: '*', pattern: '*', action: 'deny'}]}
+        : policy;
       value = await work({
         api,
         checkActive,
@@ -687,8 +730,14 @@ function createSessionApiForJudge(
   client: unknown,
   sdkShape: 'flat' | 'legacy',
   signal?: AbortSignal,
+  beforePromptAdmission?: () => Promise<void>,
 ): OpenCodeSessionApi {
-  return createOpenCodeSessionApi(client, {preferredShape: sdkShape, signal});
+  return createOpenCodeSessionApi(client, {
+    preferredShape: sdkShape,
+    signal,
+    requireFreshMessages: true,
+    beforePromptAdmission,
+  });
 }
 
 export interface VerifierOptions {
@@ -821,9 +870,7 @@ export function createChildSessionVerifier(
             const latest = findLatestAssistantMessage(
               Array.isArray(messages) ? messages : [],
             );
-            verdictText = getTextFromParts(
-              (latest as {parts?: unknown[]} | null)?.parts,
-            );
+            verdictText = extractJudgeVerdictText(latest);
           }
           // The host can move a session while its turn is running. Validate
           // again before returning an attestation about this workspace.

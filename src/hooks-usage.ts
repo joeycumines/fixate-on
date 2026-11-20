@@ -7,13 +7,13 @@ import type {RuntimeState} from './session-state-manager.ts';
 import type {SessionContext, TerminalEventInfo} from './hooks-types.ts';
 import {getMessageID} from './message-helpers.ts';
 import {
-  addToUsageField,
   addUsageDelta,
   emptyUsage,
   normalizeMessageUsage,
   outputTokensForMessage,
   totalTokensForMessage,
   USAGE_TOKEN_FIELDS,
+  type UsageSnapshot,
 } from './accounting.ts';
 
 export function detectTerminalEvent(event: unknown): TerminalEventInfo | null {
@@ -80,6 +80,61 @@ export function messageInfoFromEvent(
   return null;
 }
 
+/**
+ * Validate a fresh host session read before trusting its cumulative totals.
+ * A malformed/failed lookup must stop this idle attempt, not look like zero use.
+ */
+export function cumulativeSessionUsageMessage(
+  sessionID: string,
+  value: unknown,
+): Record<string, unknown> {
+  const info = value as {
+    id?: unknown;
+    tokens?: {
+      input?: unknown;
+      output?: unknown;
+      reasoning?: unknown;
+      cache?: {read?: unknown; write?: unknown};
+    };
+    cost?: unknown;
+  } | null;
+  const tokens = info?.tokens;
+  const values = [
+    tokens?.input,
+    tokens?.output,
+    tokens?.reasoning,
+    tokens?.cache?.read,
+    tokens?.cache?.write,
+    info?.cost,
+  ];
+  if (
+    info?.id !== sessionID ||
+    values.some(
+      value =>
+        typeof value !== 'number' || !Number.isFinite(value) || value < 0,
+    )
+  ) {
+    throw new Error(
+      'Host cumulative session usage is unavailable or malformed',
+    );
+  }
+  return {
+    id: `${sessionID}#usage`,
+    role: 'assistant',
+    info: {tokens, cost: info.cost},
+  };
+}
+
+interface CumulativeUsageUpdate {
+  changed: boolean;
+  notices: string[];
+}
+
+const cumulativeUsageUpdates = new WeakMap<
+  RuntimeState,
+  Map<string, Promise<CumulativeUsageUpdate>>
+>();
+
 export async function trackTokenUsage(
   sessionID: string,
   message: Record<string, unknown>,
@@ -87,12 +142,97 @@ export async function trackTokenUsage(
   runtime: RuntimeState | undefined,
   session?: SessionContext,
   sessionScopedUsage = false,
+  announceMigration?: (message: string) => Promise<void>,
 ): Promise<void> {
   if (!runtime || machines.length === 0) return;
+  if (!sessionScopedUsage) {
+    await trackTokenUsageNow(message, machines, runtime, session);
+    return;
+  }
+
+  // The native idle hook and the subscribed event stream can observe the same
+  // running totals concurrently. Serialize the in-memory delta and baseline
+  // update per session. Persistence happens after releasing this queue, so a
+  // delayed write does not prevent the next idle from reading newer totals.
+  let sessions = cumulativeUsageUpdates.get(runtime);
+  if (!sessions) {
+    sessions = new Map();
+    cumulativeUsageUpdates.set(runtime, sessions);
+  }
+  const previous = sessions.get(sessionID) ?? Promise.resolve();
+  const update = previous
+    .catch(() => {})
+    .then(() => trackCumulativeUsage(sessionID, message, machines, runtime));
+  sessions.set(sessionID, update);
+  let result: CumulativeUsageUpdate;
+  try {
+    result = await update;
+  } finally {
+    if (sessions.get(sessionID) === update) sessions.delete(sessionID);
+  }
+  if (result.changed && session) await session.persist();
+  for (const notice of result.notices) await announceMigration?.(notice);
+}
+
+function mergeCumulativeUsage(
+  target: UsageSnapshot,
+  source: UsageSnapshot,
+): void {
+  for (const field of USAGE_TOKEN_FIELDS) {
+    target[field] = Math.max(target[field], source[field]);
+  }
+  target.cost = Math.max(target.cost, source.cost);
+  target.costKnown ||= source.costKnown;
+}
+
+async function trackCumulativeUsage(
+  sessionID: string,
+  message: Record<string, unknown>,
+  machines: GoalStateMachine[],
+  runtime: RuntimeState,
+): Promise<CumulativeUsageUpdate> {
+  const previous = {
+    ...(runtime.seenSessionUsage.get(sessionID) ?? emptyUsage()),
+  };
+  // A restored goal can have a newer persisted watermark than the event stream
+  // or this process's empty cache. It also supplies the prior session baseline
+  // for goals created after restoration, preserving late-join accounting.
+  for (const machine of machines) {
+    const saved = machine.state.lastSessionUsage;
+    if (saved) mergeCumulativeUsage(previous, saved);
+  }
+  const current = normalizeMessageUsage(message);
+  mergeCumulativeUsage(current, previous);
+  let changed = false;
+  const notices: string[] = [];
+  for (const machine of machines) {
+    if (machine.isTerminal()) continue;
+    const result = await machine.updateCumulativeUsage(current, previous);
+    changed ||= result.changed;
+    if (result.migrationNotice) notices.push(result.migrationNotice);
+  }
+  const id = `${sessionID}#usage`;
+  runtime.seenSessionUsage.set(sessionID, current);
+  runtime.seenUsage.set(id, current);
+  runtime.seenTokens.set(
+    id,
+    USAGE_TOKEN_FIELDS.reduce((total, field) => total + current[field], 0),
+  );
+  runtime.seenOutputTokens.set(id, current.output);
+  return {changed, notices};
+}
+
+async function trackTokenUsageNow(
+  message: Record<string, unknown>,
+  machines: GoalStateMachine[],
+  runtime: RuntimeState | undefined,
+  session?: SessionContext,
+): Promise<boolean> {
+  if (!runtime || machines.length === 0) return false;
 
   // Extract the message ID supporting both v2 (flat info) and v1 (nested info) envelopes.
   const currentMessageID = getMessageID(message);
-  if (!currentMessageID) return;
+  if (!currentMessageID) return false;
 
   const seenMessage = runtime.seenTokens.has(currentMessageID);
   let changed = false;
@@ -109,54 +249,8 @@ export async function trackTokenUsage(
     ) || currentUsage.cost !== previousUsage.cost;
 
   for (const machine of machines) {
-    // For cumulative session events (`session.usage.updated`), incoming metrics
-    // represent session running totals. Goals must be charged only the delta
-    // since the prior reading to prevent polynomial growth.
-    if (sessionScopedUsage) {
-      const prevSession =
-        runtime.seenSessionUsage.get(sessionID) ?? emptyUsage();
-      if (usageChanged) {
-        for (const field of USAGE_TOKEN_FIELDS) {
-          const delta = Math.max(0, currentUsage[field] - prevSession[field]);
-          if (delta > 0)
-            await machine.updateUsage(
-              addToUsageField(machine.state.usage, field, delta),
-            );
-        }
-        const costDelta = Math.max(0, currentUsage.cost - prevSession.cost);
-        if (costDelta > 0) {
-          await machine.updateUsage({
-            ...machine.state.usage,
-            cost: machine.state.usage.cost + costDelta,
-            costKnown: true,
-          });
-        }
-        changed = true;
-      }
-      if (currentTokens > (runtime.seenTokens.get(currentMessageID) ?? 0)) {
-        await machine.mutate(
-          g => {
-            g.totalTokens = Math.max(g.totalTokens, currentTokens);
-          },
-          {
-            source: 'idle-handler',
-            detail: 'Updated total tokens',
-            skipPersist: true,
-            skipRevision: true,
-          },
-        );
-        changed = true;
-      }
-      continue;
-    }
-
     // Late-joiner guard: do not back-charge messages processed prior to goal creation.
-    // Session-scoped usage events are exempt as they represent shared ongoing spend.
-    if (
-      !sessionScopedUsage &&
-      seenMessage &&
-      !machine.state.messageIDs.has(currentMessageID)
-    )
+    if (seenMessage && !machine.state.messageIDs.has(currentMessageID))
       continue;
 
     if (usageChanged) {
@@ -214,10 +308,7 @@ export async function trackTokenUsage(
     }
   }
 
-  if (!changed) return;
-
-  // Cache running session usage so subsequent events charge only new increments.
-  if (sessionScopedUsage) runtime.seenSessionUsage.set(sessionID, currentUsage);
+  if (!changed) return false;
 
   runtime.seenUsage.set(currentMessageID, currentUsage);
   if (currentTokens > previousTokens) {
@@ -230,4 +321,5 @@ export async function trackTokenUsage(
   if (session) {
     await session.persist();
   }
+  return true;
 }

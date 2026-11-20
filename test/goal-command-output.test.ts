@@ -158,29 +158,18 @@ describe('TUI command output', () => {
     const toasts: Array<{sessionID: string; message: string}> = [];
     let unsubscribed = 0;
     const context: GoalOutputTuiContext = {
-      client: {
-        rpc: definition => {
-          expect(definition).toEqual(GOAL_OUTPUT_RPC);
-          return {
-            events: {
-              on: (name, handler) => {
-                expect(name).toBe('output');
-                receive = handler;
-                return () => {
-                  unsubscribed++;
-                };
-              },
-            },
+      client: {},
+      data: {
+        on: (name, handler) => {
+          if (name === 'rpc.fixate-on-output.output') receive = handler;
+          else expect(name).toBe('server.connected');
+          return () => {
+            unsubscribed++;
           };
         },
       },
       ui: {
         router: {current: () => ({type: 'session', sessionID: 'one'})},
-        dialog: {
-          alert: async input => {
-            alerts.push(input.message);
-          },
-        },
         toast: {
           show: input => {
             toasts.push(input);
@@ -188,7 +177,7 @@ describe('TUI command output', () => {
         },
       },
     };
-    const dispose = wireGoalCommandOutput(context);
+    const dispose = wireGoalCommandOutput(context, text => alerts.push(text));
     const output: GoalCommandOutput = {
       id: 'receipt',
       sessionID: 'one',
@@ -214,7 +203,7 @@ describe('TUI command output', () => {
     dispose();
     receive({data: {...output, id: 'late'}});
     expect(alerts).toHaveLength(1);
-    expect(unsubscribed).toBe(1);
+    expect(unsubscribed).toBe(2);
   });
 
   test('malformed output is rejected at the display boundary', () => {
@@ -232,6 +221,101 @@ describe('TUI command output', () => {
     ]) {
       expect(parseGoalCommandOutput(input)).toBeNull();
     }
+  });
+
+  test('recovers a missed receipt on reconnect and deduplicates its live event', async () => {
+    const handlers = new Map<string, (event: unknown) => void>();
+    const pending: Array<(value: unknown) => void> = [];
+    const receipts: string[] = [];
+    const dispose = wireGoalCommandOutput(
+      {
+        client: {
+          rpc: definition => {
+            expect(definition).toEqual(GOAL_OUTPUT_RPC);
+            return {
+              latest: input => {
+                expect(input).toEqual({sessionID: 'one'});
+                return new Promise(resolve => pending.push(resolve));
+              },
+            };
+          },
+        },
+        data: {
+          on: (type, handler) => {
+            handlers.set(type, handler);
+            return () => handlers.delete(type);
+          },
+        },
+        ui: {
+          router: {current: () => ({type: 'session', sessionID: 'one'})},
+          toast: {show: () => {}},
+        },
+      },
+      text => receipts.push(text),
+    );
+    const output = {
+      id: 'missed',
+      sessionID: 'one',
+      text: 'Recovered receipt',
+      kind: 'command',
+      timestamp: 1,
+    };
+    pending.shift()!(null);
+    await Promise.resolve();
+    handlers.get('server.connected')!({type: 'server.connected'});
+    pending.shift()!(output);
+    await Promise.resolve();
+    handlers.get('rpc.fixate-on-output.output')!({data: output});
+    expect(receipts).toEqual(['Recovered receipt']);
+    dispose();
+    expect(handlers.size).toBe(0);
+  });
+
+  test('a delayed replay cannot replace a live receipt or display after disposal', async () => {
+    const handlers = new Map<string, (event: unknown) => void>();
+    const pending: Array<(value: unknown) => void> = [];
+    const receipts: string[] = [];
+    const dispose = wireGoalCommandOutput(
+      {
+        client: {
+          rpc: () => ({
+            latest: () => new Promise(resolve => pending.push(resolve)),
+          }),
+        },
+        data: {
+          on: (type, handler) => {
+            handlers.set(type, handler);
+            return () => handlers.delete(type);
+          },
+        },
+        ui: {
+          router: {current: () => ({type: 'session', sessionID: 'one'})},
+          toast: {show: () => {}},
+        },
+      },
+      text => receipts.push(text),
+    );
+    const output = {
+      id: 'new',
+      sessionID: 'one',
+      text: 'Current receipt',
+      kind: 'command',
+      timestamp: 2,
+    };
+    handlers.get('rpc.fixate-on-output.output')!({data: output});
+    pending.shift()!({
+      ...output,
+      id: 'old',
+      text: 'Stale receipt',
+      timestamp: 1,
+    });
+    await Promise.resolve();
+    expect(receipts).toEqual(['Current receipt']);
+    handlers.get('server.connected')!({});
+    dispose();
+    pending.shift()!({...output, id: 'late', text: 'After disposal'});
+    await Promise.resolve();
+    expect(receipts).toEqual(['Current receipt']);
   });
 
   test('disposes late rpc.register resolution if dispose raced it', async () => {
@@ -260,49 +344,51 @@ describe('TUI command output', () => {
     expect(disposedCount).toBe(1);
   });
 
-  test('wireGoalCommandOutput survives partial/throwing rpc and throwing UI callbacks', () => {
-    const partialDispose = wireGoalCommandOutput({
-      client: {rpc: () => ({}) as never},
-      ui: {
-        router: {current: () => ({type: 'session', sessionID: 'one'})},
-        dialog: {alert: async () => {}},
-        toast: {show: () => {}},
+  test('wireGoalCommandOutput survives unavailable data and throwing UI callbacks', () => {
+    const partialDispose = wireGoalCommandOutput(
+      {
+        client: {},
+        data: {} as never,
+        ui: {
+          router: {current: () => ({type: 'session', sessionID: 'one'})},
+          toast: {show: () => {}},
+        },
       },
-    });
+      () => {},
+    );
     expect(() => partialDispose()).not.toThrow();
 
     let receive: (event: {data: unknown}) => void = () => {};
     let throwFirst = true;
     const toasts: string[] = [];
-    const dispose = wireGoalCommandOutput({
-      client: {
-        rpc: () => ({
-          events: {
-            on: (_name, handler) => {
-              receive = handler;
-              return () => {};
+    const dispose = wireGoalCommandOutput(
+      {
+        client: {},
+        data: {
+          on: (name, handler) => {
+            if (name === 'rpc.fixate-on-output.output') receive = handler;
+            return () => {};
+          },
+        },
+        ui: {
+          router: {
+            current: () => {
+              if (throwFirst) {
+                throwFirst = false;
+                throw new Error('router unavailable');
+              }
+              return {type: 'other'};
             },
           },
-        }),
-      },
-      ui: {
-        router: {
-          current: () => {
-            if (throwFirst) {
-              throwFirst = false;
-              throw new Error('router unavailable');
-            }
-            return {type: 'other'};
-          },
-        },
-        dialog: {alert: async () => {}},
-        toast: {
-          show: input => {
-            toasts.push(input.message);
+          toast: {
+            show: input => {
+              toasts.push(input.message);
+            },
           },
         },
       },
-    });
+      () => {},
+    );
     expect(() =>
       receive({
         data: {

@@ -449,6 +449,9 @@ export function createKickoffWiring(args: {
     },
   ): Promise<SlashCommandResult> => {
     const userCommandStartedAt = options?.userCommandStartedAt ?? Date.now();
+    const interventionAtStart = runtime.userInterventions.get(
+      input?.sessionID ?? '',
+    );
     const emptyResult = (
       overrides: Partial<SlashCommandResult>,
     ): SlashCommandResult => ({
@@ -536,6 +539,25 @@ export function createKickoffWiring(args: {
         hasAttachments: options?.hasAttachments,
         userCommandStartedAt,
       });
+      const intervention = runtime.userInterventions.get(sessionID);
+      if (outcome.ok && intervention !== interventionAtStart && intervention) {
+        const target = outcome.targetGoalId
+          ? session.getMachineById?.(outcome.targetGoalId)
+          : null;
+        if (target?.snapshot().status === 'active') {
+          const paused = await target.transition('paused', {
+            source: 'chat-message',
+            stopReason: intervention.stopReason,
+            detail:
+              'A human message arrived while the goal command was being saved; kickoff cancelled.',
+          });
+          if (paused.ok) {
+            await session.persist();
+            outcome.text +=
+              '\nGoal paused because a newer human message arrived before kickoff.';
+          }
+        }
+      }
       const text = outcome.text;
       const afterCommand = session.getMachine()?.snapshot() ?? null;
       const {receipt, changed: dispatchChanged} = await transitionReceipt(

@@ -169,11 +169,18 @@ headless environments.
 
 The server registers the `fixate-on-output` RPC. Its `output` event carries
 `{id, sessionID, text, kind, timestamp}`; `kind` is `command` or `notice`.
-The v2 companion subscribes through `client.rpc(...).events.on('output', ...)`.
-It displays the full command receipt in a dialog when that session is open,
-and shows a session-scoped toast for other sessions or notices. Repeated receipt
-IDs are ignored. Command receipts never call `session.prompt` or
-`session.synthetic`: both admit model input on the verified OpenCode v2.2.7 host.
+The v2 companion subscribes through the host's reconnecting
+`context.data.on('rpc.fixate-on-output.output', ...)` event feed. It requests the
+latest receipt for the open session at startup and after `server.connected`;
+a delayed replay cannot replace a newer live receipt. Repeated receipt IDs are
+ignored.
+
+For the open session, command receipts use a scrollable dialog that keeps the
+full text available as the terminal resizes. Use `up`/`down`,
+`pageup`/`pagedown`, `home`/`end`, or the mouse wheel to scroll; `escape` or
+`enter` closes the viewer. Other sessions and notices use session-scoped toasts.
+Command receipts never call `session.prompt` or `session.synthetic`: both admit
+model input on the verified OpenCode v2.2.7 host.
 
 A headless client can consume the event `rpc.fixate-on-output.output` on the
 host's event stream. After a missed event it can request the latest receipt:
@@ -403,9 +410,15 @@ requires the lag documented with numbers rather than left implicit.
 | `src/tui-disk-state.ts` | Enumerates and reads every session's persisted goal state | `fs-portable.ts` (the bounded, symlink-refusing read), `session-paths.ts` (the layout), `state-machine.ts`, `tui-state.ts` |
 | `src/tui-companion-refresh.ts` | v1 disk refresh loop | `tui-disk-state.ts`, `tui-state.ts` |
 | `src/tui.ts` | v1 TUI companion entrypoint | `tui-action-labels.ts`, `tui-companion-refresh.ts`, `tui-components.ts`, `tui-disk-state.ts`, `tui-sound.ts`, `tui-state.ts`, `tui-toast-policy.ts`, `tui-views.ts`, plus `@opencode-ai/plugin` and `@opencode-ai/plugin/tui` |
-| `src/tui-v2.ts` | v2 TUI companion entrypoint | `tui-action-labels.ts`, `tui-components.ts`, `tui-dashboard-route.tsx`, `tui-disk-state.ts`, `tui-state.ts`, `tui-v2-command-output.ts`, `tui-v2-events.ts`, `tui-views.ts` |
+| `src/tui-v2.ts` | v2 TUI companion entrypoint | `tui-action-labels.ts`, `tui-components.ts`, `tui-dashboard-route.tsx`, `tui-disk-state.ts`, `tui-state.ts`, `tui-v2-command-output.ts`, `tui-v2-events.ts`, `tui-v2-receipt-dialog.tsx`, `tui-views.ts` |
 | `src/tui-v2-command-output.ts` | Passive native command receipts and notices | `plugin-v2-command-output.ts`, `tui-components.ts` |
+| `src/tui-v2-receipt-dialog.tsx` | Scrollable native command receipt viewer | `tui-dashboard-route.tsx`, `tui-components.ts`, host Solid/OpenTUI modules |
 | `src/tui-v2-events.ts` | v2 event-driven truth channels: disk-refresh loop, curated toasts, briefing, tool-metadata subscription | `state-machine.ts`, `tui-action-labels.ts`, `tui-companion-refresh.ts`, `tui-components.ts`, `tui-sound.ts`, `tui-state.ts`, `tui-toast-policy.ts` |
+
+The bundle script (`scripts/bundle.ts`) applies the OpenTUI Solid compiler to
+JSX before bundling. This preserves reactive theme colors, dashboard state, and
+receipt layout on resize; plain JSX compilation does not provide those updates.
+Solid and OpenTUI remain external modules supplied by the 2.x host.
 
 ## Host API Requirements
 

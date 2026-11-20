@@ -75,6 +75,8 @@ export async function registerV2GoalCommandBridge(
             const userCommandStartedAt = Date.now();
             const {sessionID, rawArgs, prompt, hasAttachments, delivery} =
               validateV2CommandExecutionInput(input);
+            const interventionAtStart =
+              hooks.runtime?.userInterventions.get(sessionID);
             if (!rawArgs && hasAttachments) {
               throw new Error(
                 `No objective provided. Use \`/${commandName} <condition>\` to set a goal.`,
@@ -163,6 +165,9 @@ export async function registerV2GoalCommandBridge(
                 hasAttachments,
                 commandName,
                 res,
+                cancelledByHuman:
+                  runtime.userInterventions.get(sessionID) !==
+                  interventionAtStart,
                 canDriveSession: hooks.runtime?.canDriveSession?.(sessionID),
               });
               logV2DiagnosticEvent(
@@ -242,11 +247,13 @@ export async function registerV2GoalCommandBridge(
                 tuiMetadataKey: GOAL_TUI_METADATA_KEY,
                 prompt: mergedPrompt,
                 hasAttachments: carriesAttachments,
+                // The host fills an omitted command delivery with "steer".
+                // A resume is a retry of the retained admission, so that
+                // default must not turn a queued payload into an interruption.
                 delivery:
-                  delivery ??
-                  (typeof previousPayload?.delivery === 'string'
+                  typeof previousPayload?.delivery === 'string'
                     ? previousPayload.delivery
-                    : undefined),
+                    : delivery,
                 resolvedAgent: inherited
                   ? stripAgentListSortPrefix(inherited)
                   : undefined,
@@ -277,17 +284,32 @@ export async function registerV2GoalCommandBridge(
                     'Kickoff admission persistence is unavailable.',
                   );
                 await runtime.prepareKickoffAdmission(sessionID, pending);
-                const beforeAdmission = runtime.sessionGoals
+                const beforeAdmissionMachine = runtime.sessionGoals
                   .get(sessionID)
-                  ?.find(m => m.snapshot().goalId === live.goalId)
-                  ?.snapshot();
+                  ?.find(m => m.snapshot().goalId === live.goalId);
+                const beforeAdmission = beforeAdmissionMachine?.snapshot();
+                const intervention = runtime.userInterventions.get(sessionID);
+                if (
+                  intervention !== interventionAtStart &&
+                  intervention &&
+                  beforeAdmission?.status === 'active' &&
+                  beforeAdmission.runId === live.runId
+                ) {
+                  await beforeAdmissionMachine!.transition('paused', {
+                    source: 'chat-message',
+                    stopReason: intervention.stopReason,
+                    detail:
+                      'A newer human message cancelled kickoff admission.',
+                  });
+                }
                 if (
                   runtime.canDriveSession?.(sessionID) === false ||
                   runtime.pendingKickoffDispatch
                     ?.get(sessionID)
                     ?.get(live.goalId) !== pending ||
                   beforeAdmission?.status !== 'active' ||
-                  beforeAdmission.runId !== live.runId
+                  beforeAdmission.runId !== live.runId ||
+                  intervention !== interventionAtStart
                 )
                   throw new Error(
                     'Goal changed before kickoff admission; no prompt was sent.',

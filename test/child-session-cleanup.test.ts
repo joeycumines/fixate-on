@@ -205,6 +205,8 @@ describe('verifier child cleanup is part of the outcome', () => {
               status,
               headers: {'content-type': 'application/json'},
             });
+          if (request.method === 'GET' && path === '/agent')
+            return json([{name: 'goal-verify', permission: []}]);
           if (request.method === 'DELETE')
             return json(
               {
@@ -257,6 +259,7 @@ describe('verifier child cleanup is part of the outcome', () => {
     const {client, calls} = host();
     const shim = createV2ClientShim(
       {
+        agent: {get: async () => ({id: 'goal-verify', permissions: []})},
         session: {
           ...client.session,
           switchAgent: async () => {},
@@ -281,10 +284,24 @@ describe('verifier child cleanup is part of the outcome', () => {
     const {client, calls} = host();
     let selected = 'build';
     const events: string[] = [];
+    let admission: ((event: {sessionID: string}) => Promise<void>) | undefined;
     const shim = createV2ClientShim(
       {
+        agent: {get: async () => ({id: 'goal-verify', permissions: []})},
         session: {
           ...client.session,
+          hook: async (
+            _name: string,
+            callback: (event: {sessionID: string}) => Promise<void>,
+          ) => {
+            admission = callback;
+            return {
+              dispose: async () => {
+                admission = undefined;
+              },
+            };
+          },
+          update: async () => {},
           switchAgent: async ({agent}: {agent: string}) => {
             selected = agent;
             events.push(`select:${agent}`);
@@ -301,6 +318,7 @@ describe('verifier child cleanup is part of the outcome', () => {
             };
           },
           prompt: async () => {
+            await admission?.({sessionID: child.id});
             events.push(`prompt:${selected}`);
             return reply;
           },
@@ -323,6 +341,7 @@ describe('verifier child cleanup is part of the outcome', () => {
     const {client, calls} = host();
     const shim = createV2ClientShim(
       {
+        agent: {get: async () => ({id: 'goal-verify', permissions: []})},
         session: {
           ...client.session,
           switchAgent: async () => {},
@@ -431,6 +450,7 @@ describe('timeout and cleanup ownership', () => {
     let selectedAgent: string | undefined;
     const shim = createV2ClientShim(
       {
+        agent: {get: async () => ({id: 'goal-verify', permissions: []})},
         session: {
           ...client.session,
           get: async (arg: unknown) =>

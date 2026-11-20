@@ -97,10 +97,14 @@ export function createV2ClientShim(
 
   // Regular prompt used for synchronous turns such as child-session verifiers.
   // On v2.2.7, session.prompt admits input and runs asynchronously; wait for idle
-  // when no assistant reply parts are present and the host exposes session.wait.
+  // when no synchronous assistant reply is present. Without that barrier, a fresh
+  // context read could still contain an interim verdict from an unfinished turn.
   const prompt = async (
     input: Record<string, unknown>,
-    options?: {signal?: AbortSignal},
+    options?: {
+      signal?: AbortSignal;
+      beforeAdmission?: () => Promise<void>;
+    },
   ): Promise<unknown> => {
     options?.signal?.throwIfAborted();
     const translated = v1PartsToV2Text(input);
@@ -109,18 +113,51 @@ export function createV2ClientShim(
       await selectAgent(targetSessionID, translated.agent);
     }
     options?.signal?.throwIfAborted();
-    const res = await session.prompt({
-      sessionID: targetSessionID,
-      text: translated.text,
-      ...(translated.metadata ? {metadata: translated.metadata} : {}),
-      ...(translated.agent ? {agent: translated.agent} : {}),
-    });
+    let admissionHook: {dispose: () => Promise<void>} | undefined;
+    let admissionChecked = false;
+    let res: unknown;
+    try {
+      if (options?.beforeAdmission) {
+        if (
+          typeof session.hook !== 'function' ||
+          typeof session.update !== 'function'
+        ) {
+          throw new Error(
+            'Child policy refresh before prompt admission is unavailable on this host.',
+          );
+        }
+        // OpenCode 2.2.7 applies config through later plugin transforms. Its
+        // prompt hook runs after activation, before the input enters the inbox.
+        // A policy read during setup or automatic recovery can be incomplete.
+        admissionHook = await session.hook('prompt', async event => {
+          if (event.sessionID !== targetSessionID) return;
+          options.signal?.throwIfAborted();
+          await options.beforeAdmission!();
+          options.signal?.throwIfAborted();
+          admissionChecked = true;
+        });
+      }
+      options?.signal?.throwIfAborted();
+      res = await session.prompt({
+        sessionID: targetSessionID,
+        text: translated.text,
+        ...(translated.metadata ? {metadata: translated.metadata} : {}),
+        ...(translated.agent ? {agent: translated.agent} : {}),
+      });
+      if (options?.beforeAdmission && !admissionChecked)
+        throw new Error('Host did not run the child policy admission hook.');
+    } finally {
+      // Keep the hook until the actual host call settles, even if the outer
+      // verifier deadline wins. A late admission must still see cancellation.
+      await admissionHook?.dispose();
+    }
     options?.signal?.throwIfAborted();
-    if (
-      !hasAssistantReplyContent(res) &&
-      targetSessionID &&
-      typeof session.wait === 'function'
-    ) {
+    if (!hasAssistantReplyContent(res)) {
+      if (!targetSessionID || typeof session.wait !== 'function') {
+        throw new Error(
+          'Session completion wait is unavailable for asynchronous prompt admission.',
+        );
+      }
       const waitPromise = Promise.resolve(
         session.wait({sessionID: targetSessionID}),
       );
@@ -149,6 +186,9 @@ export function createV2ClientShim(
       } else {
         await waitPromise;
       }
+      // Admission is user input, even if a host includes text parts on it.
+      // The verifier must obtain the completed assistant reply from context.
+      return {};
     }
     return res;
   };
@@ -230,7 +270,10 @@ export function createV2ClientShim(
     return res ?? {};
   };
 
-  const messages: V2SessionOp = async input => {
+  const readMessages = async (
+    input: Record<string, unknown>,
+    requireFresh = false,
+  ): Promise<unknown[]> => {
     const sessionID = extractV2SessionIDArg(input);
     const rawLimit =
       (input as {limit?: unknown; query?: {limit?: unknown}})?.limit ??
@@ -244,10 +287,15 @@ export function createV2ClientShim(
         const unwrapped = unwrapV2Data(ctxResult);
         if (Array.isArray(unwrapped)) {
           rawList = unwrapped;
+        } else if (requireFresh) {
+          throw new Error('Fresh session context did not contain messages.');
         }
-      } catch {
+      } catch (error) {
+        if (requireFresh) throw error;
         /* fall back to pre-turn buffer if context endpoint is unavailable */
       }
+    } else if (requireFresh) {
+      throw new Error('Fresh session context is unavailable on this host.');
     }
     const sourceList = rawList ?? buffer.bySession.get(sessionID) ?? [];
     const normalized = markRecentKickoffMessages(
@@ -266,12 +314,32 @@ export function createV2ClientShim(
         : 0;
     return normalized.slice(start);
   };
+  const messages: V2SessionOp = input => readMessages(input);
 
   return {
     sessionCapabilities: {
       deleteSession: typeof session.remove === 'function',
       promptAbortSignal: true,
+      promptAdmissionHook: true,
+      readCumulativeUsage: sessionID => get({sessionID}),
       selectAgent,
+      readFreshMessages: (sessionID, options) =>
+        readMessages({sessionID, ...options}, true),
+      readAgentPermissions: async agent => {
+        if (typeof ctx.agent?.get !== 'function')
+          throw new Error(
+            'Resolved agent permission policy is unavailable on this host.',
+          );
+        const info = unwrapV2Data(await ctx.agent.get({agentID: agent})) as {
+          id?: unknown;
+          permissions?: unknown;
+        } | null;
+        if (info?.id !== agent || !Array.isArray(info.permissions))
+          throw new Error(
+            `Resolved permission policy for agent ${agent} is unavailable.`,
+          );
+        return info.permissions;
+      },
     },
     session: {
       promptAsync,
@@ -698,7 +766,9 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
             goalAgentName,
             verifierAgentName,
             registerAgents: pluginOptions.registerAgents !== false,
-            requireVerifierOwnership: pluginOptions.childSessionJudge !== false,
+            requireVerifierOwnership:
+              pluginOptions.childSessionJudge !== false &&
+              typeof pluginOptions.judge !== 'function',
           },
         ),
       );

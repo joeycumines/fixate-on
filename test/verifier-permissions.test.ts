@@ -1,7 +1,10 @@
 import {describe, expect, test} from 'bun:test';
 import {createOpencodeClient as legacyClient} from '@opencode-ai/sdk';
 import {createOpencodeClient as flatClient} from '@opencode-ai/sdk/v2';
-import {buildVerifierChildPermissions} from '../src/plugin-v2-tools-agents.ts';
+import {
+  buildVerifierChildPermissions,
+  VERIFIER_SESSION_PERMISSIONS,
+} from '../src/plugin-v2-tools-agents.ts';
 import type {V2PermissionRule} from '../src/plugin-v2-helpers.ts';
 import {createChildSessionVerifier} from '../src/child-session-verifier.ts';
 import {createGoalState} from '../src/state-machine.ts';
@@ -42,6 +45,58 @@ const rulesFor = (rules: V2PermissionRule[]) =>
     .permissions as V2PermissionRule[];
 
 describe('verifier capability ceiling and parent restrictions', () => {
+  test('resolved agent config denials survive when the parent has no session rules', () => {
+    const agentRules: V2PermissionRule[] = [
+      ...VERIFIER_SESSION_PERMISSIONS,
+      {action: 'read', resource: '*restricted-fixture.txt', effect: 'deny'},
+      {action: 'glob', resource: '*private*', effect: 'ask'},
+    ];
+    const before = structuredClone(agentRules);
+    const rules = buildVerifierChildPermissions(
+      parent([]),
+      'parent',
+      agentRules,
+    ).permissions as V2PermissionRule[];
+    expect(decision(rules, 'read', '/repo/restricted-fixture.txt')).toBe(
+      'deny',
+    );
+    expect(decision(rules, 'glob', '/repo/private/**')).toBe('ask');
+    expect(decision(rules, 'read', '/repo/source.ts')).toBe('allow');
+    expect(decision(rules, 'bash', '*')).toBe('deny');
+    expect(agentRules).toEqual(before);
+  });
+
+  test('resolved stock verifier policy still permits .env.example', () => {
+    const rules = buildVerifierChildPermissions(
+      parent([]),
+      'parent',
+      VERIFIER_SESSION_PERMISSIONS,
+    ).permissions as V2PermissionRule[];
+    expect(decision(rules, 'read', '/repo/.env.example')).toBe('allow');
+    expect(decision(rules, 'read', '/repo/.env')).toBe('deny');
+    expect(decision(rules, 'read', '/repo/.env.production')).toBe('deny');
+    const restricted = buildVerifierChildPermissions(
+      parent([{action: 'read', resource: '*.env.example', effect: 'deny'}]),
+      'parent',
+      VERIFIER_SESSION_PERMISSIONS,
+    ).permissions as V2PermissionRule[];
+    expect(decision(restricted, 'read', '/repo/.env.example')).toBe('deny');
+  });
+
+  test('explicit parent session rules keep the host precedence without allowing mutation', () => {
+    const rules = buildVerifierChildPermissions(
+      parent([{action: '*', resource: '*', effect: 'allow'}]),
+      'parent',
+      [{action: 'read', resource: '*restricted-fixture.txt', effect: 'deny'}],
+    ).permissions as V2PermissionRule[];
+    expect(decision(rules, 'read', '/repo/restricted-fixture.txt')).toBe(
+      'allow',
+    );
+    expect(decision(rules, 'write', '/repo/restricted-fixture.txt')).toBe(
+      'deny',
+    );
+  });
+
   const cases: Array<{
     name: string;
     rules: V2PermissionRule[];
@@ -262,6 +317,19 @@ for (const [shape, makeClient] of [
     let deletes = 0;
     const fetcher = async (request: Request) => {
       const path = new URL(request.url).pathname;
+      if (path === '/agent')
+        return Response.json([
+          {
+            name: 'goal-verify',
+            permission: [
+              {
+                permission: 'read',
+                pattern: '*configured-private.txt',
+                action: 'deny',
+              },
+            ],
+          },
+        ]);
       if (request.method === 'DELETE') {
         deletes++;
         return Response.json(true);
@@ -311,6 +379,11 @@ for (const [shape, makeClient] of [
     expect(createdBody?.permission).toContainEqual({
       permission: 'read',
       pattern: '*secrets.pem',
+      action: 'deny',
+    });
+    expect(createdBody?.permission).toContainEqual({
+      permission: 'read',
+      pattern: '*configured-private.txt',
       action: 'deny',
     });
     expect(deletes).toBe(1);

@@ -209,6 +209,25 @@ if [ -z "$BOOTED" ]; then
 fi
 echo "     host rendered a TUI after ${BOOTED}s"
 cap 01-boot
+# Keep an immutable sample of EVERY boot frame. The briefing toast is transient
+# and the single `01-boot.ansi` file is overwritten by the bounded wait below;
+# asserting against that one mutable file can report that no briefing rendered
+# after it actually did. This is the same sampled-frame discipline already used
+# for the goal-started toast.
+BOOT_FRAME_SEQ=0
+capture_boot_frame() {
+  BOOT_FRAME_SEQ=$((BOOT_FRAME_SEQ + 1))
+  tmux capture-pane -p -e -t "$SESSION:0.0" > "$CAP/01-boot.ansi"
+  cp "$CAP/01-boot.ansi" "$CAP/01-boot-$BOOT_FRAME_SEQ.ansi"
+}
+boot_frame_has_briefing() {
+  local f
+  for f in "$CAP"/01-boot-*.ansi; do
+    [ -f "$f" ] || continue
+    if grep -aqE "goals? need" "$f"; then return 0; fi
+  done
+  return 1
+}
 
 # THE BOOT CAPTURE IS TAKEN TWICE, and the reason is measured rather than guessed.
 # The companion hydrates and briefs from the DISK LOOP, which starts after the
@@ -236,11 +255,11 @@ case "$BRIEF_WAIT" in
     FAIL=1
     ;;
 esac
-if [ "${BRIEF_WAIT:-0}" -gt 0 ] && ! grep -aqE "goals? need" "$CAP/01-boot.ansi"; then
+if [ "${BRIEF_WAIT:-0}" -gt 0 ] && ! boot_frame_has_briefing; then
   for _ in $(seq 1 20); do
     sleep 1
-    tmux capture-pane -p -e -t "$SESSION:0.0" > "$CAP/01-boot.ansi"
-    if grep -aqE "goals? need" "$CAP/01-boot.ansi"; then break; fi
+    capture_boot_frame
+    if boot_frame_has_briefing; then break; fi
   done
   echo "     boot capture waited for the briefing (workspace held ${BRIEF_WAIT} goal(s) needing you)"
 fi
@@ -344,9 +363,17 @@ if [ -n "$STATE" ] && [ -f "$STATE" ]; then
   WAITING=$(count_needing_user)
 fi
 if [ "${WAITING:-0}" -gt 0 ]; then
-  if panel_regions "$CAP/01-boot.ansi" 'Fixate' | grep -aqE "goals? need"; then
+  BRIEF_FRAME=""
+  for f in "$CAP"/01-boot-*.ansi; do
+    [ -f "$f" ] || continue
+    if panel_regions "$f" 'Fixate' | grep -aqE "goals? need"; then
+      BRIEF_FRAME="$f"
+      break
+    fi
+  done
+  if [ -n "$BRIEF_FRAME" ]; then
     echo "PASS[L2-brief]: load briefing rendered for ${WAITING} stopped goal(s) (toast panel region)"
-    panel_excerpt "$CAP/01-boot.ansi" 'Fixate' 'needs you' | grep -m1 -E "goals? need" | sed 's/^[[:space:]]*//' | cut -c1-70
+    panel_excerpt "$BRIEF_FRAME" 'Fixate' 'needs you' | grep -m1 -E "goals? need" | sed 's/^[[:space:]]*//' | cut -c1-70
   else
     echo "FAIL[L2-brief]: the workspace held ${WAITING} stopped goal(s) and the companion briefed none of them."
     echo "        The briefing is the one moment a user learns a goal is waiting on THEM; a silent regression is invisible."

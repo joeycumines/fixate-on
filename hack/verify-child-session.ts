@@ -8,10 +8,7 @@ import {strict as assert} from 'node:assert';
 import {mkdirSync, mkdtempSync, realpathSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join, resolve} from 'node:path';
-import {createChildSessionVerifier} from '../src/child-session-verifier.ts';
-import {createV2ClientShim} from '../src/plugin-v2.ts';
 import {buildVerifierChildPermissions} from '../src/plugin-v2-tools-agents.ts';
-import {createGoalState} from '../src/state-machine.ts';
 
 const binary = process.env.OPENCODE_BINARY ?? 'opencode';
 const version = Bun.spawnSync([binary, '--version']);
@@ -22,11 +19,124 @@ const root = realpathSync(mkdtempSync(join(tmpdir(), 'fixate-child-session-')));
 const work = join(root, 'work');
 const plugin = join(root, 'plugin');
 const configDir = join(root, 'config', 'opencode');
-for (const directory of [work, plugin, configDir])
+for (const directory of [work, plugin, configDir, join(root, 'home')])
   mkdirSync(directory, {recursive: true});
 assert.equal(Bun.spawnSync(['git', 'init', '-q'], {cwd: work}).exitCode, 0);
+const fixtureEntry = join(root, 'fixture.ts');
+const source = resolve(import.meta.dir, '../src');
+writeFileSync(
+  fixtureEntry,
+  `import GoalsPluginV2, {createV2ClientShim} from ${JSON.stringify(join(source, 'plugin-v2.ts'))};
+import {createChildSessionVerifier} from ${JSON.stringify(join(source, 'child-session-verifier.ts'))};
+import {createGoalState} from ${JSON.stringify(join(source, 'state-machine.ts'))};
+
+const definition = {
+  id: 'fixate-child-session-fixture',
+  methods: {
+    run: {
+      input: {
+        type: 'object',
+        properties: {parentID: {type: 'string'}, initialAgent: {type: 'string'}},
+        required: ['parentID'],
+        additionalProperties: false,
+      },
+      output: {type: 'object', additionalProperties: true},
+    },
+  },
+  events: {},
+};
+
+export default {
+  ...GoalsPluginV2,
+  async setup(ctx: any) {
+    const dispose = await GoalsPluginV2.setup(ctx);
+    const registration = await ctx.rpc.register(definition, {
+      run: async ({parentID, initialAgent}: {parentID: string; initialAgent?: string}) => {
+        const created: any[] = [];
+        const parentObserved: any[] = [];
+        const childObserved: any[] = [];
+        const admissionObserved: any[] = [];
+        const operations: string[] = [];
+        // Delegate the real plugin Context. In particular, hook('prompt') runs
+        // inside the host's admission boundary; an HTTP shim cannot model it.
+        const session = new Proxy(ctx.session, {
+          get(target, name) {
+            const method = target[name];
+            if (typeof method !== 'function') return method;
+            if (name === 'create') return async (input: Record<string, unknown>) => {
+              const info = await target.create({...input, ...(initialAgent ? {agent: initialAgent} : {})});
+              created.push(JSON.parse(JSON.stringify(info)));
+              operations.push('create:' + info.agent);
+              return info;
+            };
+            if (name === 'get') return async (input: {sessionID: string}) => {
+              const info = await target.get(input);
+              (input.sessionID === parentID ? parentObserved : childObserved).push(JSON.parse(JSON.stringify(info)));
+              operations.push('get:' + info.agent);
+              return info;
+            };
+            if (name === 'switchAgent') return async (input: {agent: string}) => {
+              const result = await target.switchAgent(input);
+              operations.push('select:' + input.agent);
+              return result;
+            };
+            if (name === 'update') return async (input: {sessionID: string}) => {
+              const result = await target.update(input);
+              admissionObserved.push(await target.get({sessionID: input.sessionID}));
+              operations.push('update-policy');
+              return result;
+            };
+            if (name === 'hook') return async (name: string, callback: (input: any) => Promise<void>) => {
+              operations.push('hook:' + name);
+              const registered = await target.hook(name, async (input: any) => {
+                operations.push('hook:' + name + ':before');
+                await callback(input);
+                operations.push('hook:' + name + ':after');
+              });
+              return {dispose: async () => {
+                await registered.dispose();
+                operations.push('unhook:' + name);
+              }};
+            };
+            if (name === 'prompt') return async (input: Record<string, unknown>) => {
+              operations.push('prompt');
+              const result = await target.prompt(input);
+              operations.push('prompt:accepted');
+              return result;
+            };
+            if (name === 'wait') return async (input: Record<string, unknown>) => {
+              const result = await target.wait(input);
+              operations.push('wait');
+              return result;
+            };
+            if (name === 'context' || name === 'remove' || name === 'interrupt')
+              return async (input: Record<string, unknown>) => {
+                const result = await method.call(target, input);
+                operations.push(String(name));
+                return result;
+              };
+            return method.bind(target);
+          },
+        });
+        const shim = createV2ClientShim({...ctx, session}, {bySession: new Map()});
+        const goal = createGoalState(parentID, 'Exercise the verifier host transport', {
+          goalId: 'live-verifier-goal', runId: 'live-verifier-run',
+        });
+        const verdict = await createChildSessionVerifier(shim, {timeoutMs: 15_000})({
+          goal, taskId: goal.goalId, cwd: ctx.location.directory,
+          latestText: 'Controlled completion claim',
+          candidateIdentity: {candidate: 'integration', fingerprint: 'integration'},
+        });
+        return JSON.parse(JSON.stringify({created, parentObserved, childObserved, admissionObserved, operations, verdict}));
+      },
+    });
+    return async () => {await registration.dispose(); await dispose();};
+  },
+};
+`,
+);
 const built = await Bun.build({
-  entrypoints: [resolve(import.meta.dir, '../src/plugin-v2.ts')],
+  entrypoints: [fixtureEntry],
   target: 'bun',
   outdir: plugin,
   naming: 'server.js',
@@ -44,6 +154,14 @@ interface SessionInfo {
   agent?: string;
   permissions?: unknown[];
   location?: {directory?: string};
+}
+interface FixtureResult {
+  created: SessionInfo[];
+  parentObserved: SessionInfo[];
+  childObserved: SessionInfo[];
+  admissionObserved: SessionInfo[];
+  operations: string[];
+  verdict: {state: string};
 }
 const providerRequests: ModelRequest[] = [];
 const provider = Bun.serve({
@@ -130,8 +248,16 @@ writeFileSync(
     2,
   ),
 );
+writeFileSync(join(root, 'models.json'), '{}');
 const env: NodeJS.ProcessEnv = {
-  ...process.env,
+  PATH: process.env.PATH,
+  HOME: join(root, 'home'),
+  OPENCODE_DISABLE_MODELS_FETCH: 'true',
+  OPENCODE_DISABLE_AUTOUPDATE: 'true',
+  OPENCODE_DISABLE_CLAUDE_CODE: 'true',
+  OPENCODE_CONFIG_PROJECT_DISABLE: 'true',
+  OPENCODE_DISABLE_FILEWATCHER: 'true',
+  OPENCODE_MODELS_PATH: join(root, 'models.json'),
   PWD: work,
   MOCK_API_KEY: 'dummy',
   OPENCODE_PASSWORD: 'e2e',
@@ -212,6 +338,9 @@ try {
     const agents = unwrap<Array<{id: string}>>(await json('/api/agent'));
     return agents.some(agent => agent.id === 'goal-verify');
   }, 'verifier agent registration');
+  const verifierAgent = unwrap<Array<{id: string; permissions?: unknown[]}>>(
+    await json('/api/agent'),
+  ).find(agent => agent.id === 'goal-verify');
   const cases = [
     {
       label: 'allow-all-parent',
@@ -237,107 +366,68 @@ try {
     // a child explicitly initialized as build, representing a host/default that
     // supplies that field. Both use the actual host's create/switch/prompt APIs.
     for (const initialAgent of scenario.initialAgents) {
-      const created: SessionInfo[] = [];
-      const parentObserved: SessionInfo[] = [];
-      const childObserved: SessionInfo[] = [];
-      const operations: string[] = [];
       const providerStart = providerRequests.length;
-      const shim = createV2ClientShim(
+      const response = (await json(
+        '/api/rpc/fixate-child-session-fixture/run',
         {
-          location: {directory: work},
-          session: {
-            create: async (input: Record<string, unknown>) => {
-              const info = unwrap<SessionInfo>(
-                await json('/api/session', {
-                  ...input,
-                  ...(initialAgent ? {agent: initialAgent} : {}),
-                }),
-              );
-              created.push(info);
-              operations.push(`create:${info.agent}`);
-              return info;
-            },
-            get: async ({sessionID}: {sessionID: string}) => {
-              const info = unwrap<SessionInfo>(
-                await json(`/api/session/${sessionID}`),
-              );
-              if (sessionID === parent.id) parentObserved.push(info);
-              else childObserved.push(info);
-              operations.push(`get:${info.agent}`);
-              return info;
-            },
-            switchAgent: async ({
-              sessionID,
-              agent,
-            }: {
-              sessionID: string;
-              agent: string;
-            }) => {
-              await json(`/api/session/${sessionID}/agent`, {agent});
-              operations.push(`select:${agent}`);
-            },
-            prompt: async ({
-              sessionID,
-              text,
-            }: {
-              sessionID: string;
-              text: string;
-            }) => {
-              operations.push('prompt');
-              return json(`/api/session/${sessionID}/prompt`, {text});
-            },
-            wait: async ({sessionID}: {sessionID: string}) => {
-              await json(`/api/experimental/session/${sessionID}/wait`, {});
-              operations.push('wait');
-            },
-            context: async ({sessionID}: {sessionID: string}) => {
-              operations.push('context');
-              return json(`/api/session/${sessionID}/context`);
-            },
-            remove: async ({sessionID}: {sessionID: string}) => {
-              await json(`/api/session/${sessionID}`, undefined, 'DELETE');
-              operations.push('remove');
-            },
-            interrupt: async ({sessionID}: {sessionID: string}) => {
-              operations.push('interrupt');
-              return json(`/api/session/${sessionID}/interrupt`, {});
-            },
-          },
-        } as never,
-        {bySession: new Map()},
-      );
-      const goal = createGoalState(
-        parent.id,
-        'Exercise the verifier host transport',
-        {
-          goalId: 'live-verifier-goal',
-          runId: 'live-verifier-run',
+          input: {parentID: parent.id, ...(initialAgent ? {initialAgent} : {})},
         },
-      );
-      const verdict = await createChildSessionVerifier(shim, {
-        timeoutMs: 15_000,
-      })({
-        goal,
-        taskId: goal.goalId,
-        cwd: work,
-        latestText: 'Controlled completion claim',
-        candidateIdentity: {
-          candidate: 'integration',
-          fingerprint: 'integration',
-        },
-      });
+      )) as {output: FixtureResult};
+      const {
+        created,
+        parentObserved,
+        childObserved,
+        admissionObserved,
+        operations,
+        verdict,
+      } = response.output;
       assert.equal(verdict.state, 'COMPLETE');
       assert.equal(created.length, 1);
       assert.equal(created[0].agent, initialAgent);
-      assert.equal(parentObserved.length, 1);
+      assert.equal(
+        parentObserved.length,
+        2,
+        'Parent policy is refreshed at admission.',
+      );
       const expectedPermissions = buildVerifierChildPermissions(
-        parentObserved[0],
+        parentObserved[1],
         parent.id,
+        verifierAgent?.permissions,
       ).permissions;
-      assert.deepEqual(created[0].permissions, expectedPermissions);
+      const inertPermissions = [{action: '*', resource: '*', effect: 'deny'}];
+      assert.deepEqual(created[0].permissions, inertPermissions);
+      assert.equal(admissionObserved.length, 1);
+      assert.deepEqual(admissionObserved[0].permissions, expectedPermissions);
+      assert.equal(admissionObserved[0].agent, 'goal-verify');
+      assert.equal(
+        operations.filter(operation => operation === 'hook:prompt:before')
+          .length,
+        1,
+      );
+      assert.equal(
+        operations.filter(operation => operation === 'unhook:prompt').length,
+        1,
+      );
+      assert.ok(
+        operations.indexOf('prompt') < operations.indexOf('update-policy'),
+      );
+      assert.ok(
+        operations.indexOf('hook:prompt:before') <
+          operations.indexOf('update-policy'),
+      );
+      assert.ok(
+        operations.indexOf('update-policy') <
+          operations.indexOf('hook:prompt:after'),
+      );
+      assert.ok(
+        operations.indexOf('hook:prompt:after') <
+          operations.indexOf('prompt:accepted'),
+      );
       assert.equal(childObserved.length, 2);
       assert.ok(childObserved.every(info => info.agent === 'goal-verify'));
       assert.ok(childObserved.every(info => info.location?.directory === work));
+      assert.deepEqual(childObserved[0].permissions, inertPermissions);
+      assert.deepEqual(childObserved[1].permissions, expectedPermissions);
       const requests = providerRequests.slice(providerStart);
       assert.equal(requests.length, 1);
       const tools = (requests[0].tools ?? [])
@@ -366,6 +456,7 @@ try {
         created,
         parentObserved,
         childObserved,
+        admissionObserved,
         operations,
         verdict,
         tools,

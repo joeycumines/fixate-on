@@ -32,6 +32,7 @@ import {
   type GoalOutputTuiContext,
   wireGoalCommandOutput,
 } from './tui-v2-command-output.ts';
+import {showGoalCommandReceipt} from './tui-v2-receipt-dialog.tsx';
 
 // Minimal Context interface consumed by the plugin until @opencode-ai/plugin/tui
 // is officially published. Unknown-shaped fields are typed as `unknown` and narrowed at use sites.
@@ -1145,10 +1146,14 @@ export const GoalTuiPluginV2 = {
       activeWatchdogs,
       log,
     });
-    const disposeOutput = wireGoalCommandOutput(context);
+    let disposeReceipt: (() => void) | undefined;
+    const disposeOutput = wireGoalCommandOutput(context, text => {
+      disposeReceipt = showGoalCommandReceipt(context, text);
+    });
 
     return () => {
       disposeOutput();
+      disposeReceipt?.();
       events.dispose();
     };
   },
