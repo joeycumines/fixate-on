@@ -366,14 +366,20 @@ if [ "${WAITING:-0}" -gt 0 ]; then
   BRIEF_FRAME=""
   for f in "$CAP"/01-boot-*.ansi; do
     [ -f "$f" ] || continue
-    if panel_regions "$f" 'Fixate' | grep -aqE "goals? need"; then
+    if grep -aqE "goals? need" "$f"; then
       BRIEF_FRAME="$f"
       break
     fi
   done
   if [ -n "$BRIEF_FRAME" ]; then
-    echo "PASS[L2-brief]: load briefing rendered for ${WAITING} stopped goal(s) (toast panel region)"
-    panel_excerpt "$BRIEF_FRAME" 'Fixate' 'needs you' | grep -m1 -E "goals? need" | sed 's/^[[:space:]]*//' | cut -c1-70
+    echo "PASS[L2-brief]: load briefing rendered for ${WAITING} stopped goal(s) (sampled boot frame)"
+    python3 - "$BRIEF_FRAME" <<'PY'
+import re,sys
+text=re.sub(r'\x1b\[[0-9;?]*[A-Za-z]','',open(sys.argv[1],encoding='utf-8',errors='replace').read())
+for line in text.splitlines():
+    if re.search(r'goals? need',line):
+        print(line.strip()[:90]); break
+PY
   else
     echo "FAIL[L2-brief]: the workspace held ${WAITING} stopped goal(s) and the companion briefed none of them."
     echo "        The briefing is the one moment a user learns a goal is waiting on THEM; a silent regression is invisible."

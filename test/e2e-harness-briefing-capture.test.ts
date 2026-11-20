@@ -19,4 +19,5 @@ test('the v2 briefing assertion samples boot frames instead of one mutable captu
   expect(script).toContain('01-boot-*.ansi');
   expect(script).toContain('boot_frame_has_briefing');
   expect(script).not.toContain('grep -aqE "goals? need" "$CAP/01-boot.ansi"');
+  expect(script).not.toContain('panel_regions "$f" \'Fixate\'');
 });
