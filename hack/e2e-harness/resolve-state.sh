@@ -187,6 +187,27 @@ fresh_host_session() {
 }
 export -f fresh_host_session 2>/dev/null || true
 
+# stop_stale_harness_hosts — terminate only host processes from a previous
+# harness launch. Killing the tmux session does not kill the detached
+# `opencode serve --stdio` child, which then keeps the session's state lease and
+# declines the new host's writes. Scope every match to this harness's work
+# directories so unrelated OpenCode processes on the developer's machine are
+# never touched.
+stop_stale_harness_hosts() {
+  local here pids pid
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  pids="$(pgrep -f "$here/(work|work-v1)(/| )$" 2>/dev/null || true)"
+  [ -n "$pids" ] || return 0
+  for pid in $pids; do
+    kill "$pid" 2>/dev/null || true
+  done
+  sleep 1
+  for pid in $pids; do
+    kill -9 "$pid" 2>/dev/null || true
+  done
+}
+export -f stop_stale_harness_hosts 2>/dev/null || true
+
 # assert_harness_unmodified — the harness must be able to tell when the thing it
 # is scoring has rewritten it.
 #

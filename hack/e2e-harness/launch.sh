@@ -132,6 +132,8 @@ bash "$HARNESS_DIR/seed-briefing.sh" "$WORK_DIR"
 export OPENCODE_CONFIG="$ISOLATED_ROOT/config/opencode.json"
 export OPENCODE_CONFIG_DIR="$ISOLATED_ROOT/config"
 
+. "$HARNESS_DIR/resolve-state.sh"
+stop_stale_harness_hosts
 # A named tmux session we own; never attached to another's state (reversibility).
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 

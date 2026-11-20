@@ -105,6 +105,8 @@ git -C "$BUNDLE_DIR" clean -fdq "${WORK_DIR#$BUNDLE_DIR/}" 2>/dev/null || true
 # deterministically, replacing the non-deterministic KEEP_STATE=1 escape hatch.
 bash "$HARNESS_DIR/seed-briefing.sh" "$WORK_DIR"
 
+. "$HARNESS_DIR/resolve-state.sh"
+stop_stale_harness_hosts
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 
 # Provider credential passthrough (see SECURITY CONTRACT above). The key is
