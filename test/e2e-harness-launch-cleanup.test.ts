@@ -10,5 +10,6 @@ for (const name of ['launch.sh', 'launch-v1.sh']) {
       'utf8',
     );
     expect(script).toContain('stop_stale_harness_hosts');
+    expect(script).toContain('WORK="$WORK_DIR"');
   });
 }
