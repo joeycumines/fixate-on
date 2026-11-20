@@ -133,7 +133,12 @@ const files = await discoverStateFiles(process.argv[1])
 let n = 0
 for (const f of files) {
   const sessionID = f.split("/sessions/")[1]?.split("/")[0]
-  for (const g of parseStateFileGoals(await Bun.file(f).text(), sessionID)) {
+  const text = await Bun.file(f).text().catch(() => null)
+  // A session directory can outlive its state.json during cleanup. A missing
+  // file is unreadable evidence, NOT a cleared goal: skip it the same way the
+  // TUI disk loop ignores an unreadable state file.
+  if (text === null) continue
+  for (const g of parseStateFileGoals(text, sessionID)) {
     if (goalNeedsTheUser(g)) n += 1
   }
 }
