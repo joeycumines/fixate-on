@@ -9,10 +9,7 @@
 import {expect, test} from 'bun:test';
 import {readFileSync} from 'node:fs';
 
-const DRIVE = new URL(
-  '../hack/e2e-harness/drive.sh',
-  import.meta.url,
-).pathname;
+const DRIVE = new URL('../hack/e2e-harness/drive.sh', import.meta.url).pathname;
 
 test('the v2 briefing assertion samples boot frames instead of one mutable capture', () => {
   const script = readFileSync(DRIVE, 'utf8');
