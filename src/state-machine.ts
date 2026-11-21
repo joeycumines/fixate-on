@@ -1,4 +1,4 @@
-import type {UsageSnapshot} from './accounting.ts';
+import {USAGE_TOKEN_FIELDS, type UsageSnapshot} from './accounting.ts';
 import {buildRetractionNotice} from './recovery-pressure.ts';
 import {claimQualityLabel} from './claim-vocabulary.ts';
 import {
@@ -115,6 +115,9 @@ export class GoalStateMachine {
     return {
       ...this.goal,
       usage: {...this.goal.usage},
+      lastSessionUsage: this.goal.lastSessionUsage
+        ? {...this.goal.lastSessionUsage}
+        : this.goal.lastSessionUsage,
       artifactPointers: [...this.goal.artifactPointers],
       pendingProposal: this.goal.pendingProposal
         ? {
@@ -183,6 +186,17 @@ export class GoalStateMachine {
     return this.mutex.run(async () => {
       const from = this.goal.status;
 
+      if (
+        opts.expectedRevision !== undefined &&
+        opts.expectedRevision !== this.revision
+      ) {
+        return {ok: false, error: 'goal changed before the transition'};
+      }
+
+      if (opts.restart && target !== 'active') {
+        return {ok: false, error: 'a run can only restart into active status'};
+      }
+
       if (TERMINAL_STATUSES.has(from)) {
         return {
           ok: false,
@@ -211,6 +225,12 @@ export class GoalStateMachine {
       this.goal.continuationClaim = null;
 
       if (target === 'active') {
+        if (opts.restart) {
+          this.goal.turnCount = 0;
+          this.goal.pressureRung = undefined;
+          if (opts.restart.kickoffAdmissionPending)
+            this.goal.kickoffAdmissionPending = true;
+        }
         this.goal.stopReason = '';
         this.goal.blockedReason = '';
         this.goal.noProgressTurns = 0;
@@ -219,6 +239,7 @@ export class GoalStateMachine {
         // make subsequent observations of the same message ID appear counted,
         // prematurely suppressing the brake until a new turn occurs.
         this.goal.lastCountedProgressMessageID = '';
+        this.goal.stalledTurnCounted = false;
         this.goal.lastNoToolCallMessageID = '';
         this.goal.promptFailures = 0;
         this.goal.budgetWrapupSent = false;
@@ -405,6 +426,83 @@ export class GoalStateMachine {
           // Usage broadcast failures are swallowed to maintain state machine resilience.
         }
       }
+    });
+  }
+
+  /** Charge a cumulative reading and retain its watermark as one mutation. */
+  async updateCumulativeUsage(
+    observed: UsageSnapshot,
+    previousSession: UsageSnapshot,
+  ): Promise<{changed: boolean; migrationNotice?: string}> {
+    return this.mutex.run(async () => {
+      // Settlement may win after the caller's nonterminal filter but before
+      // this queued update acquires the lock. Archived spend is then frozen.
+      if (TERMINAL_STATUSES.has(this.goal.status)) return {changed: false};
+      const legacy = this.goal.lastSessionUsage === undefined;
+      const previous = legacy
+        ? observed
+        : (this.goal.lastSessionUsage ?? previousSession);
+      const next = {...observed};
+      const charged = {...this.goal.usage};
+      for (const field of USAGE_TOKEN_FIELDS) {
+        next[field] = Math.max(next[field], previous[field]);
+        charged[field] += next[field] - previous[field];
+      }
+      next.cost = Math.max(next.cost, previous.cost);
+      next.costKnown ||= previous.costKnown;
+      charged.cost += next.cost - previous.cost;
+      if (!legacy) charged.costKnown ||= next.costKnown;
+      const total = USAGE_TOKEN_FIELDS.reduce(
+        (sum, field) => sum + next[field],
+        0,
+      );
+      const changed =
+        !this.goal.lastSessionUsage ||
+        total > this.goal.totalTokens ||
+        USAGE_TOKEN_FIELDS.some(
+          field => charged[field] !== this.goal.usage[field],
+        ) ||
+        charged.cost !== this.goal.usage.cost ||
+        charged.costKnown !== this.goal.usage.costKnown;
+      if (!changed) return {changed: false};
+      this.goal.usage = charged;
+      this.goal.totalTokens = Math.max(this.goal.totalTokens, total);
+      this.goal.lastSessionUsage = next;
+      const now = Date.now();
+      this.goal.updatedAt = now;
+      const migrationNotice = legacy
+        ? `Goal ${this.goal.goalId}: restored state has no cumulative usage watermark. Previously recorded spend is preserved and accounting resumes from the current host reading. Usage accrued while the plugin was offline cannot be reconstructed; the context-token brake still uses the host's full cumulative total.`
+        : undefined;
+      if (migrationNotice) {
+        this.goal.pendingNotices.push({
+          kind: 'usage-baseline',
+          message: migrationNotice,
+          timestamp: now,
+        });
+        if (this.goal.pendingNotices.length > MAX_PENDING_NOTICES)
+          this.goal.pendingNotices.splice(
+            0,
+            this.goal.pendingNotices.length - MAX_PENDING_NOTICES,
+          );
+      }
+      this.goal.history.push({
+        type: migrationNotice ? 'usage-baseline' : 'tracking',
+        detail: migrationNotice ?? 'Updated cumulative session usage',
+        timestamp: now,
+      });
+      if (this.goal.history.length > MAX_HISTORY_ENTRIES)
+        this.goal.history.splice(
+          0,
+          this.goal.history.length - MAX_HISTORY_ENTRIES,
+        );
+      if (this.callbacks.onUsageUpdate) {
+        try {
+          await this.callbacks.onUsageUpdate(this.snapshot());
+        } catch {
+          // A display failure cannot roll back authoritative usage accounting.
+        }
+      }
+      return {changed: true, ...(migrationNotice ? {migrationNotice} : {})};
     });
   }
 
@@ -616,6 +714,8 @@ export function createGoalState(
     maxUnchangedResults?: number;
     maxBlockedTurns?: number;
     languageTriage?: boolean;
+    kickoffAdmissionPending?: boolean;
+    userCommandStartedAt?: number;
   } = {},
 ): GoalState {
   const now = Date.now();
@@ -633,7 +733,7 @@ export function createGoalState(
     mode: options.mode ?? 'normal',
     sessionID,
     tokenBudget: options.tokenBudget ?? null,
-    maxTokens: options.maxTokens ?? 1000000,
+    maxTokens: options.maxTokens ?? 0,
     maxTurns: options.maxTurns ?? 0,
     maxDurationMs: options.maxDurationMs ?? 1800000,
     minDelayMs: options.minDelayMs ?? 1500,
@@ -652,7 +752,9 @@ export function createGoalState(
       cost: 0,
       costKnown: false,
     },
+    lastSessionUsage: null,
     createdAt: now,
+    userCommandStartedAt: options.userCommandStartedAt,
     updatedAt: now,
     startedAt: now,
     pausedAt: 0,
@@ -680,9 +782,11 @@ export function createGoalState(
     blockedAssertedThisTurn: false,
     languageTriage: options.languageTriage ?? true,
     lastStatus: 'Goal set.',
+    kickoffAdmissionPending: options.kickoffAdmissionPending ?? false,
     lastAssistantText: '',
     lastAssistantMessageID: '',
     lastCountedProgressMessageID: '',
+    stalledTurnCounted: false,
     lastNoToolCallMessageID: '',
     lastContinueAt: 0,
     lastProgressAt: 0,

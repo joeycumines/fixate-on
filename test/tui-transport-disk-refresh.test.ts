@@ -296,7 +296,7 @@ describe('disk-refresh loop', () => {
     }
   });
 
-  test('PER-FILE CONTINUITY: torn session does not fabricate removes while healthy session removes still fire', async () => {
+  test('per-file continuity: a torn session does not fabricate removes while healthy session removes still fire', async () => {
     // The core: garbage written into ONE session's
     // state.json must not cause a false "Goal cleared" for that session,
     // while a REAL removal in another session must still be reported.
@@ -377,7 +377,7 @@ describe('disk-refresh loop', () => {
     }
   });
 
-  test('FORGED REVISIONS GONE: token-only transition carries disk revision, store accepts same-revision', async () => {
+  test('token-only transition carries disk revision and the store accepts the same revision', async () => {
     // The old code bumped revision+1 for same-revision token changes,
     // falsely believing the store rejected them. That pushed the store
     // ahead of the disk, and a real server-side transition arriving at

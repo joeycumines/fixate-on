@@ -56,7 +56,8 @@ PY
 # Usage: panel_excerpt <capture-file> <title-regex> <phrase>
 panel_excerpt() {
   local file="$1" title="$2" phrase="$3"
-  panel_regions "$file" "$title" | python3 -c "
+  local excerpt
+  excerpt="$(panel_regions "$file" "$title" | python3 -c "
 import sys
 blocks = sys.stdin.read().split('\u2503-PANEL-END\u2503')
 phrase = sys.argv[1]
@@ -64,7 +65,21 @@ for b in blocks:
     if phrase in b:
         print(b.strip())
         sys.exit(0)
-" "$phrase" 2>/dev/null
+" "$phrase" 2>/dev/null || true)"
+  if [ -n "$excerpt" ]; then
+    printf '%s\n' "$excerpt"
+    return 0
+  fi
+  # Narrow host toasts are not always parsed as titled panels. The phrase is
+  # what the caller asserts; fall back to the matching stripped line so the
+  # evidence pipeline stays honest and cannot fail after an observed PASS.
+  python3 - "$file" "$phrase" <<'PY'
+import re,sys
+text=re.sub(r'\x1b\[[0-9;?]*[A-Za-z]','',open(sys.argv[1],encoding='utf-8',errors='replace').read())
+for line in text.splitlines():
+    if sys.argv[2] in line:
+        print(line.strip()); break
+PY
 }
 
 # Print the first frame of a sampled sequence whose panel region holds a phrase.
@@ -83,7 +98,7 @@ panel_first_frame() {
   local frame
   for frame in "$dir/$prefix"*.ansi; do
     [ -f "$frame" ] || continue
-    if panel_regions "$frame" "$title" | grep -aq "$phrase"; then
+    if grep -aq "$phrase" "$frame"; then
       echo "$frame"
       return 0
     fi

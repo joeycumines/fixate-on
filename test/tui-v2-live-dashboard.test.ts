@@ -97,6 +97,7 @@ function createMockContext() {
   const alertCalls: Array<{alert: AlertRecord; resolve: () => void}> = [];
   const showCalls: Array<{onClose?: () => void}> = [];
   const toasts: {variant?: string; title?: string; message: string}[] = [];
+  let clearCalls = 0;
   let capturedCommands: V2Command[] = [];
   let route: {type: string; sessionID?: string} = {
     type: 'session',
@@ -128,7 +129,10 @@ function createMockContext() {
       if (prev?.onClose) prev.onClose(); // replace fires previous onClose
     },
     set: () => {},
-    clear: () => {},
+    clear: () => {
+      clearCalls++;
+      showCalls.at(-1)?.onClose?.();
+    },
   };
 
   const ctx = {
@@ -196,6 +200,19 @@ function createMockContext() {
       if (cur) cur.resolve();
     },
     showCount: () => showCalls.length,
+    clearCount: () => clearCalls,
+    replaceDialog: () => dialog.show(() => undefined),
+    hasSubscription: (type: string) => handlers.has(type),
+    emitReceipt: () =>
+      handlers.get('rpc.fixate-on-output.output')?.({
+        data: {
+          id: 'receipt',
+          sessionID: 'test-session-123',
+          kind: 'command',
+          text: 'Full receipt',
+          timestamp: 1,
+        },
+      }),
     closeCurrentShow: () => {
       const cur = showCalls.at(-1);
       if (cur?.onClose) cur.onClose();
@@ -215,6 +232,25 @@ function createMockContext() {
     },
   };
 }
+
+test('companion disposal closes its receipt without clearing a replacement dialog', async () => {
+  for (const replaced of [false, true]) {
+    const host = createMockContext();
+    const dispose = await GoalTuiPluginV2.setup(host.stub);
+    try {
+      host.emitReceipt();
+      expect(host.showCount()).toBe(1);
+      if (replaced) host.replaceDialog();
+      dispose();
+      dispose();
+      expect(host.clearCount()).toBe(replaced ? 0 : 1);
+      expect(host.hasSubscription('rpc.fixate-on-output.output')).toBe(false);
+      expect(host.hasSubscription('server.connected')).toBe(false);
+    } finally {
+      dispose();
+    }
+  }
+});
 
 // Drain alert promise-resolution microtasks so close state settles
 // deterministically before asserting on subsequent behavior.

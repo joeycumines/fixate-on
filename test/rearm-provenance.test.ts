@@ -86,7 +86,7 @@ async function rearmSourcesAfterRestart(
 ): Promise<string[]> {
   // idlePoller false here: these cases assert on the RE-ARM's provenance,
   // not on the sweep, so no background sweep may fire mid-case. The sweep's
-  // own liveness gate is covered in fxj-idle-poll.test.ts, which runs the
+  // own liveness gate is covered in idle-poll-fallback.test.ts, which runs the
   // poller. A hand-delivered poll id stands in for the sweep's sanctioned
   // idle (the sweep marks liveness in the tick it fires). Marking the
   // session live must not itself consume the recovery flag, so it is done

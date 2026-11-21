@@ -8,16 +8,45 @@
  * responses during host restarts, but allows reporting a specific missing-session error
  * to the user instead of a generic transient failure.
  */
-export function isSessionGoneError(
-  error: {name?: string; message?: string} | undefined,
-): boolean {
-  if (!error) return false;
-  const name = (error.name ?? '').toLowerCase();
-  const msg = (error.message ?? '').toLowerCase();
-  if (/notfound|sessionnotfound/.test(name)) return true;
-  return /session\s+(?:not\s+found|no\s+longer\s+exists|does\s+not\s+exist|deleted|expired)/.test(
-    msg,
-  );
+export function isSessionGoneError(error: unknown): boolean {
+  const visited = new Set<object>();
+  for (let depth = 0; depth < 4; depth++) {
+    if (!error || typeof error !== 'object' || visited.has(error)) return false;
+    visited.add(error);
+    const detail = error as {
+      name?: unknown;
+      _tag?: unknown;
+      message?: unknown;
+      data?: {message?: unknown};
+      cause?: unknown;
+    };
+    const nonEmpty = (value: unknown): string =>
+      typeof value === 'string' && value.length > 0 ? value : '';
+    // Check name and _tag independently: a generic name ('Error') must not
+    // mask a typed tag, and an empty message must not mask data.message.
+    const names = [nonEmpty(detail.name), nonEmpty(detail._tag)];
+    const messages = [nonEmpty(detail.message), nonEmpty(detail.data?.message)];
+    if (
+      names.some(
+        n =>
+          /notfound|sessionnotfound/i.test(n) ||
+          (/session/i.test(n) && /not.*found/i.test(n)),
+      )
+    )
+      return true;
+    if (
+      messages.some(m =>
+        /session\s+(?:not\s+found|no\s+longer\s+exists|does\s+not\s+exist|deleted|expired)/i.test(
+          m,
+        ),
+      )
+    )
+      return true;
+    // HTTP SDK errors retain their typed response in Error.cause. Inspect it
+    // rather than relying on a generic 404 or the wrapper's display message.
+    error = detail.cause;
+  }
+  return false;
 }
 
 /**

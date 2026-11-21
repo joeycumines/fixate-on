@@ -1,4 +1,4 @@
-// fxi-v2-input-steering.test.ts — FX-I locks: human steering must reach the
+// v2-input-steering.test.ts — FX-I locks: human steering must reach the
 // goal loop on opencode v2, where the v1 `chat.message` hook never fires.
 //
 // Live evidence (drill-v2 campaign 2026-08-26): a whole-message "stop"
@@ -19,7 +19,13 @@ import type {GoalState} from '../src/state-machine.ts';
 import {createGoalState, GoalStateMachine} from '../src/state-machine.ts';
 import type {UsageSnapshot} from '../src/accounting.ts';
 import {createLoopPolicy} from '../src/continuation-loop.ts';
-import {synthesizeChatMessageFromAdmitted} from '../src/plugin-v2.ts';
+import {
+  synthesizeChatMessageFromAdmitted,
+  synthesizeChatMessageFromText,
+} from '../src/plugin-v2-event-leaf.ts';
+import {reconcileSystemParts} from '../src/plugin-v2-helpers.ts';
+import {mapV2EventToHandlers} from '../src/plugin-v2-event-bridge.ts';
+import {createRecentKickoffTextTracker} from '../src/plugin-v2-command.ts';
 
 function makeUsage(): UsageSnapshot {
   return {
@@ -110,7 +116,7 @@ function admittedEvent(
   };
 }
 
-describe('FX-I synthesis: session.input.admitted → chat.message hook', () => {
+describe('v2 input synthesis: session.input.admitted drives the chat.message hook', () => {
   test("human 'stop' reaches the hook with synthetic undefined and pauses explicitly", async () => {
     const machine = new GoalStateMachine(makeActiveGoal(), {
       onCommit: async () => {},
@@ -122,6 +128,25 @@ describe('FX-I synthesis: session.input.admitted → chat.message hook', () => {
     await synthesizeChatMessageFromAdmitted(
       hooks['chat.message'],
       admittedEvent('session-1', 'stop').data,
+    );
+
+    expect(machine.snapshot().status).toBe('paused');
+    expect(machine.snapshot().stopReason).toBe('explicit pause');
+  });
+
+  test("inbox 'stop' with steer delivery reaches the hook and pauses explicitly", async () => {
+    const machine = new GoalStateMachine(makeActiveGoal(), {
+      onCommit: async () => {},
+    });
+    const hooks = createHooks(
+      makeDeps(makeSessionContext(machine), makeMockSessionApi()),
+    );
+
+    await synthesizeChatMessageFromText(
+      hooks['chat.message'],
+      'session-1',
+      'stop',
+      {sessionID: 'session-1', item: {delivery: 'steer'}},
     );
 
     expect(machine.snapshot().status).toBe('paused');
@@ -215,7 +240,7 @@ describe('FX-I synthesis: session.input.admitted → chat.message hook', () => {
   });
 });
 
-describe('FX-I idle defense: the loop never drives over a pending human turn', () => {
+describe('idle defense: the loop never drives over a pending human turn', () => {
   test("newest message human 'stop' → explicit pause, no continuation prompt sent", async () => {
     const machine = new GoalStateMachine(makeActiveGoal(), {
       onCommit: async () => {},
@@ -293,12 +318,155 @@ describe('FX-I idle defense: the loop never drives over a pending human turn', (
   });
 });
 
-describe('FX-E classification anchor used by both FX-I paths', () => {
+describe('stop classification anchor used by both steering paths', () => {
   test('whole-message stop imperatives classify; mixed sentences do not', () => {
     expect(isExplicitStopMessage('stop')).toBe(true);
     expect(isExplicitStopMessage('halt')).toBe(true);
     expect(isExplicitStopMessage('hold off')).toBe(true);
     expect(isExplicitStopMessage('please stop')).toBe(false);
     expect(isExplicitStopMessage('stop the server then fix tests')).toBe(false);
+  });
+});
+
+describe('v2 system prompt parts survive goal-context injection', () => {
+  test('prepended goal context keeps native cache-control parts in place', () => {
+    const cachePart = {
+      type: 'text',
+      text: 'a',
+      cache_control: {type: 'ephemeral'},
+    };
+    const out = reconcileSystemParts(
+      [cachePart, {type: 'text', text: 'b'}],
+      ['<goal_context>injected</goal_context>', 'a', 'b'],
+    );
+    expect(out).toHaveLength(3);
+    expect(out[0]).toEqual({
+      type: 'text',
+      text: '<goal_context>injected</goal_context>',
+    });
+    expect(out[1]).toBe(cachePart);
+    expect(out[2]).toEqual({type: 'text', text: 'b'});
+  });
+
+  test('non-text native parts keep their original positions', () => {
+    const cachePart = {
+      type: 'text',
+      text: 'a',
+      cache_control: {type: 'ephemeral'},
+    };
+    const effortPart = {type: 'effort', effort: 'high'};
+    const out = reconcileSystemParts(
+      [cachePart, effortPart, {type: 'text', text: 'b'}],
+      ['<goal_context>injected</goal_context>', 'a', '', 'b'],
+    );
+    expect(out).toHaveLength(4);
+    expect(out[0]).toEqual({
+      type: 'text',
+      text: '<goal_context>injected</goal_context>',
+    });
+    expect(out[1]).toBe(cachePart);
+    expect(out[2]).toBe(effortPart);
+    expect(out[3]).toEqual({type: 'text', text: 'b'});
+  });
+
+  test('rewriting a native text part keeps its host metadata', () => {
+    const cachePart = {
+      type: 'text',
+      text: 'a',
+      cache_control: {type: 'ephemeral'},
+    };
+    const out = reconcileSystemParts(
+      [cachePart, {type: 'text', text: 'b'}],
+      ['a-rewritten', 'b'],
+    );
+    expect(out).toHaveLength(2);
+    expect(out[0]).toEqual({
+      type: 'text',
+      text: 'a-rewritten',
+      cache_control: {type: 'ephemeral'},
+    });
+    expect(out[1]).toEqual({type: 'text', text: 'b'});
+  });
+});
+
+describe('v2 mode-implied input events drive steering', () => {
+  function bridgeDeps(hooks: ReturnType<typeof createHooks>) {
+    return {
+      ctx: {},
+      hooks,
+      idleStateBySession: new Map(),
+      lastObservedTurnBySession: new Map(),
+      recentKickoffTexts: createRecentKickoffTextTracker(),
+      locationDirectory: undefined,
+      isStopped: () => false,
+      stopSignal: new Promise<void>(() => {}),
+    };
+  }
+
+  test('session.input.steered pauses an active goal for a human stop', async () => {
+    const machine = new GoalStateMachine(makeActiveGoal(), {
+      onCommit: async () => {},
+    });
+    const depsForHooks = makeDeps(
+      makeSessionContext(machine),
+      makeMockSessionApi(),
+    );
+    const hooks = createHooks(depsForHooks) as ReturnType<
+      typeof createHooks
+    > & {
+      runtime?: typeof depsForHooks.runtime;
+    };
+    hooks.runtime = depsForHooks.runtime;
+    await mapV2EventToHandlers(
+      {
+        type: 'session.input.steered',
+        data: {
+          sessionID: 'session-1',
+          inputID: 'steer-1',
+          item: {type: 'user', payload: {text: 'stop'}},
+        },
+      },
+      bridgeDeps(hooks),
+    );
+    expect(machine.snapshot().status).toBe('paused');
+    expect(machine.snapshot().stopReason).toBe('explicit pause');
+  });
+
+  test('a queued payload promoted to steered reaches the hook by ID', async () => {
+    const machine = new GoalStateMachine(makeActiveGoal(), {
+      onCommit: async () => {},
+    });
+    const depsForHooks = makeDeps(
+      makeSessionContext(machine),
+      makeMockSessionApi(),
+    );
+    const hooks = createHooks(depsForHooks) as ReturnType<
+      typeof createHooks
+    > & {
+      runtime?: typeof depsForHooks.runtime;
+    };
+    hooks.runtime = depsForHooks.runtime;
+    const deps = bridgeDeps(hooks);
+    await mapV2EventToHandlers(
+      {
+        type: 'session.input.queued',
+        data: {
+          sessionID: 'session-1',
+          inputID: 'promote-1',
+          item: {type: 'user', payload: {text: 'stop'}},
+        },
+      },
+      deps,
+    );
+    expect(machine.snapshot().status).toBe('active');
+    await mapV2EventToHandlers(
+      {
+        type: 'session.input.steered',
+        data: {sessionID: 'session-1', inputID: 'promote-1'},
+      },
+      deps,
+    );
+    expect(machine.snapshot().status).toBe('paused');
+    expect(machine.snapshot().stopReason).toBe('explicit pause');
   });
 });

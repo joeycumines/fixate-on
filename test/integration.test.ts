@@ -1579,6 +1579,13 @@ test('top-level maxTokens option reaches goals created via /goal command', async
   expect(status).not.toContain('/200,000');
 });
 
+test('context-token ceiling defaults to unlimited for v1 goals', async () => {
+  const {hooks} = await makePlugin({});
+  await runGoalCommand(hooks, 's1', 'test objective');
+  const status = await runGoalCommand(hooks, 's1', 'status');
+  expect(status).toContain('0/unlimited ctx tokens');
+});
+
 test('maxRecentMessages option controls messages fetch limit', async () => {
   let capturedLimit: unknown = undefined;
   const client = {
@@ -1849,7 +1856,10 @@ test('messages fetch failure is logged via logError', async () => {
   });
   expect(errorLogs.length).toBeGreaterThan(0);
   const firstError = errorLogs[0] as {message?: string};
-  expect(firstError?.message).toContain('Failed to fetch session messages');
+  expect(firstError?.message).toContain(
+    'Failed to read session state for continuation',
+  );
+  expect(firstError?.message).toContain('SDK connection failed');
 });
 
 test('compaction resets budgetWrapupSent to allow wrapup on regrowth', async () => {

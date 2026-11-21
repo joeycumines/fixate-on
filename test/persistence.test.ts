@@ -1329,7 +1329,7 @@ test('deserializeGoal handles corrupted/missing fields gracefully', () => {
   expect(restored.status).toBe('active');
   expect(restored.mode).toBe('normal');
   expect(restored.tokenBudget).toBe(null);
-  expect(restored.maxTokens).toBe(1000000);
+  expect(restored.maxTokens).toBe(0);
   expect(restored.finishedAt).toBe(null);
   expect(restored.finalizing).toBe(false);
   expect(restored.budgetLimitReported).toBe(false);
@@ -1353,7 +1353,7 @@ test('deserializeGoal handles completely empty object', () => {
   expect(restored.status).toBe('active');
   expect(restored.mode).toBe('normal');
   expect(restored.tokenBudget).toBe(null);
-  expect(restored.maxTokens).toBe(1000000);
+  expect(restored.maxTokens).toBe(0);
   expect(restored.maxTurns).toBe(0);
   expect(restored.maxDurationMs).toBe(1800000);
   expect(restored.minDelayMs).toBe(1500);

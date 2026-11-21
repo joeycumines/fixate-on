@@ -25,14 +25,17 @@ explicit `directory` — `hydrateStoreFromDisk` otherwise falls back to
 untracked `.opencode/goals/sessions/<sessionID>/state.json`, so it passes
 locally and fails on a clean checkout.
 
-`bun pm pack` and `bun publish` run **no** lifecycle scripts, and the generated
-bundle is gitignored, so a pack performed before `bun run bundle` produces a
-tarball that cannot load. Always run `bun run bundle` before packing; never
-rely on remembering to bundle first.
+On the pinned Bun 1.4.2, `bun pm pack` runs `prepack` (`bun run bundle`), and
+publishing a checkout runs `prepublishOnly` before `prepack`. An existing
+tarball runs neither hook when published. Generated bundles are gitignored,
+and scripts can be disabled, so keep the explicit `bun run bundle` before
+packing and run `bun run release:check` before releasing. A fresh bundle alone
+does not establish that the quality gate passed.
 
-On OpenCode v2 hosts, `/goal` only reaches goal state when `command.goal`'s
-template routes through the plugin's `goal-command` tool — see the README's
-"`/goal` on OpenCode v2 hosts" section before touching command wiring.
+On OpenCode 2.x, `command.transform` registers a native `/goal` command when
+the host exposes that API. An explicit `command.goal` template routing to
+`goal-command` remains the fallback for older hosts. See the README's
+"`/goal` on OpenCode 2.x" section before touching command wiring.
 
 ## Vocabulary (authoritative — use these words everywhere)
 
@@ -159,7 +162,9 @@ measurement is an opinion, and must be labelled as one.
 
 ## File structure
 
-- **TypeScript only.** All source is `.ts`, plus one `.tsx` (the host-native dashboard route, which the host renders as JSX). No `.js` source files.
+- **TypeScript only.** Use `.ts` for source and `.tsx` for cohesive host-native
+  render components, compiled with the Solid transform in `scripts/bundle.ts`.
+  No `.js` source files.
 - **No barreling.** Do not create `index.ts` files that re-export from other
   modules. Each file is an individual module; imports go directly to the
   defining file. This keeps dependency graphs explicit and prevents circular
@@ -178,3 +183,7 @@ measurement is an opinion, and must be labelled as one.
   plugin) to ensure the graph is a DAG.
 - **File naming.** Name files after their primary concern. Test files are
   `<module>.test.ts` colocated in `test/`.
+
+The user-facing behavior these rules protect is documented in
+[README.md](README.md#goal-command-reference); the companion rendering and the
+release runbook live in [docs/](docs/tui-integration.md).

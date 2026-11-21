@@ -29,9 +29,9 @@
 set -euo pipefail
 
 SESSION="fixate-on"
-# Host launcher override: installed opencode2 v2.0.27 loads the TUI plugin but
-# never registers its palette entries; the fix lives in a local source checkout
-# (hack/e2e-harness/opencode2-from-source.sh runs it).
+# Host launcher override: defaults to installed `opencode2` (verified on v2.2.7
+# with directory plugin targets in hack/e2e-harness/plugin-dir). Set
+# E2E_OPENCODE2_BIN to override with another binary or wrapper script.
 OPENCODE2_BIN="${E2E_OPENCODE2_BIN:-opencode2}"
 case "$OPENCODE2_BIN" in
  */*) [ -x "$OPENCODE2_BIN" ] || { echo "abort: E2E_OPENCODE2_BIN=$OPENCODE2_BIN is not executable" >&2; exit 1; };;
@@ -132,6 +132,9 @@ bash "$HARNESS_DIR/seed-briefing.sh" "$WORK_DIR"
 export OPENCODE_CONFIG="$ISOLATED_ROOT/config/opencode.json"
 export OPENCODE_CONFIG_DIR="$ISOLATED_ROOT/config"
 
+WORK="$WORK_DIR"
+. "$HARNESS_DIR/resolve-state.sh"
+stop_stale_harness_hosts
 # A named tmux session we own; never attached to another's state (reversibility).
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 

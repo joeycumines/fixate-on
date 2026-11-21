@@ -123,7 +123,7 @@ describe('shouldToast — the storm law', () => {
     ).toBe(true);
   });
 
-  test('escalated pause renders the review-needed sentence with error variant (gate run-2 pin)', () => {
+  test('escalated pause renders the review-needed sentence with error variant', () => {
     const t = formatCuratedToast(
       ev('transition', {
         snapshot: snap({
@@ -143,7 +143,7 @@ describe('shouldToast — the storm law', () => {
     expect(t.message.startsWith('{')).toBe(false);
   });
 
-  test('budget-limited pause names the BUDGET, not a repeated failure (gate run-2 pin)', () => {
+  test('budget-limited pause names the BUDGET, not a repeated failure', () => {
     const t = formatCuratedToast(
       ev('transition', {
         snapshot: snap({
@@ -367,7 +367,7 @@ describe('ToastCoalescer — rate law', () => {
     expect(out[0]!.startsWith('{')).toBe(false);
   });
 
-  test('accept() itself drains matured queued toasts (gate fix B1)', () => {
+  test('accept() itself drains matured queued toasts', () => {
     const out: string[] = [];
     let now = 100_000;
     const c = new ToastCoalescer(

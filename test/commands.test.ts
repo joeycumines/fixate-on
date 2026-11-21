@@ -19,6 +19,23 @@ import type {CreateGoalOptions} from '../src/tools.ts';
 
 // Helpers
 
+test('clear refuses an ambiguous goal prefix without removing either goal', async () => {
+  const removedGoalIds: string[] = [];
+  const activeGoals = [
+    makeGoal({goalId: 'shared-first'}),
+    makeGoal({goalId: 'shared-second'}),
+  ];
+  const session = makeSessionContext({activeGoals, removedGoalIds});
+  expect(await handleCommand('clear shared-', session)).toContain(
+    'matches 2 goals',
+  );
+  expect(removedGoalIds).toEqual([]);
+  expect(await handleCommand('clear shared-first', session)).toContain(
+    'Goal cleared:',
+  );
+  expect(removedGoalIds).toEqual(['shared-first']);
+});
+
 function makeUsage(partial: Partial<UsageSnapshot> = {}): UsageSnapshot {
   return {
     input: 1000,
@@ -306,6 +323,85 @@ test('handleCommand with status shows status', async () => {
   expect(result).toContain('Working: Build the feature');
 });
 
+test('handleCommand status --full returns the full verbose wall', async () => {
+  const machine = makeMachine();
+  const session = makeSessionContext({machine});
+  const full = await handleCommand('status --full', session, 'goal');
+  const verbose = await handleCommand('status --verbose', session, 'goal');
+  const headline = await handleCommand('status', session, 'goal');
+  expect(full).toBe(verbose);
+  expect(full.length).toBeGreaterThan(headline.length);
+});
+
+test('handleCommand list all lists live goals and the archive', async () => {
+  const machine = makeMachine();
+  const session = makeSessionContext({
+    machine,
+    archived: [makeResult()],
+  });
+  const result = await handleCommand('list all', session, 'goal');
+  expect(result).toContain('Goals (1):');
+  expect(result).toContain('Build the feature');
+  expect(result).toContain('Archived (1, newest last):');
+  expect(result).toContain('Old completed goal');
+});
+
+test('handleCommand list with an unknown operand still refuses', async () => {
+  const machine = makeMachine();
+  const session = makeSessionContext({machine});
+  const result = await handleCommand('list bogus', session, 'goal');
+  expect(result).toContain('does not accept additional arguments');
+});
+
+test('handleCommand handback/review with trailing prose is refused', async () => {
+  const machine = makeMachine();
+  const session = makeSessionContext({machine});
+  for (const args of [
+    'handback please focus on auth',
+    'review the attached patch',
+    'review-payload plus extra',
+  ]) {
+    const result = await handleCommand(args, session, 'goal');
+    expect(result).toContain('does not accept additional arguments');
+  }
+});
+
+test('handleCommand list all and ls all serve the exact same listing as list', async () => {
+  const machine = makeMachine();
+  const session = makeSessionContext({
+    machine,
+    archived: [makeResult()],
+  });
+  const bare = await handleCommand('list', session, 'goal');
+  for (const form of ['list all', 'ls all', 'LIST ALL']) {
+    expect(await handleCommand(form, session, 'goal')).toBe(bare);
+  }
+});
+
+test('handleCommand history --verbose on an archived result shows the raw trail', async () => {
+  const history: GoalLifecycleEvent[] = [
+    {timestamp: Date.now() - 60000, type: 'set', detail: 'Goal created'},
+    {
+      timestamp: Date.now() - 30000,
+      type: 'tracking',
+      detail: 'bookkeeping only',
+    },
+    {timestamp: Date.now(), type: 'complete', detail: 'Settled'},
+  ];
+  const session = makeSessionContext({
+    machine: null,
+    activeGoals: [],
+    archived: [{...makeResult(), history}],
+  });
+  const bare = await handleCommand('history', session, 'goal');
+  const verbose = await handleCommand('history --verbose', session, 'goal');
+  const full = await handleCommand('history --full', session, 'goal');
+  expect(bare).toContain('Last goal history for:');
+  expect(bare).not.toContain('bookkeeping only');
+  expect(verbose).toContain('tracking: bookkeeping only');
+  expect(full).toBe(verbose);
+});
+
 test('handleCommand with no goal shows message', async () => {
   const session = makeSessionContext({
     machine: null,
@@ -321,6 +417,44 @@ test('handleCommand history shows history', async () => {
   const session = makeSessionContext({machine});
   const result = await handleCommand('history', session, 'goal');
   expect(result).toContain('Goal history for:');
+});
+
+test('handleCommand history --verbose shows the raw trail including bookkeeping entries', async () => {
+  const history: GoalLifecycleEvent[] = [
+    {timestamp: Date.now() - 60000, type: 'set', detail: 'Goal created'},
+    {
+      timestamp: Date.now() - 30000,
+      type: 'tracking',
+      detail: 'baseline updated',
+    },
+    {timestamp: Date.now(), type: 'paused', detail: 'User paused'},
+  ];
+  const machine = makeMachine(makeGoal({history}));
+  const session = makeSessionContext({machine});
+  const bare = await handleCommand('history', session, 'goal');
+  const verbose = await handleCommand('history --verbose', session, 'goal');
+  const full = await handleCommand('history --full', session, 'goal');
+  expect(bare).toContain('set: Goal created');
+  expect(bare).not.toContain('tracking');
+  expect(verbose).toContain('tracking: baseline updated');
+  expect(verbose.length).toBeGreaterThan(bare.length);
+  expect(full).toBe(verbose);
+});
+
+test('handleCommand history with an unknown operand still refuses', async () => {
+  const machine = makeMachine();
+  const session = makeSessionContext({machine});
+  const result = await handleCommand('history bogus', session, 'goal');
+  expect(result).toContain('does not accept additional arguments');
+});
+
+test('formatHistoryRaw never renders the literal "undefined" for a missing detail', async () => {
+  const {formatHistoryRaw} = await import('../src/commands-format.ts');
+  const out = formatHistoryRaw([
+    {timestamp: Date.now(), type: 'mutation', detail: undefined as never},
+  ]);
+  expect(out).not.toContain('undefined');
+  expect(out).toContain('mutation:');
 });
 
 test('handleCommand list shows goal list', async () => {

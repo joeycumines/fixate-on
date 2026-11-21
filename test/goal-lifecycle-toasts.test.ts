@@ -722,7 +722,7 @@ describe("one session's traffic cannot silence another's", () => {
 // R4: the load briefing
 
 describe('goals that are defined but not running', () => {
-  test("self-resolving stops are excluded — R3's active-side toast already covers them", () => {
+  test('self-resolving stops are excluded because the active-side toast already covers them', () => {
     for (const stopReason of ['recovery', 'user intervention', 'queued']) {
       expect(
         goalNeedsTheUser(snap({status: 'paused', stopReason})),

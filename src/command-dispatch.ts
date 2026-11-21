@@ -8,7 +8,11 @@
  */
 
 import {GOAL_COMMAND_TEMPLATE_PREFIX} from './native-agent-config.ts';
-import {canonicalGoalDispatch, isBareGoalObjective} from './commands.ts';
+import {
+  canonicalGoalDispatch,
+  isBareGoalObjective,
+  parseGoalCommand,
+} from './commands-args.ts';
 
 /**
  * True when `text` is the host's own replay of our config command template.
@@ -47,6 +51,18 @@ export function markSlashDispatch(sessionID: string, args: string): void {
   recentSlashEcho.set(sessionID, queue);
 }
 
+/**
+ * Non-destructive check for a matching in-window echo fingerprint. Use this in
+ * read-only filters (e.g. history scans) so one scan cannot consume the
+ * fingerprint before another scan that needs the same check.
+ */
+export function hasSlashEcho(sessionID: string, text: string): boolean {
+  const queue = recentSlashEcho.get(sessionID);
+  if (!queue || queue.length === 0) return false;
+  const now = Date.now();
+  return queue.some(e => now - e.at < SLASH_ECHO_WINDOW_MS && text === e.args);
+}
+
 /** Consume a matching in-window echo fingerprint for this session, if any. */
 export function matchSlashEcho(sessionID: string, text: string): boolean {
   const queue = recentSlashEcho.get(sessionID);
@@ -73,7 +89,7 @@ export function matchSlashEcho(sessionID: string, text: string): boolean {
 // reporting fresh state. A MUTATING dispatch that found nothing to change
 // (clear with no goal) IS recorded, because the duplicate channel exists to
 // answer a second dispatch that can arrive after the world has changed — see
-// MUTATING_ROOTS.
+// isMutatingCommand.
 //
 // The remaining scoping is deliberately narrow: exact canonical-identity match,
 // consumed once, per session. A genuine repeat invocation runs the hook again
@@ -98,9 +114,9 @@ const MAX_COMMAND_DISPATCH_SESSIONS = 256;
 const MAX_COMMAND_DISPATCH_PER_SESSION = 16;
 
 /**
- * The subcommand roots that MUTATE goal state when they run, whether or not a
- * particular dispatch found anything to change. Everything else in
- * SUBCOMMAND_ROOTS is read-only.
+ * Commands that can mutate goal state need replay protection even when a
+ * particular dispatch found nothing to change. Use the execution parser so
+ * tabs, aliases and multiline objectives have exactly the same meaning here.
  *
  * MEASURED 2026-10-24 (run 2026-10-24T23:04:34Z, the v1 host's own DB): a
  * `clear` dispatched by the command hook with no goal present (changed=false,
@@ -110,39 +126,9 @@ const MAX_COMMAND_DISPATCH_PER_SESSION = 16;
  * world did not change in between, and the duplicate channel exists precisely
  * because the world changes between the two dispatches.
  */
-const MUTATING_ROOTS = new Set([
-  'clear',
-  'stop',
-  'off',
-  'reset',
-  'none',
-  'cancel',
-  'pause',
-  'resume',
-  'accept',
-  'accept-proposal',
-  'reject',
-  'reject-proposal',
-  'handback',
-  'review',
-  'review-payload',
-  'edit',
-  'focus',
-  'checkpoint',
-  'add',
-  'sequence',
-]);
-
-/**
- * True when a subcommand's root can mutate goal state, so a repeat is not
- * guaranteed harmless even when this dispatch changed nothing.
- */
-function isMutatingRoot(line: string): boolean {
-  const lower = line.trim().toLowerCase();
-  for (const candidate of MUTATING_ROOTS) {
-    if (lower === candidate || lower.startsWith(`${candidate} `)) return true;
-  }
-  return false;
+function isMutatingCommand(line: string): boolean {
+  const command = parseGoalCommand(line);
+  return !command.readOnly && command.action !== 'invalid';
 }
 
 /**
@@ -162,7 +148,7 @@ export function markCommandDispatch(
   changed: boolean,
 ): void {
   if (!sessionID || !subcommand.trim()) return;
-  if (!changed && !isMutatingRoot(subcommand)) return;
+  if (!changed && !isMutatingCommand(subcommand)) return;
   const key = canonicalGoalDispatch(subcommand);
   if (!key) return;
   // The bare form is load-bearing for the duplicate rule and is NOT recoverable

@@ -21,7 +21,11 @@ import type {
   TransitionSource,
 } from './state-machine.ts';
 import type {UsageSnapshot} from './accounting.ts';
-import {normalizeUsage, toNonNegativeInteger} from './accounting.ts';
+import {
+  normalizeUsage,
+  toNonNegativeInteger,
+  USAGE_TOKEN_FIELDS,
+} from './accounting.ts';
 import {MAX_STATE_FILE_BYTES, portableReadBounded} from './fs-portable.ts';
 
 // Bounds: state files are untrusted input, so lengths are capped and
@@ -107,7 +111,9 @@ export interface SerializedGoal {
   totalTokens: number;
   compactionBaselineTokens: number;
   usage: UsageSnapshot;
+  lastSessionUsage?: UsageSnapshot | null;
   createdAt: number;
+  userCommandStartedAt?: number;
   updatedAt: number;
   startedAt: number;
   pausedAt: number;
@@ -136,9 +142,11 @@ export interface SerializedGoal {
   blockedAssertedThisTurn: boolean;
   languageTriage: boolean;
   lastStatus: string;
+  kickoffAdmissionPending?: boolean;
   lastAssistantText: string;
   lastAssistantMessageID: string;
   lastCountedProgressMessageID?: string;
+  stalledTurnCounted?: boolean;
   lastNoToolCallMessageID?: string;
   baseline?: RunBaseline | null;
   lastContinueAt: number;
@@ -284,9 +292,30 @@ function normalizeBaseline(raw: unknown): RunBaseline | null {
   };
 }
 
+function normalizeSessionUsageWatermark(
+  value: unknown,
+): UsageSnapshot | null | undefined {
+  if (value === null) return null;
+  if (
+    !isPlainObject(value) ||
+    !USAGE_TOKEN_FIELDS.every(
+      field => Number.isSafeInteger(value[field]) && Number(value[field]) >= 0,
+    ) ||
+    typeof value.cost !== 'number' ||
+    !Number.isFinite(value.cost) ||
+    value.cost < 0 ||
+    typeof value.costKnown !== 'boolean'
+  )
+    return undefined;
+  return normalizeUsage(value);
+}
+
 export function serializeGoal(goal: GoalState): SerializedGoal {
   return {
     ...goal,
+    lastSessionUsage: goal.lastSessionUsage
+      ? {...goal.lastSessionUsage}
+      : goal.lastSessionUsage,
     artifactPointers: [...goal.artifactPointers],
     pendingProposal: goal.pendingProposal
       ? {
@@ -396,7 +425,7 @@ export function deserializeGoal(raw: unknown): GoalState {
       Number(source.tokenBudget) > 0
         ? Number(source.tokenBudget)
         : null,
-    maxTokens: toNonNegativeInteger(source.maxTokens, 1000000),
+    maxTokens: toNonNegativeInteger(source.maxTokens, 0),
     maxTurns: toNonNegativeInteger(source.maxTurns, 0),
     maxDurationMs: toNonNegativeInteger(source.maxDurationMs, 1800000),
     minDelayMs: toNonNegativeInteger(source.minDelayMs, 1500),
@@ -418,7 +447,14 @@ export function deserializeGoal(raw: unknown): GoalState {
       source.compactionBaselineTokens,
     ),
     usage: normalizeUsage(source.usage),
+    lastSessionUsage: normalizeSessionUsageWatermark(source.lastSessionUsage),
     createdAt: toNonNegativeInteger(source.createdAt),
+    userCommandStartedAt:
+      typeof source.userCommandStartedAt === 'number' &&
+      Number.isFinite(source.userCommandStartedAt) &&
+      source.userCommandStartedAt > 0
+        ? toNonNegativeInteger(source.userCommandStartedAt)
+        : undefined,
     updatedAt: toNonNegativeInteger(source.updatedAt),
     startedAt: toNonNegativeInteger(source.startedAt),
     pausedAt: toNonNegativeInteger(source.pausedAt),
@@ -461,6 +497,7 @@ export function deserializeGoal(raw: unknown): GoalState {
     // Backward compatibility: default language triage to true when absent.
     languageTriage: source.languageTriage !== false,
     lastStatus: capString(source.lastStatus, MAX_GOAL_META_LENGTH),
+    kickoffAdmissionPending: source.kickoffAdmissionPending === true,
     lastAssistantText: capString(
       source.lastAssistantText,
       MAX_LAST_ASSISTANT_TEXT_LENGTH,
@@ -473,6 +510,10 @@ export function deserializeGoal(raw: unknown): GoalState {
       source.lastCountedProgressMessageID,
       MAX_GOAL_META_LENGTH,
     ),
+    stalledTurnCounted:
+      typeof source.stalledTurnCounted === 'boolean'
+        ? source.stalledTurnCounted
+        : undefined,
     lastNoToolCallMessageID: capString(
       source.lastNoToolCallMessageID,
       MAX_GOAL_META_LENGTH,

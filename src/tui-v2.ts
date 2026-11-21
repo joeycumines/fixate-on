@@ -28,6 +28,11 @@ import {
 import {DashboardRoute, type HostTheme} from './tui-dashboard-route.tsx';
 import {createSignal, onCleanup} from 'solid-js';
 import {type V2EventContext, wireV2Events} from './tui-v2-events.ts';
+import {
+  type GoalOutputTuiContext,
+  wireGoalCommandOutput,
+} from './tui-v2-command-output.ts';
+import {showGoalCommandReceipt} from './tui-v2-receipt-dialog.tsx';
 
 // Minimal Context interface consumed by the plugin until @opencode-ai/plugin/tui
 // is officially published. Unknown-shaped fields are typed as `unknown` and narrowed at use sites.
@@ -53,6 +58,7 @@ interface V2Context {
    */
   readonly location?: {directory: string; workspaceID?: string};
   readonly client: {
+    rpc?: GoalOutputTuiContext['client']['rpc'];
     session: {
       synthetic(params: {
         sessionID: string;
@@ -391,14 +397,17 @@ export const GoalTuiPluginV2 = {
     // Eagerly hydrate from disk to prevent initial views from displaying empty state.
     const eagerHydrateDir =
       opts.workspaceDirectory ?? context.location?.directory;
-    if (eagerHydrateDir) {
-      void hydrateStoreFromDisk(
-        store,
-        eagerHydrateDir,
-        undefined,
-        opts.stateRoot,
-      ).catch(() => {});
-    }
+    const initialHydration: Promise<void> | null = eagerHydrateDir
+      ? hydrateStoreFromDisk(
+          store,
+          eagerHydrateDir,
+          undefined,
+          opts.stateRoot,
+        ).then(
+          () => {},
+          () => {},
+        )
+      : null;
 
     const lastHydration: {dir?: string; count: number; evidence?: string} = {
       count: 0,
@@ -578,17 +587,25 @@ export const GoalTuiPluginV2 = {
       dashboardRouteDispose = context.ui.router.register({
         name: dashboardRouteName,
         render: () => {
-          const theme = (context.theme ?? {}) as HostTheme;
           // SolidJS reactivity: trigger view updates on store events without route re-navigation.
           const [rev, setRev] = createSignal(0);
           const unsub = store.subscribe(() => setRev(r => r + 1));
           onCleanup(() => {
+            // Route unmount without onClose must not leave the global scroll
+            // binds armed: they would shadow host arrow/page keys while the
+            // dashboard is gone.
+            dashboardOpen = false;
+            dashboardSessionID = null;
+            scrollHandlers = null;
             try {
               unsub();
             } catch {
               // Teardown is best-effort.
             }
           });
+          // The theme is read reactively (not hoisted out of the render) so a
+          // host theme swap repaints the dashboard with the new dialog surface.
+          const theme = () => dialogTheme();
           const sections = () => {
             rev();
             return dashboardSections();
@@ -636,11 +653,15 @@ export const GoalTuiPluginV2 = {
             onClose: () => {
               dashboardOpen = false;
               dashboardSessionID = null;
+              scrollHandlers = null;
               try {
                 context.ui.router.navigate({type: 'home'});
               } catch {
                 // Ignore navigation errors on dismissal.
               }
+            },
+            registerScrollCommands: handlers => {
+              scrollHandlers = handlers;
             },
             theme,
             footer: dashboardFooter(dashboardSession),
@@ -656,6 +677,24 @@ export const GoalTuiPluginV2 = {
     let dashboardOpen = false;
     let dashboardSessionID: string | null = null;
     let dashboardUnsubscribe: (() => void) | null = null;
+    // Keyboard-scroll handlers registered by the dashboard route's render.
+    // Null while the dashboard dialog is closed; scroll commands no-op then.
+    let scrollHandlers: {
+      up: () => void;
+      down: () => void;
+      pageUp: () => void;
+      pageDown: () => void;
+    } | null = null;
+
+    /** Resolves the theme on the dialog surface, where the dashboard renders. */
+    const dialogTheme = (): HostTheme => {
+      const raw = (context.theme ?? {}) as HostTheme;
+      try {
+        return typeof raw.surface === 'function' ? raw.surface('dialog') : raw;
+      } catch {
+        return raw;
+      }
+    };
 
     const isDashboardRouteActive = (): boolean => {
       try {
@@ -680,7 +719,6 @@ export const GoalTuiPluginV2 = {
     const repaintDashboard = (): void => {
       if (!dashboardOpen) return;
       const generation = ++dashboardGeneration;
-      const theme = (context.theme ?? {}) as HostTheme;
 
       const renderContent = () =>
         DashboardRoute({
@@ -710,6 +748,7 @@ export const GoalTuiPluginV2 = {
           onClose: () => {
             dashboardOpen = false;
             dashboardSessionID = null;
+            scrollHandlers = null;
             if (dashboardUnsubscribe) {
               try {
                 dashboardUnsubscribe();
@@ -724,7 +763,10 @@ export const GoalTuiPluginV2 = {
               // Dialog might already be dismissed.
             }
           },
-          theme,
+          registerScrollCommands: handlers => {
+            scrollHandlers = handlers;
+          },
+          theme: () => dialogTheme(),
           footer: dashboardFooter(
             () => dashboardSessionID ?? activeSessionID(),
           ),
@@ -738,6 +780,7 @@ export const GoalTuiPluginV2 = {
         if (generation === dashboardGeneration) {
           dashboardOpen = false;
           dashboardSessionID = null;
+          scrollHandlers = null;
           if (dashboardUnsubscribe) {
             try {
               dashboardUnsubscribe();
@@ -800,7 +843,11 @@ export const GoalTuiPluginV2 = {
         await sendGoalCommand(bare);
         return;
       }
-      const goalId = resolveFocusedGoalId(store, sid);
+      let goalId = resolveFocusedGoalId(store, sid);
+      if (goalId === null && initialHydration) {
+        await initialHydration;
+        goalId = resolveFocusedGoalId(store, sid);
+      }
       if (goalId === null) return;
       await sendGoalCommand(targeted(goalId));
     };
@@ -815,7 +862,11 @@ export const GoalTuiPluginV2 = {
       prompt: () => Promise<string | undefined>,
     ): Promise<void> => {
       const sid = dashboardSession();
-      const goalId = sid === null ? null : resolveFocusedGoalId(store, sid);
+      let goalId = sid === null ? null : resolveFocusedGoalId(store, sid);
+      if (sid !== null && goalId === null && initialHydration) {
+        await initialHydration;
+        goalId = resolveFocusedGoalId(store, sid);
+      }
       if (sid !== null && goalId === null) return;
       const operand = await prompt();
       if (!operand) return;
@@ -824,7 +875,11 @@ export const GoalTuiPluginV2 = {
       );
     };
 
+    // OpenCode 2.x gates command reachability by the active input mode: the palette
+    // and other modals push their own mode, so a base-mode layer vanishes from the
+    // palette the moment it opens. The layer must be global to stay reachable.
     context.keymap.layer(() => ({
+      mode: 'global',
       commands: [
         {
           id: 'fixate-on.dashboard',
@@ -1011,6 +1066,69 @@ export const GoalTuiPluginV2 = {
             await sendGoalCommand('review-payload');
           },
         },
+        // Dashboard scrolling: the host scrollbox moves on mouse wheel only;
+        // these commands drive its ref so arrow/page keys scroll too. They
+        // no-op when the dashboard dialog is not open.
+        {
+          id: 'fixate-on.scroll.up',
+          title: `${PRODUCT_DISPLAY_NAME}: Scroll Dashboard Up`,
+          description: 'Scroll the goal dashboard up one line',
+          group: PRODUCT_DISPLAY_NAME,
+          bind: 'up',
+          enabled: () => dashboardOpen && scrollHandlers !== null,
+          run: () => {
+            try {
+              scrollHandlers?.up();
+            } catch {
+              // A throwing scrollbox ref must not escape into the keymap engine.
+            }
+          },
+        },
+        {
+          id: 'fixate-on.scroll.down',
+          title: `${PRODUCT_DISPLAY_NAME}: Scroll Dashboard Down`,
+          description: 'Scroll the goal dashboard down one line',
+          group: PRODUCT_DISPLAY_NAME,
+          bind: 'down',
+          enabled: () => dashboardOpen && scrollHandlers !== null,
+          run: () => {
+            try {
+              scrollHandlers?.down();
+            } catch {
+              // See scroll.up.
+            }
+          },
+        },
+        {
+          id: 'fixate-on.scroll.page-up',
+          title: `${PRODUCT_DISPLAY_NAME}: Page Dashboard Up`,
+          description: 'Scroll the goal dashboard up one page',
+          group: PRODUCT_DISPLAY_NAME,
+          bind: 'pageup',
+          enabled: () => dashboardOpen && scrollHandlers !== null,
+          run: () => {
+            try {
+              scrollHandlers?.pageUp();
+            } catch {
+              // See scroll.up.
+            }
+          },
+        },
+        {
+          id: 'fixate-on.scroll.page-down',
+          title: `${PRODUCT_DISPLAY_NAME}: Page Dashboard Down`,
+          description: 'Scroll the goal dashboard down one page',
+          group: PRODUCT_DISPLAY_NAME,
+          bind: 'pagedown',
+          enabled: () => dashboardOpen && scrollHandlers !== null,
+          run: () => {
+            try {
+              scrollHandlers?.pageDown();
+            } catch {
+              // See scroll.up.
+            }
+          },
+        },
       ],
     }));
 
@@ -1028,8 +1146,14 @@ export const GoalTuiPluginV2 = {
       activeWatchdogs,
       log,
     });
+    let disposeReceipt: (() => void) | undefined;
+    const disposeOutput = wireGoalCommandOutput(context, text => {
+      disposeReceipt = showGoalCommandReceipt(context, text);
+    });
 
     return () => {
+      disposeOutput();
+      disposeReceipt?.();
       events.dispose();
     };
   },

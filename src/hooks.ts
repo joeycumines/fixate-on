@@ -19,6 +19,8 @@ import {
   messageIsSettled,
 } from './message-helpers.ts';
 import {outputTokensForMessage} from './accounting.ts';
+import {MAX_BACKGROUND_WAIT_MS} from './plugin-v2-helpers.ts';
+import {recordIdleReadFailure} from './hooks-idle.ts';
 import type {HookDeps, PluginHooks, SessionContext} from './hooks-types.ts';
 import {POLL_EVENT_PREFIX} from './hooks-types.ts';
 import {
@@ -133,6 +135,64 @@ export function createHooks(deps: HookDeps): PluginHooks {
   const QUIET_MS = deps.idleQuietMs ?? 10_000;
   let pollSeq = 0;
   const quietSince = new Map<string, {key: string; since: number}>();
+  if (deps.runtime) {
+    const previous = deps.runtime.clearSessionIdleTracking;
+    deps.runtime.clearSessionIdleTracking = (sessionID: string) => {
+      previous?.(sessionID);
+      quietSince.delete(sessionID);
+      lastAuthenticIdleAt.delete(sessionID);
+      seenIdleEventIDs.delete(sessionID);
+    };
+  }
+
+  const escalateBackgroundDeferral = async (
+    sessionID: string,
+  ): Promise<void> => {
+    if (
+      deps.runtime?.canDriveSession &&
+      !deps.runtime.canDriveSession(sessionID)
+    )
+      return;
+    // Bounded escalation: pause with an explicit receipt rather than
+    // continue past an unattested completion or loop indefinitely.
+    // Only active/finalizing goals can transition to paused per
+    // TRANSITION_TABLE; already-paused/blocked goals keep their state
+    // and stop reason but still receive the notice and announcement.
+    const session = getSessionContext(sessionID);
+    const allMachines = sessionMachines(session);
+    for (const target of allMachines) {
+      if (target.isTerminal()) continue;
+      const snap = target.snapshot();
+      if (
+        snap.status === 'active' ||
+        snap.status === 'finalizing' ||
+        snap.finalizing
+      ) {
+        await target.transition('paused', {
+          source: 'idle-handler',
+          stopReason: 'background completion unreported',
+          detail:
+            'A background subagent/image job did not report completion within the wait bound; resume after it finishes.',
+        });
+      }
+      await target.addNotice(
+        'background-completion-unreported',
+        'Background job completion was not reported; goal paused. Resume once the job has finished.',
+      );
+    }
+    if (deps.announceGoalDecision) {
+      await deps.announceGoalDecision(
+        sessionID,
+        'A background subagent/image job did not report completion within the wait bound; goal(s) paused. Resume once the job has finished.',
+      );
+    }
+    if (session) await session.persist();
+    deps.runtime?.backgroundDeferrals?.delete(sessionID);
+    deps.runtime?.backgroundBlockedUntil.delete(sessionID);
+  };
+  if (deps.runtime) {
+    deps.runtime.escalateBackgroundDeferral = escalateBackgroundDeferral;
+  }
 
   const pollTick = async (): Promise<void> => {
     if (deps.runtime?.disposed) {
@@ -146,6 +206,47 @@ export function createHooks(deps: HookDeps): PluginHooks {
         // this process lifetime, preventing resumption of un-opened persisted sessions.
         if (!deps.runtime?.liveSessions.has(sessionID)) continue;
         if (deps.runtime?.promptInFlightSessions.has(sessionID)) continue;
+        if (
+          deps.runtime?.canDriveSession &&
+          !deps.runtime.canDriveSession(sessionID)
+        )
+          continue;
+        // A host-reported background job defers idles. The wall-clock deadline
+        // is NOT a completion signal — only a later native idle with an empty
+        // background authoritatively clears it. On expiry we keep deferring and
+        // extend with backoff, until a bounded cap pauses with an explicit
+        // receipt instead of driving over live work or stalling forever.
+        const deferral = deps.runtime?.backgroundDeferrals?.get(sessionID);
+        const backgroundDeadline =
+          deps.runtime?.backgroundBlockedUntil.get(sessionID);
+        if (deferral || backgroundDeadline !== undefined) {
+          const now = Date.now();
+          const deadline = backgroundDeadline ?? deferral!.nextRecheckAt;
+          if (
+            deps.runtime?.canDriveSession &&
+            !deps.runtime.canDriveSession(sessionID)
+          )
+            continue;
+          const since = deferral?.since ?? now;
+          if (now - since >= MAX_BACKGROUND_WAIT_MS) {
+            await escalateBackgroundDeferral(sessionID);
+            continue;
+          }
+          // A rolling recheck deadline cannot postpone the absolute wait bound.
+          if (deadline > now) continue;
+          // Still within the bound: extend the deferral with bounded backoff.
+          // The host's next experimental.idle with empty background clears it.
+          const extensions = (deferral?.extensions ?? 0) + 1;
+          const nextRecheckAt = now + Math.min(60_000, 5_000 * extensions);
+          deps.runtime?.backgroundDeferrals?.set(sessionID, {
+            jobKeys: deferral?.jobKeys ?? [],
+            since,
+            nextRecheckAt,
+            extensions,
+          });
+          deps.runtime?.backgroundBlockedUntil.set(sessionID, nextRecheckAt);
+          continue;
+        }
         const lastReal = lastAuthenticIdleAt.get(sessionID);
         if (lastReal !== undefined && Date.now() - lastReal < IDLE_GRACE_MS)
           continue;
@@ -177,9 +278,34 @@ export function createHooks(deps: HookDeps): PluginHooks {
 
         // Quiet-window gate: prompt only after the newest assistant turn has remained
         // unchanged for QUIET_MS to avoid interrupting in-flight turns.
-        const messages = await deps.sessionApi
-          .messages(sessionID, {limit: 5})
-          .catch(() => []);
+        const observedGoals = machines.map(machine => ({
+          machine,
+          goal: machine.snapshot(),
+        }));
+        let messages: unknown[];
+        try {
+          messages = await deps.sessionApi.messages(sessionID, {limit: 5});
+        } catch (error) {
+          // No quiet-window observation was obtained. A failing host read must
+          // not synthesize idle, but it also must not leave an active goal
+          // silently stranded on hosts without a native idle event channel.
+          quietSince.delete(sessionID);
+          await logError(
+            'Failed to read session state during idle polling',
+            error,
+          );
+          for (const {machine} of observedGoals) {
+            await recordIdleReadFailure(
+              sessionID,
+              session,
+              machine,
+              deps,
+              machine.snapshot(),
+              error,
+            );
+          }
+          continue;
+        }
         if (!Array.isArray(messages) || messages.length === 0) continue;
 
         // Host versions return session.messages() in differing orders (v2 is desc,

@@ -8,6 +8,7 @@ import {
 import {serializeGoal, serializeResult} from './persistence.ts';
 import {appendWalEntry, createCommittedEntry} from './persistence-wal.ts';
 import {ensureSessionDir, sessionStatePaths} from './session-paths.ts';
+import {clearSessionDeliveryState} from './session-runtime.ts';
 import type {CreateGoalOptions} from './tools.ts';
 import type {SessionLifecycleHost} from './session-lifecycle-types.ts';
 
@@ -80,6 +81,8 @@ export function createGoalOwned(
       options.maxUnchangedResults ?? mgr.defaultOpts.maxUnchangedResults,
     maxBlockedTurns: options.maxBlockedTurns ?? mgr.defaultOpts.maxBlockedTurns,
     languageTriage: options.languageTriage ?? mgr.defaultOpts.languageTriage,
+    kickoffAdmissionPending: options.kickoffAdmissionPending,
+    userCommandStartedAt: options.userCommandStartedAt,
   });
   const machine = new GoalStateMachine(goal, {
     onCommit: mgr.createOnCommit(),
@@ -416,6 +419,9 @@ export async function clearSessionOwned(
   mgr.runtime.focusedGoalId.delete(sessionID);
   mgr.runtime.sessionOrdered.delete(sessionID);
   mgr.runtime.compactionTimestamps.delete(sessionID);
+  // Delivery-tracking keys are per-session too: prune them so a reused session
+  // id cannot classify messages with another session's recorded deliveries.
+  clearSessionDeliveryState(mgr.runtime, sessionID);
   for (const key of [...mgr.runtime.deferCounts.keys()]) {
     if (key.startsWith(`${sessionID}:`)) mgr.runtime.deferCounts.delete(key);
   }
@@ -483,6 +489,7 @@ export async function autoPromoteOwned(
           g.noProgressTurns = 0;
           g.noToolCallTurns = 0;
           g.lastCountedProgressMessageID = '';
+          g.stalledTurnCounted = false;
           g.lastNoToolCallMessageID = '';
           g.promptFailures = 0;
           g.recoveryTurns = 0;

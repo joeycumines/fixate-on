@@ -36,11 +36,15 @@ jobs:
         run: bun install --frozen-lockfile
       - name: Type check
         run: bun run type:check
+      # The identity-constants test asserts that every package.json export target
+      # exists. The bundles are gitignored, so a clean checkout has none: build
+      # them before testing, exactly as release:check does. Measured 2026-11-21
+      # (PR #3): tests-before-bundle failed on `plugin/fixate-on/plugin.js`.
+      - name: Generate the bundle
+        run: bun run bundle
       - name: Run the test suite
         run: bun test test/*.test.ts
       - name: Lint
         run: bun run lint
-      - name: Generate the bundle
-        run: bun run bundle
       - name: Audit the dependency tree
         run: bun run audit

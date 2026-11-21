@@ -33,6 +33,8 @@ places it was looked for. Confirm with:
 - `launch.sh`    — v2: opencode2 --standalone, tmux session `fixate-on`, cfg/ (server plugin + cli.json v2 companion)
 - `launch-v1.sh` — v1: stock brew opencode, isolated HOME, tmux session `fixate-on`, cfg-v1/ (server plugin + tui.json v1 companion)
 - `drive.sh`     — v2 palette-driven campaign: Add Goal -> poll state.json -> Dashboard -> live-update detection -> Escape close
+- `drive-v2-goal-loop.sh` — v2 goal-loop campaign: runs `verify-v2-goal-loop.ts` against the installed `opencode2` binary and a local mock OpenAI-compatible server, so it needs no provider key. Covers directory plugin loading, zero-config `/goal` via `command.transform`, `<goal_context>` injection, `experimental.idle` continuation in `serve` and `--standalone run`, the judge's settlement, `commands.goal` coexistence, the no-tool-call brake, `workspaceDirectory` scoping, and compaction survival. Override the host with `E2E_OPENCODE2_BIN`.
+- `verify-v2-goal-loop.ts` — the campaign body: three isolated cases (serve `/goal` + settlement; compaction + brake + workspace scope; `--standalone run` continuation), each in its own XDG tree with its own work directory, torn down afterwards.
 - `drive-f2.sh`  — v1 toast-discipline laws: L1 zero JSON toasts, L2 curated moment, L3 no screen-covering
 - `drive-cockpit-v1.sh` — v1 cockpit C1–C6 via the command palette: dashboard opens, goal list renders, detail card, action menu, back to list, close. Asserts dialog-only markers and asserts their ABSENCE to confirm close.
 - `cfg/`         — v2 server config (openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free, goal-command template, Implementer agent) + cli.json (v2 TUI companion) + agents/
@@ -63,6 +65,7 @@ generated, and the campaign is supposed to change them.
 
     bash hack/e2e-harness/launch.sh        # v2 full TUI in tmux
     bash hack/e2e-harness/drive.sh         # palette-driven campaign (requires launch.sh running)
+    bash hack/e2e-harness/drive-v2-goal-loop.sh  # v2 goal-loop campaign (self-contained: mock model, installed opencode2)
     bash hack/e2e-harness/launch-v1.sh     # v1 full TUI in tmux (isolated HOME)
     bash hack/e2e-harness/drive-f2.sh      # v1 toast-law campaign (requires launch-v1.sh running)
     tmux attach -t fixate-on                  # watch (do NOT kill sessions you don't own)
@@ -138,10 +141,10 @@ workspace, so a read outside it is never legitimate here.
 
 ## Orchestrated runs, cadence, and evidence aging
 
-- `run-all.sh` — the documented command that runs every campaign (six v1, one
-  v2) against HEAD from the isolated fixture projects, under one lease per
+- `run-all.sh` — the documented command that runs every campaign (six v1, two
+  v2: `drive.sh` and `drive-v2-goal-loop.sh`) against HEAD from the isolated fixture projects, under one lease per
   host type (`slot.sh`). Preflight: harness-unmodified attestation, bundle
-  freshness + the 20 harness contracts, stale-evidence aging, and an
+  freshness, stale-evidence aging, and an
   `OPENROUTER_API_KEY` check. It relaunches each host fresh under the lease so
   boot-time events (the load briefing) are observable, runs the campaigns,
   attests the harness again afterwards, and prints state digests plus the

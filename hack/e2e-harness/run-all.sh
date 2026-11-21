@@ -168,29 +168,27 @@ fi
 
 # V2 CAMPAIGNS
 # Relaunch the v2 host fresh under the lease, same reason as v1.
-# The installed opencode2 v2.0.27 release has TWO deficiencies proven by upstream
-# source cross-reference (tag v2.0.27, commit 1f4d07a):
-# (1) TUI plugin loading uses raw import which throws ERR_UNKNOWN_BUILTIN_MODULE
-# for file:// URLs in the SEA binary (fixed in commit 0dfcb30d71, NOT in release)
-# (2) Keymap layer registration deferred to cleanup + defaults to base mode
-# (fixed in commit 359c501ceb, NOT in release)
-# The from-source wrapper runs the fix/external-tui-plugin-loading branch which has
-# both fixes. Without this override, launch.sh defaults to the installed release
-# binary which also rejects file targets with WARN "configured plugin path must be
-# a directory" (observed in logs).
+# Defaults to the installed `opencode2` binary (verified on v2.2.7 with
+# hack/e2e-harness/plugin-dir in cfg/opencode.json and cfg/cli.json); callers
+# can still override via E2E_OPENCODE2_BIN if targeting a custom checkout.
+V2_CAMPAIGNS=(
+  "dashboard-live:drive.sh"
+  "goal-loop-v2:drive-v2-goal-loop.sh"
+)
 if acquire_lease "v2" "run-all"; then
   log "== relaunch v2 host (fresh boot for boot-time events) =="
-  export E2E_OPENCODE2_BIN="$HERE/opencode2-from-source.sh"
   if ! bash "$HERE/launch.sh" >> "$TRANSCRIPT" 2>&1; then
     log "FAIL[launch-v2]: could not relaunch v2 host"
     release_lease "v2"
     exit 1
   fi
-  run_campaign "dashboard-live" "drive.sh"
+  for spec in "${V2_CAMPAIGNS[@]}"; do
+    run_campaign "${spec%%:*}" "${spec#*:}"
+  done
   release_lease "v2"
 else
   log "SKIP[v2 campaigns]: lease held by another process"
-  TOTAL_SKIP=$((TOTAL_SKIP + 1))
+  TOTAL_SKIP=$((TOTAL_SKIP + ${#V2_CAMPAIGNS[@]}))
   RESULTS="${RESULTS}SKIP[v2:lease] "
 fi
 
