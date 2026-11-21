@@ -20,14 +20,25 @@ export function isSessionGoneError(error: unknown): boolean {
       data?: {message?: unknown};
       cause?: unknown;
     };
-    const name = String(detail.name ?? detail._tag ?? '').toLowerCase();
-    const message = String(
-      detail.message ?? detail.data?.message ?? '',
-    ).toLowerCase();
-    if (/notfound|sessionnotfound/.test(name)) return true;
+    const nonEmpty = (value: unknown): string =>
+      typeof value === 'string' && value.length > 0 ? value : '';
+    // Check name and _tag independently: a generic name ('Error') must not
+    // mask a typed tag, and an empty message must not mask data.message.
+    const names = [nonEmpty(detail.name), nonEmpty(detail._tag)];
+    const messages = [nonEmpty(detail.message), nonEmpty(detail.data?.message)];
     if (
-      /session\s+(?:not\s+found|no\s+longer\s+exists|does\s+not\s+exist|deleted|expired)/.test(
-        message,
+      names.some(
+        n =>
+          /notfound|sessionnotfound/i.test(n) ||
+          (/session/i.test(n) && /not.*found/i.test(n)),
+      )
+    )
+      return true;
+    if (
+      messages.some(m =>
+        /session\s+(?:not\s+found|no\s+longer\s+exists|does\s+not\s+exist|deleted|expired)/i.test(
+          m,
+        ),
       )
     )
       return true;

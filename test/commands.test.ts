@@ -353,6 +353,19 @@ test('handleCommand list with an unknown operand still refuses', async () => {
   expect(result).toContain('does not accept additional arguments');
 });
 
+test('handleCommand handback/review with trailing prose is refused', async () => {
+  const machine = makeMachine();
+  const session = makeSessionContext({machine});
+  for (const args of [
+    'handback please focus on auth',
+    'review the attached patch',
+    'review-payload plus extra',
+  ]) {
+    const result = await handleCommand(args, session, 'goal');
+    expect(result).toContain('does not accept additional arguments');
+  }
+});
+
 test('handleCommand list all and ls all serve the exact same listing as list', async () => {
   const machine = makeMachine();
   const session = makeSessionContext({

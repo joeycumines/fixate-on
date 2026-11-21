@@ -135,6 +135,15 @@ export function createHooks(deps: HookDeps): PluginHooks {
   const QUIET_MS = deps.idleQuietMs ?? 10_000;
   let pollSeq = 0;
   const quietSince = new Map<string, {key: string; since: number}>();
+  if (deps.runtime) {
+    const previous = deps.runtime.clearSessionIdleTracking;
+    deps.runtime.clearSessionIdleTracking = (sessionID: string) => {
+      previous?.(sessionID);
+      quietSince.delete(sessionID);
+      lastAuthenticIdleAt.delete(sessionID);
+      seenIdleEventIDs.delete(sessionID);
+    };
+  }
 
   const escalateBackgroundDeferral = async (
     sessionID: string,
@@ -285,13 +294,13 @@ export function createHooks(deps: HookDeps): PluginHooks {
             'Failed to read session state during idle polling',
             error,
           );
-          for (const {machine, goal} of observedGoals) {
+          for (const {machine} of observedGoals) {
             await recordIdleReadFailure(
               sessionID,
               session,
               machine,
               deps,
-              goal,
+              machine.snapshot(),
               error,
             );
           }

@@ -25,6 +25,7 @@ import {
   type IdleHandledRecord,
 } from './plugin-v2-helpers.ts';
 import {
+  extractV2InputText,
   getV2EventSessionID,
   recordV2InputDelivery,
   synthesizeChatMessageFromAdmitted,
@@ -93,9 +94,25 @@ export async function mapV2EventToHandlers(
   // synthesized: it waits for the turn boundary by definition and is
   // surfaced as a notice by the idle path.
   if (ev.type === 'session.input.admitted' && sessionID) {
-    const {delivery} = resolveInputDeliveryFields(data, ev.type, sessionID);
+    const {delivery, id: inputID} = resolveInputDeliveryFields(
+      data,
+      ev.type,
+      sessionID,
+    );
     recordV2InputDelivery(hooks.runtime, data, ev.type, sessionID);
-    if (delivery !== 'queue') {
+    if (delivery === 'queue') {
+      // Retain the payload so a later queue→steer promotion (which carries no
+      // text) can synthesize the original instruction, as with the 2.2.5 inbox
+      // path below.
+      const payload = extractV2InputText(data);
+      if (payload.text)
+        recordInboxPayload(hooks.runtime, sessionID, inputID, {
+          text: payload.text,
+          synthetic:
+            payload.synthetic ||
+            deps.recentKickoffTexts.matches(sessionID, payload.text),
+        });
+    } else {
       try {
         await synthesizeChatMessageFromAdmitted(
           hooks['chat.message'],
@@ -104,6 +121,56 @@ export async function mapV2EventToHandlers(
         );
       } catch {
         /* steering failures must not break the event loop */
+      }
+    }
+  }
+
+  // Newer hosts emit mode-implied variants instead of `input.delivery`. Route a
+  // steered input straight to the steering hook; retain a queued payload and
+  // consume it when it is later promoted to steered.
+  if (
+    (ev.type === 'session.input.steered' ||
+      ev.type === 'session.input.queued') &&
+    sessionID
+  ) {
+    const {id: inputID} = resolveInputDeliveryFields(data, ev.type, sessionID);
+    recordV2InputDelivery(hooks.runtime, data, ev.type, sessionID);
+    const payload = extractV2InputText(data);
+    if (ev.type === 'session.input.queued') {
+      if (payload.text)
+        recordInboxPayload(hooks.runtime, sessionID, inputID, {
+          text: payload.text,
+          synthetic:
+            payload.synthetic ||
+            deps.recentKickoffTexts.matches(sessionID, payload.text),
+        });
+    } else {
+      const retained = consumeInboxPayload(hooks.runtime, sessionID, inputID);
+      const message =
+        retained ??
+        (payload.text
+          ? {
+              text: payload.text,
+              synthetic:
+                payload.synthetic ||
+                deps.recentKickoffTexts.matches(sessionID, payload.text),
+            }
+          : undefined);
+      if (
+        message &&
+        !message.synthetic &&
+        !deps.recentKickoffTexts.matches(sessionID, message.text)
+      ) {
+        try {
+          await synthesizeChatMessageFromText(
+            hooks['chat.message'],
+            sessionID,
+            message.text,
+            {inputID, delivery: 'steer'},
+          );
+        } catch {
+          /* steering failures must not break the event loop */
+        }
       }
     }
   }

@@ -87,8 +87,12 @@ export function createV2ClientShim(
   // synthetic op to wake execution without injecting a genuine user turn.
   const promptAsync: V2SessionOp = async input => {
     const translated = v1PartsToV2Text(input);
+    const asyncSessionID = translated.sessionID ?? '';
+    if (translated.agent && asyncSessionID) {
+      await selectAgent(asyncSessionID, translated.agent);
+    }
     return session.synthetic({
-      sessionID: translated.sessionID ?? '',
+      sessionID: asyncSessionID,
       text: translated.text,
       ...(translated.metadata ? {metadata: translated.metadata} : {}),
       ...(translated.agent ? {agent: translated.agent} : {}),
@@ -149,7 +153,12 @@ export function createV2ClientShim(
     } finally {
       // Keep the hook until the actual host call settles, even if the outer
       // verifier deadline wins. A late admission must still see cancellation.
-      await admissionHook?.dispose();
+      // A dispose failure must not replace a verdict we already obtained.
+      try {
+        await admissionHook?.dispose();
+      } catch {
+        /* a late hook cleanup failure cannot invalidate a settled prompt */
+      }
     }
     options?.signal?.throwIfAborted();
     if (!hasAssistantReplyContent(res)) {
@@ -453,6 +462,17 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
     runtime?: import('./session-state-manager.ts').RuntimeState;
   };
 
+  // A cleared session ID can be reused; stale idle/turn records would suppress
+  // the new goal's first idle. Chain onto whatever the v1 hooks registered.
+  if (hooks.runtime) {
+    const previousClear = hooks.runtime.clearSessionIdleTracking;
+    hooks.runtime.clearSessionIdleTracking = (sessionID: string) => {
+      previousClear?.(sessionID);
+      idleStateBySession.delete(sessionID);
+      lastObservedTurnBySession.delete(sessionID);
+    };
+  }
+
   const disposers: Array<() => Promise<void> | void> = [goalOutput.dispose];
   let stopEventLoop = false;
   let stopEventLoopResolve: (() => void) | undefined;
@@ -739,6 +759,7 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
       disposers,
       publishOutput: (sessionID, text) =>
         goalOutput.publish(sessionID, text, 'command'),
+      selectAgent: client.sessionCapabilities.selectAgent,
     });
     if (hooks.runtime) {
       hooks.runtime.announceKickoffFailure = goalOutput.publish;

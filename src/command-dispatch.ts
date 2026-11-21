@@ -51,6 +51,18 @@ export function markSlashDispatch(sessionID: string, args: string): void {
   recentSlashEcho.set(sessionID, queue);
 }
 
+/**
+ * Non-destructive check for a matching in-window echo fingerprint. Use this in
+ * read-only filters (e.g. history scans) so one scan cannot consume the
+ * fingerprint before another scan that needs the same check.
+ */
+export function hasSlashEcho(sessionID: string, text: string): boolean {
+  const queue = recentSlashEcho.get(sessionID);
+  if (!queue || queue.length === 0) return false;
+  const now = Date.now();
+  return queue.some(e => now - e.at < SLASH_ECHO_WINDOW_MS && text === e.args);
+}
+
 /** Consume a matching in-window echo fingerprint for this session, if any. */
 export function matchSlashEcho(sessionID: string, text: string): boolean {
   const queue = recentSlashEcho.get(sessionID);

@@ -256,6 +256,10 @@ export function createRecentKickoffTextTracker(
         entries = new Map();
         bySession.set(sessionID, entries);
       }
+      // Delete before set so a re-recorded (still-live) kickoff moves to the
+      // end of insertion order; pruning the oldest must not evict the entry
+      // that was just refreshed for a retry.
+      entries.delete(trimmed);
       entries.set(trimmed, now + ttlMs);
       prune(entries, now);
     },

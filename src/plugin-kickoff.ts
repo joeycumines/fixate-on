@@ -105,6 +105,10 @@ export function createKickoffWiring(args: {
     {sessionID: string; goalId: string; runId: string}
   >();
   const MAX_KICKOFF_RETRY_ATTEMPTS = 3;
+  // Bound busy-session deferrals so a session left permanently in
+  // promptInFlightSessions cannot respawn a 50ms timer forever. Reaching the
+  // cap stops this timer chain; a later idle may schedule a fresh chain.
+  const busyDefers = new Map<string, number>();
   const clearKickoffTimer = (sessionID: string, goalId?: string): void => {
     for (const [key, owner] of timerOwners) {
       if (
@@ -112,6 +116,7 @@ export function createKickoffWiring(args: {
         (goalId !== undefined && owner.goalId !== goalId)
       )
         continue;
+      busyDefers.delete(key);
       const timer = kickoffTimers.get(key);
       if (timer !== undefined) clearTimeout(timer);
       kickoffTimers.delete(key);
@@ -211,10 +216,12 @@ export function createKickoffWiring(args: {
     goalId: string,
     runId: string,
     overrideDelayMs?: number,
+    busyDeferrals = 0,
   ): void => {
     if (!sessionID || runtime.disposed) return;
     clearKickoffTimer(sessionID, goalId);
     const key = JSON.stringify([sessionID, goalId]);
+    busyDefers.set(key, busyDeferrals);
     const hasPendingAtSchedule =
       runtime.pendingKickoffDispatch?.get(sessionID)?.has(goalId) ?? false;
     const baselinePromise = hasPendingAtSchedule
@@ -229,8 +236,10 @@ export function createKickoffWiring(args: {
     const busyDeferDelayMs = Math.max(baseDelayMs, 50);
     const timer = setTimeout(() => {
       if (kickoffTimers.get(key) !== timer) return;
+      const deferrals = busyDefers.get(key) ?? 0;
       kickoffTimers.delete(key);
       timerOwners.delete(key);
+      busyDefers.delete(key);
       void (async () => {
         if (runtime.disposed || !runtime.canDriveSession?.(sessionID)) return;
         let machine = machineByGoalId(sessionID, goalId);
@@ -245,12 +254,20 @@ export function createKickoffWiring(args: {
         }
         if (snap.status !== 'active') return;
         if (pending && (pending.runId !== runId || pending.exhausted)) return;
-        // Busy admissions defer their timer instead of silently losing the retry.
+        // Busy admissions defer their timer instead of silently losing the retry,
+        // but only up to a bound; a permanently busy session must not spin here.
         if (
           runtime.promptInFlightSessions.has(sessionID) ||
           pending?.inFlight
         ) {
-          scheduleKickoff(sessionID, goalId, runId, busyDeferDelayMs);
+          if (deferrals < MAX_KICKOFF_RETRY_ATTEMPTS)
+            scheduleKickoff(
+              sessionID,
+              goalId,
+              runId,
+              busyDeferDelayMs,
+              deferrals + 1,
+            );
           return;
         }
         // New assistant activity supersedes a generic kickoff, but can never
@@ -284,7 +301,14 @@ export function createKickoffWiring(args: {
           runtime.promptInFlightSessions.has(sessionID) ||
           pending?.inFlight
         ) {
-          scheduleKickoff(sessionID, goalId, runId, busyDeferDelayMs);
+          if (deferrals < MAX_KICKOFF_RETRY_ATTEMPTS)
+            scheduleKickoff(
+              sessionID,
+              goalId,
+              runId,
+              busyDeferDelayMs,
+              deferrals + 1,
+            );
           return;
         }
         if (pending) {
@@ -559,21 +583,7 @@ export function createKickoffWiring(args: {
         }
       }
       const text = outcome.text;
-      const afterCommand = session.getMachine()?.snapshot() ?? null;
-      const {receipt, changed: dispatchChanged} = await transitionReceipt(
-        sessionID,
-        before,
-        afterCommand,
-        options?.source ?? 'user-command',
-      );
-      // Record dispatch to prevent duplicate mutations if the host also invokes the command template.
-      // Native v2 commands are the only invocation (no duplicate template channel), so they must
-      // not populate this cache: a later deliberate goal-command call would replay a stale receipt.
-      if (!options?.skipReplayRecord) {
-        markCommandDispatch(sessionID, args, text, receipt, dispatchChanged);
-      }
       const header = formatCommandHeader(runtime.hasTuiCompanion, subcmd);
-      const rendered = `${header}\n${text}${receipt ? `\n\n${receipt}` : ''}`;
       // Activation is a property of the goal the command actually targeted,
       // not of the focused presentation goal. A named resume can activate a
       // background goal while focus stays elsewhere.
@@ -679,6 +689,28 @@ export function createKickoffWiring(args: {
           activatedGoal = edited;
       }
       const after = activatedGoal ?? focusedAfter;
+      // Describe the state transition of the goal the command actually
+      // targeted, not the focused presentation goal. A named resume/edit can
+      // activate a background goal while focus stays elsewhere; comparing the
+      // focused goal would produce no receipt for the goal that changed.
+      const receiptGoalId = outcome.targetGoalId ?? after?.goalId;
+      const receiptBefore =
+        (receiptGoalId ? beforeByGoal.get(receiptGoalId) : null) ?? before;
+      const receiptAfter =
+        (receiptGoalId ? afterByGoal.get(receiptGoalId) : null) ?? after;
+      const {receipt, changed: dispatchChanged} = await transitionReceipt(
+        sessionID,
+        receiptBefore,
+        receiptAfter,
+        options?.source ?? 'user-command',
+      );
+      // Record dispatch to prevent duplicate mutations if the host also invokes the command template.
+      // Native v2 commands are the only invocation (no duplicate template channel), so they must
+      // not populate this cache: a later deliberate goal-command call would replay a stale receipt.
+      if (!options?.skipReplayRecord) {
+        markCommandDispatch(sessionID, args, text, receipt, dispatchChanged);
+      }
+      const rendered = `${header}\n${text}${receipt ? `\n\n${receipt}` : ''}`;
       const enteredActive = outcome.ok && activatedGoal !== null;
       // Cancel only work whose own goal actually stopped or disappeared.
       // A rejected/unrelated command cannot cancel another goal's admission.

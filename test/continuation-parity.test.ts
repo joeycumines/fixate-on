@@ -1111,6 +1111,18 @@ describe('a goal whose owning session is gone', () => {
     ).toBe(true);
     // Name-only, and message-only, both classify.
     expect(isSessionGoneError({name: 'NotFoundError'})).toBe(true);
+    // Newer hosts throw a plain Error whose typed tag carries the diagnosis.
+    expect(
+      isSessionGoneError({name: 'Error', _tag: 'Session.NotFoundError'}),
+    ).toBe(true);
+    // A structured data.message must not be masked by an empty top-level message.
+    expect(
+      isSessionGoneError({
+        name: 'Error',
+        message: '',
+        data: {message: 'Session not found: ses_abc'},
+      }),
+    ).toBe(true);
     expect(isSessionGoneError({message: 'Session not found'})).toBe(true);
     expect(isSessionGoneError({message: 'session no longer exists'})).toBe(
       true,

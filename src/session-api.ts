@@ -260,8 +260,14 @@ export function createOpenCodeSessionApi(
       sessionID: string,
       messageOptions: {limit?: number} = {},
     ): Promise<unknown[]> {
-      if (options.requireFreshMessages && capabilities?.readFreshMessages)
-        return capabilities.readFreshMessages(sessionID, messageOptions);
+      if (options.requireFreshMessages && capabilities?.readFreshMessages) {
+        // Route through the same envelope/error unwrapping as every other
+        // operation; a capability may still return the SDK's {data: ...}
+        // shape or a structured error envelope.
+        return Promise.resolve(
+          capabilities.readFreshMessages(sessionID, messageOptions),
+        ).then(fresh => unwrapData(fresh, 'messages') as unknown[]);
+      }
       return invoke<unknown[]>(
         'messages',
         {sessionID, ...messageOptions},

@@ -465,6 +465,35 @@ describe('idle path: queued input does not yield the goal and notifies the user'
     ).toBe(true);
   });
 
+  test('ID-less queued messages are deduped by text across repeated idles', async () => {
+    const machine = new GoalStateMachine(makeActiveGoal(), {
+      onCommit: async () => {},
+    });
+    const announcements: string[] = [];
+    const api = makeMockSessionApi([
+      {id: 'm1', role: 'assistant', parts: [{type: 'text', text: 'working'}]},
+      {
+        role: 'user',
+        delivery: 'queue',
+        parts: [{type: 'text', text: 'queued without an id'}],
+      },
+    ]);
+    const deps = makeDeps(makeSessionContext(machine), api, announcements);
+    const hooks = createHooks(deps);
+
+    await driveIdle(hooks);
+    await driveIdle(hooks);
+    await driveIdle(hooks);
+
+    const noticeEntries = machine
+      .snapshot()
+      .history.filter(h => h.detail.includes('queued without an id'));
+    expect(noticeEntries).toHaveLength(1);
+    expect(
+      announcements.filter(a => a.includes('queued without an id')),
+    ).toHaveLength(1);
+  });
+
   test('an older user message before the assistant message is outside the scan window', async () => {
     const machine = new GoalStateMachine(makeActiveGoal(), {
       onCommit: async () => {},

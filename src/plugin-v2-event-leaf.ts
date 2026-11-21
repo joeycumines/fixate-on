@@ -134,6 +134,53 @@ export async function synthesizeChatMessageFromText(
   );
 }
 
+/**
+ * Extract the text payload and metadata from a v2 input/inbox event. Handles
+ * both the `input: {type, data: {text}}` shape of `session.input.admitted` and
+ * the flatter `item.payload.text` shape used by newer mode-implied variants.
+ */
+export function extractV2InputText(data: Record<string, unknown>): {
+  text: string;
+  metadata?: Record<string, unknown>;
+  synthetic: boolean;
+} {
+  const props = (data.properties ?? {}) as Record<string, unknown>;
+  const pendingInput = (data.input ?? props.input) as
+    | {
+        type?: string;
+        metadata?: Record<string, unknown>;
+        data?: {text?: unknown; metadata?: Record<string, unknown>};
+      }
+    | undefined;
+  const item = (data.item ?? props.item) as
+    | {
+        type?: string;
+        payload?: {text?: unknown; metadata?: Record<string, unknown>};
+        metadata?: Record<string, unknown>;
+      }
+    | undefined;
+  const textValue =
+    pendingInput?.data?.text ??
+    item?.payload?.text ??
+    (data.text as unknown) ??
+    (props.text as unknown);
+  const text = typeof textValue === 'string' ? textValue : '';
+  const metadata =
+    pendingInput?.data?.metadata ??
+    pendingInput?.metadata ??
+    item?.payload?.metadata ??
+    item?.metadata;
+  const synthetic =
+    pendingInput?.type === 'synthetic' ||
+    item?.type === 'synthetic' ||
+    Boolean(metadata?.[GOAL_TUI_METADATA_KEY]);
+  return {
+    text,
+    ...(metadata && typeof metadata === 'object' ? {metadata} : {}),
+    synthetic,
+  };
+}
+
 export async function synthesizeChatMessageFromAdmitted(
   chatMessageHook: PluginHooks['chat.message'] | undefined,
   data: Record<string, unknown>,

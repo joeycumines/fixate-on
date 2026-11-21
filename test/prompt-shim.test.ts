@@ -6,7 +6,7 @@ import {describe, expect, test} from 'bun:test';
 import {mkdtemp} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {setup} from '../src/plugin-v2.ts';
+import {createV2ClientShim, setup} from '../src/plugin-v2.ts';
 import {v1PartsToV2Text} from '../src/plugin-v2-event-leaf.ts';
 
 describe('v1 parts → v2 text translation (A4 live-found defect lock)', () => {
@@ -98,4 +98,26 @@ describe('setup() wires promptAsync through v2 synthetic (steer semantics)', () 
     }
     if (typeof dispose === 'function') await dispose();
   });
+});
+
+test('promptAsync selects the carried agent before a synthetic continuation', async () => {
+  const order: string[] = [];
+  const ctx: any = {
+    session: {
+      switchAgent: async () => {
+        order.push('switch');
+      },
+      synthetic: async () => {
+        order.push('synthetic');
+        return {};
+      },
+    },
+  };
+  const shim = createV2ClientShim(ctx, {bySession: new Map()});
+  await shim.session.promptAsync!({
+    sessionID: 's-agent',
+    agent: 'build',
+    parts: [{type: 'text', text: 'continue'}],
+  });
+  expect(order).toEqual(['switch', 'synthetic']);
 });

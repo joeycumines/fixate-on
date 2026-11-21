@@ -17,6 +17,7 @@ import {
 import {
   parseGoalCommand,
   ATTACHMENT_ACTIVATION_ERROR,
+  NO_ARG_SUBCOMMANDS,
   parseGoalArguments,
   resolveGoalRef,
   resolveOperandMachine,
@@ -807,7 +808,13 @@ export async function handleCommandOutcome(
   }
 
   const firstWord = command.root;
-  if (command.action === 'invalid') {
+  if (
+    command.action === 'invalid' ||
+    (firstWord !== null &&
+      NO_ARG_SUBCOMMANDS.has(firstWord) &&
+      typeof command.operand === 'string' &&
+      command.operand.trim().length > 0)
+  ) {
     return failOutcome(
       `\`/${commandName} ${firstWord}\` does not accept additional arguments. Run \`/${commandName} ${firstWord}\` without extra text.`,
     );

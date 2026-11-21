@@ -171,6 +171,12 @@ export interface RuntimeState {
   escalateBackgroundDeferral?: (sessionID: string) => Promise<void>;
   /** Clears any pending delayed kickoff timer for a session. */
   clearKickoffTimer?: (sessionID: string, goalId?: string) => void;
+  /**
+   * Clears adapter-owned per-session idle/turn tracking (quiet windows, last
+   * authenticated idle time, observed turn signatures). Registered by the
+   * host adapters that own those maps; invoked on session clear and dispose.
+   */
+  clearSessionIdleTracking?: (sessionID: string) => void;
   hasKickoffTimer?: (sessionID: string, goalId: string) => boolean;
   scheduleKickoff?: (sessionID: string, goalId: string, runId: string) => void;
   /** Retained admissions per session and goal; unrelated goals never overwrite each other. */
@@ -505,6 +511,10 @@ export function clearSessionDeliveryState(
     | 'backgroundBlockedUntil'
     | 'backgroundDeferrals'
     | 'inboxPayloadsByID'
+    | 'userInterventions'
+    | 'pendingKickoffDispatch'
+    | 'clearKickoffTimer'
+    | 'clearSessionIdleTracking'
   >,
   sessionID: string,
 ): void {
@@ -514,6 +524,11 @@ export function clearSessionDeliveryState(
   runtime.backgroundBlockedUntil.delete(sessionID);
   runtime.backgroundDeferrals?.delete(sessionID);
   runtime.inboxPayloadsByID?.delete(sessionID);
+  runtime.userInterventions.delete(sessionID);
+  runtime.pendingKickoffDispatch?.delete(sessionID);
+  clearPromptInFlight(runtime as RuntimeState, sessionID);
+  runtime.clearKickoffTimer?.(sessionID);
+  runtime.clearSessionIdleTracking?.(sessionID);
 }
 
 /** Retain an inbox message's text so a later delivery change can promote it. */

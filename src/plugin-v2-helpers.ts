@@ -262,23 +262,32 @@ export function reconcileSystemParts(
   nativeSystem: unknown[],
   updatedTexts: string[],
 ): unknown[] {
-  const consumed = new Set<number>();
-  const result: unknown[] = [];
-  for (const text of updatedTexts) {
-    if (typeof text !== 'string') continue;
-    const matchIdx = nativeSystem.findIndex(
-      (part, idx) => !consumed.has(idx) && extractSystemPartText(part) === text,
-    );
-    if (matchIdx !== -1) {
-      consumed.add(matchIdx);
-      result.push(nativeSystem[matchIdx]);
-    } else if (text.length > 0) {
-      result.push({type: 'text', text});
-    }
-  }
+  // The v1 hook sees a text-only view of the native parts and prepends new
+  // blocks to it. Every native part owns exactly one view slot, so align from
+  // the tail: text beyond the native count was prepended by the transform.
+  // Rewrites keep the native part object (including host metadata); non-text
+  // parts stay in their original positions with their slots skipped.
+  const prepended = Math.max(0, updatedTexts.length - nativeSystem.length);
+  const texts = updatedTexts.slice(prepended);
+  const result: unknown[] = updatedTexts
+    .slice(0, prepended)
+    .filter(text => text.length > 0)
+    .map(text => ({type: 'text', text}));
   for (let i = 0; i < nativeSystem.length; i++) {
-    if (!consumed.has(i) && !isTextSystemPart(nativeSystem[i])) {
-      result.push(nativeSystem[i]);
+    const part = nativeSystem[i];
+    if (!isTextSystemPart(part)) {
+      result.push(part);
+      continue;
+    }
+    const text = texts[i];
+    if (text === undefined) continue;
+    if (typeof part === 'string') {
+      result.push(text);
+    } else if (text === extractSystemPartText(part)) {
+      result.push(part);
+    } else {
+      const nativePart = part as Record<string, unknown>;
+      result.push({...nativePart, text});
     }
   }
   return result;

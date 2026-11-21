@@ -29,9 +29,9 @@ import {
   stripAgentListSortPrefix,
 } from './agent-resolve.ts';
 import {
+  hasSlashEcho,
   isCommandTemplateEcho,
   isExplicitStopMessage,
-  matchSlashEcho,
 } from './command-dispatch.ts';
 import {outputTokensForMessage} from './accounting.ts';
 import {summarizeText} from './child-session-verifier.ts';
@@ -436,7 +436,7 @@ export async function processIdleEvent(
       text.includes(SERVER_MODE_HEADER) ||
       text.includes(TUI_MODE_HEADER) ||
       isCommandTemplateEcho(text) ||
-      matchSlashEcho(sessionID, text)
+      hasSlashEcho(sessionID, text)
     )
       return;
     const messageID = getMessageID(msg);
@@ -455,15 +455,17 @@ export async function processIdleEvent(
       messageTime < interventionBoundary
     )
       return;
+    // Some hosts omit message IDs for queued input. Derive a stable dedup key
+    // from the text so the same message is not re-announced on every idle.
+    const noticeID =
+      messageID !== ''
+        ? messageID
+        : `queued-text:${text.length}:${text.slice(0, 200)}`;
     const {surfaced} = currentDeliverySets();
-    if (
-      (messageID !== '' && surfaced?.has(messageID) === true) ||
-      (messageID !== '' && seenNoticeIDs.has(messageID))
-    )
-      return;
-    seenNoticeIDs.add(messageID);
+    if (surfaced?.has(noticeID) === true || seenNoticeIDs.has(noticeID)) return;
+    seenNoticeIDs.add(noticeID);
     queuedNotices.push(text);
-    queuedIDs.push(messageID);
+    queuedIDs.push(noticeID);
   };
 
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -520,7 +522,7 @@ export async function processIdleEvent(
       text.includes(SERVER_MODE_HEADER) ||
       text.includes(TUI_MODE_HEADER) ||
       isCommandTemplateEcho(text) ||
-      matchSlashEcho(sessionID, text)
+      hasSlashEcho(sessionID, text)
     )
       continue;
     // A command can await removal persistence before creating its replacement.

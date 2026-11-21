@@ -44,6 +44,8 @@ export interface V2CommandBridgeDeps {
   recentKickoffTexts: RecentKickoffTextTracker;
   disposers: Array<() => Promise<void> | void>;
   publishOutput?: (sessionID: string, text: string) => Promise<void>;
+  /** Host-level agent switching, mirroring the v1->v2 prompt shim. */
+  selectAgent?: (sessionID: string, agent: string) => Promise<void>;
 }
 
 /**
@@ -91,11 +93,14 @@ export async function registerV2GoalCommandBridge(
               canRecoverAttachedEdit: goalId => {
                 const machines =
                   hooks.runtime?.sessionGoals.get(sessionID) ?? [];
+                // Resolve the same goal the status check uses: the explicit
+                // id, else the focused goal, else the most recently added
+                // machine (getMachine's fallback), never blindly machines[0].
                 const targetId =
                   goalId ?? hooks.runtime?.focusedGoalId.get(sessionID);
                 const machine = targetId
                   ? machines.find(m => m.snapshot().goalId === targetId)
-                  : machines[0];
+                  : machines[machines.length - 1];
                 const snap = machine?.snapshot();
                 return Boolean(
                   snap?.kickoffAdmissionPending &&
@@ -319,6 +324,13 @@ export async function registerV2GoalCommandBridge(
                     sessionID,
                     String(dispatch.payload.text ?? ''),
                   );
+                  const kickoffAgent = dispatch.payload.agent;
+                  if (
+                    typeof kickoffAgent === 'string' &&
+                    kickoffAgent.length > 0 &&
+                    deps.selectAgent
+                  )
+                    await deps.selectAgent(sessionID, kickoffAgent);
                   await ctx.session.prompt(dispatch.payload);
                 } else {
                   await ctx.session.synthetic(dispatch.payload);
