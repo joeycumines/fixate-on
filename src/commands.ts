@@ -121,6 +121,17 @@ export async function handleCommandOutcome(
 
   const trimmed = args.trim();
   const command = parseGoalCommand(trimmed);
+  // These reporting commands take no operand and are dispatched before the
+  // general no-argument guard below, so reject trailing text here.
+  if (
+    (command.action === 'handback' || command.action === 'review') &&
+    typeof command.operand === 'string' &&
+    command.operand.trim().length > 0
+  ) {
+    return failOutcome(
+      `\`/${commandName} ${command.root}\` does not accept additional arguments. Run \`/${commandName} ${command.root}\` without extra text.`,
+    );
+  }
   if (
     options.hasAttachments &&
     !['set', 'add', 'sequence', 'resume', 'edit'].includes(command.action)
@@ -199,6 +210,45 @@ export async function handleCommandOutcome(
         session.isOrdered(),
       ),
     );
+  }
+
+  if (command.action === 'handback') {
+    const machine = session.getMachine();
+    if (!machine) {
+      return failOutcome(
+        `No active goal. Set one with \`/${commandName} <condition>\`.`,
+      );
+    }
+    const goal = machine.snapshot();
+    const deliverable = await buildHandbackDeliverable(
+      goal,
+      session.workspaceDirectory,
+    );
+    return passOutcome(
+      [
+        `# Handback Deliverable for Goal [${deliverable.goalId}]`,
+        `Objective: ${deliverable.condition}`,
+        `Status: ${deliverable.status}`,
+        `Claims: ${deliverable.claims.length} recorded`,
+        '',
+        deliverable.externalReviewPayload,
+      ].join('\n'),
+    );
+  }
+
+  if (command.action === 'review') {
+    const machine = session.getMachine();
+    if (!machine) {
+      return failOutcome(
+        `No active goal. Set one with \`/${commandName} <condition>\`.`,
+      );
+    }
+    const goal = machine.snapshot();
+    const deliverable = await buildHandbackDeliverable(
+      goal,
+      session.workspaceDirectory,
+    );
+    return passOutcome(deliverable.externalReviewPayload);
   }
 
   // `clear <goalId>` clears a specific goal. The bare `clear` command wipes the
@@ -438,45 +488,6 @@ export async function handleCommandOutcome(
     );
     await session.persist();
     return passOutcome(`Rejected proposal [${proposal.proposalId}].`);
-  }
-
-  if (command.action === 'handback') {
-    const machine = session.getMachine();
-    if (!machine) {
-      return failOutcome(
-        `No active goal. Set one with \`/${commandName} <condition>\`.`,
-      );
-    }
-    const goal = machine.snapshot();
-    const deliverable = await buildHandbackDeliverable(
-      goal,
-      session.workspaceDirectory,
-    );
-    return passOutcome(
-      [
-        `# Handback Deliverable for Goal [${deliverable.goalId}]`,
-        `Objective: ${deliverable.condition}`,
-        `Status: ${deliverable.status}`,
-        `Claims: ${deliverable.claims.length} recorded`,
-        '',
-        deliverable.externalReviewPayload,
-      ].join('\n'),
-    );
-  }
-
-  if (command.action === 'review') {
-    const machine = session.getMachine();
-    if (!machine) {
-      return failOutcome(
-        `No active goal. Set one with \`/${commandName} <condition>\`.`,
-      );
-    }
-    const goal = machine.snapshot();
-    const deliverable = await buildHandbackDeliverable(
-      goal,
-      session.workspaceDirectory,
-    );
-    return passOutcome(deliverable.externalReviewPayload);
   }
 
   // Edit objective: accepts either `edit <objective>` (focused goal) or
