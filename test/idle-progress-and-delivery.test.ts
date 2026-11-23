@@ -8,6 +8,7 @@ import {
   type SessionContext,
 } from '../src/hooks.ts';
 import {createRuntimeState} from '../src/session-state-manager.ts';
+import {recordSlashEchoMessage} from '../src/command-dispatch.ts';
 import {createGoalState, GoalStateMachine} from '../src/state-machine.ts';
 import {createLoopPolicy} from '../src/continuation-loop.ts';
 
@@ -84,6 +85,33 @@ function assistant(id: string, text: string, output: number, tool = false) {
 }
 
 describe('idle progress and delivery classification', () => {
+  test('an unconsumed slash echo does not swallow a later identical human message', async () => {
+    const machine = new GoalStateMachine(makeGoal(), {
+      onCommit: async () => {},
+    });
+    // The only echo suppression that survives to idle is ID-scoped: the echo
+    // that chat.message consumed. A later human message with the same text has
+    // a different ID and must still pause the goal.
+    recordSlashEchoMessage('session-1', 'slash-echo-1');
+    const hooks = createHooks(
+      makeDeps(makeSession(machine), [
+        assistant('a1', 'working', 200, true),
+        {
+          id: 'human-resume',
+          role: 'user',
+          parts: [{type: 'text', text: 'resume'}],
+        },
+      ]),
+    );
+    await hooks.event!({
+      type: 'session.idle',
+      sessionID: 'session-1',
+      id: 'idle-human-resume',
+    });
+    expect(machine.snapshot().status).toBe('paused');
+    expect(machine.snapshot().stopReason).toBe('user intervention');
+  });
+
   test('duplicate idle does not consume no-progress budget for productive work', async () => {
     const state = makeGoal();
     state.noProgressTurnsBeforePause = 1;

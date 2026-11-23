@@ -196,7 +196,9 @@ export -f fresh_host_session 2>/dev/null || true
 stop_stale_harness_hosts() {
   local here pids pid
   here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  pids="$(pgrep -f "$here/(work|work-v1)(/| )$" 2>/dev/null || true)"
+  # The work dir is usually the LAST argv element (opencode2 --standalone
+  # '$WORK_DIR'), so it has no trailing slash or space: match end-of-argv too.
+  pids="$(pgrep -f "$here/(work|work-v1)([/[:space:]]|$)" 2>/dev/null || true)"
   [ -n "$pids" ] || return 0
   for pid in $pids; do
     kill "$pid" 2>/dev/null || true

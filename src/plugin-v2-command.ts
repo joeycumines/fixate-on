@@ -222,6 +222,62 @@ export function buildV2CommandKickoffDispatch(args: {
   };
 }
 
+/**
+ * Reject a resolved host error envelope. A fulfilled transport promise does
+ * not establish that the operation succeeded; without this check a rejected
+ * kickoff would be recorded as admitted and its retained inputs dropped.
+ */
+function assertV2KickoffResponse(response: unknown, operation: string): void {
+  if (
+    response &&
+    typeof response === 'object' &&
+    'error' in response &&
+    (response as {error?: unknown}).error !== undefined &&
+    (response as {error?: unknown}).error !== null
+  ) {
+    const error = (response as {error: unknown}).error;
+    throw error instanceof Error
+      ? error
+      : new Error(
+          `${operation} failed: ${JSON.stringify(error) ?? String(error)}`,
+        );
+  }
+}
+
+/**
+ * Re-dispatch a retained native command kickoff. Used by both the initial
+ * admission path and its delayed retry so agent selection and error handling
+ * cannot drift between them.
+ */
+export async function dispatchV2Kickoff(args: {
+  session: {
+    prompt(payload: Record<string, unknown>): Promise<unknown>;
+    synthetic(payload: Record<string, unknown>): Promise<unknown>;
+  };
+  selectAgent?: (sessionID: string, agent: string) => Promise<void>;
+  recordKickoffText?: (sessionID: string, text: string) => void;
+  sessionID: string;
+  dispatch: {method: 'prompt' | 'synthetic'; payload: Record<string, unknown>};
+}): Promise<void> {
+  const {sessionID, dispatch} = args;
+  const agent = dispatch.payload.agent;
+  if (typeof agent === 'string' && agent.length > 0) {
+    if (!args.selectAgent)
+      throw new Error(
+        `cannot dispatch kickoff with agent ${JSON.stringify(agent)}: host has no switchAgent operation`,
+      );
+    await args.selectAgent(sessionID, agent);
+  }
+  if (dispatch.method === 'prompt') {
+    args.recordKickoffText?.(sessionID, String(dispatch.payload.text ?? ''));
+  }
+  const result =
+    dispatch.method === 'prompt'
+      ? await args.session.prompt(dispatch.payload)
+      : await args.session.synthetic(dispatch.payload);
+  assertV2KickoffResponse(result, dispatch.method);
+}
+
 export interface RecentKickoffTextTracker {
   record(sessionID: string, text: string, now?: number): void;
   matches(sessionID: string, text: string, now?: number): boolean;

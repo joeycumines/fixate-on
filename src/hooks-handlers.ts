@@ -20,6 +20,7 @@ import {
   isCommandTemplateEcho,
   isExplicitStopMessage,
   matchSlashEcho,
+  recordSlashEchoMessage,
 } from './command-dispatch.ts';
 import {USER_INTERVENTION_STOP_REASON} from './status-label.ts';
 import {escapeGoalText} from './escape.ts';
@@ -157,7 +158,13 @@ export function createChatMessageHook(
     if (isCommandTemplateEcho(text)) return;
 
     // Ignore bare arguments echoing a just-dispatched fingerprint within its time window.
-    if (matchSlashEcho(input.sessionID, text)) return;
+    if (matchSlashEcho(input.sessionID, text)) {
+      recordSlashEchoMessage(
+        input.sessionID,
+        (input as {messageID?: string}).messageID,
+      );
+      return;
+    }
 
     // Latest user instruction takes precedence session-wide: pause every active goal.
     // Explicit stop directives remain paused; regular text can be re-armed later.

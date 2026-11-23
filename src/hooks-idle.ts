@@ -29,9 +29,9 @@ import {
   stripAgentListSortPrefix,
 } from './agent-resolve.ts';
 import {
-  hasSlashEcho,
   isCommandTemplateEcho,
   isExplicitStopMessage,
+  isSlashEchoMessage,
 } from './command-dispatch.ts';
 import {outputTokensForMessage} from './accounting.ts';
 import {summarizeText} from './child-session-verifier.ts';
@@ -431,15 +431,15 @@ export async function processIdleEvent(
     )
       return;
     const text = getTextFromParts(parts);
+    const messageID = getMessageID(msg);
     if (
       !text ||
       text.includes(SERVER_MODE_HEADER) ||
       text.includes(TUI_MODE_HEADER) ||
       isCommandTemplateEcho(text) ||
-      hasSlashEcho(sessionID, text)
+      isSlashEchoMessage(sessionID, messageID)
     )
       return;
-    const messageID = getMessageID(msg);
     if (!isQueuedMessage(msg, messageID)) return;
     const messageTime =
       (msg as {time?: {created?: unknown}}).time?.created ??
@@ -522,7 +522,7 @@ export async function processIdleEvent(
       text.includes(SERVER_MODE_HEADER) ||
       text.includes(TUI_MODE_HEADER) ||
       isCommandTemplateEcho(text) ||
-      hasSlashEcho(sessionID, text)
+      isSlashEchoMessage(sessionID, getMessageID(msg))
     )
       continue;
     // A command can await removal persistence before creating its replacement.

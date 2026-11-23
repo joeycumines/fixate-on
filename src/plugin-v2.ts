@@ -42,6 +42,7 @@ import {createGoalOutputPublisher} from './plugin-v2-command-output.ts';
 import {
   type RecentKickoffTextTracker,
   createRecentKickoffTextTracker,
+  dispatchV2Kickoff,
   markRecentKickoffMessages,
 } from './plugin-v2-command.ts';
 import {GoalsPlugin, type PluginOptions} from './plugin-runtime.ts';
@@ -716,15 +717,17 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
         method: 'prompt' | 'synthetic';
         payload: Record<string, unknown>;
       };
-      if (dispatch.method === 'prompt') {
-        recentKickoffTexts.record(
-          sessionID,
-          String(dispatch.payload.text ?? ''),
-        );
-        await ctx.session.prompt(dispatch.payload);
-      } else {
-        await ctx.session.synthetic(dispatch.payload);
-      }
+      // Mirror the initial native-command dispatch: a retained payload may
+      // carry the goal's resolved agent, and a retry must run under that same
+      // agent rather than the host's current default. A switch failure fails
+      // the retry so the bounded kickoff path retains the attachment inputs.
+      await dispatchV2Kickoff({
+        session: ctx.session,
+        selectAgent: client.sessionCapabilities.selectAgent,
+        recordKickoffText: (sid, text) => recentKickoffTexts.record(sid, text),
+        sessionID,
+        dispatch,
+      });
     };
 
     // Bridge 3: Register goal tools with v2 schema and codemode options.

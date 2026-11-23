@@ -505,6 +505,18 @@ describe('chronologicalMessages and findNewestMessage id comparison guard', () =
     expect(getMessageID(findNewestMessage(messages))).toBe('m2');
   });
 
+  test('untimestamped descending custom-prefix fixed-width ids normalize oldest-first', () => {
+    const messages = [
+      {id: 'aaaa0002', role: 'assistant'},
+      {id: 'aaaa0001', role: 'user'},
+    ];
+    expect(getMessageID(findNewestMessage(messages))).toBe('aaaa0002');
+    expect(chronologicalMessages(messages).map(getMessageID)).toEqual([
+      'aaaa0001',
+      'aaaa0002',
+    ]);
+  });
+
   test('untimestamped descending msg_ ids with matching length normalize oldest-first', () => {
     const messages = [
       {id: 'msg_0000000003', role: 'user'},

@@ -108,8 +108,17 @@ export function createGoalOutputPublisher(
       while (latest.size > MAX_OUTPUT_SESSIONS) {
         latest.delete(latest.keys().next().value!);
       }
+      // The receipt is cached above before any delivery attempt. A transport
+      // fault must not turn an already-successful command into a reported
+      // failure: the TUI recovers the receipt through `latest` on reconnect.
+      // Keep the text visible to headless clients through a best-effort
+      // messenger when one is configured.
       if (registration) {
-        await registration.events.emit('output', output);
+        try {
+          await registration.events.emit('output', output);
+        } catch {
+          if (fallback) await fallback(sessionID, text).catch(() => {});
+        }
       } else if (fallback) {
         await fallback(sessionID, text);
       } else {

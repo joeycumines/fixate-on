@@ -51,16 +51,43 @@ export function markSlashDispatch(sessionID: string, args: string): void {
   recentSlashEcho.set(sessionID, queue);
 }
 
-/**
- * Non-destructive check for a matching in-window echo fingerprint. Use this in
- * read-only filters (e.g. history scans) so one scan cannot consume the
- * fingerprint before another scan that needs the same check.
- */
-export function hasSlashEcho(sessionID: string, text: string): boolean {
-  const queue = recentSlashEcho.get(sessionID);
+// The idle hook is the fallback when chat.message is dropped. It must suppress
+// a replayed slash echo WITHOUT swallowing a later genuine message that happens
+// to use the same text. Record the replay's message id when chat.message matches
+// the fingerprint, then skip only that id in the idle history scans.
+const echoedMessageIDs = new Map<
+  string,
+  Array<{at: number; messageID: string}>
+>();
+const MAX_ECHOED_MESSAGE_IDS = MAX_SLASH_ECHO_PER_SESSION;
+
+/** Remember that a host chat replay matched a slash dispatch fingerprint. */
+export function recordSlashEchoMessage(
+  sessionID: string,
+  messageID: string | undefined,
+): void {
+  if (!sessionID || !messageID) return;
+  const now = Date.now();
+  const queue = (echoedMessageIDs.get(sessionID) ?? []).filter(
+    e => now - e.at < SLASH_ECHO_WINDOW_MS,
+  );
+  queue.push({at: now, messageID});
+  while (queue.length > MAX_ECHOED_MESSAGE_IDS) queue.shift();
+  echoedMessageIDs.set(sessionID, queue);
+}
+
+/** True only for the specific message that chat.message matched as an echo. */
+export function isSlashEchoMessage(
+  sessionID: string,
+  messageID: string | undefined,
+): boolean {
+  if (!sessionID || !messageID) return false;
+  const queue = echoedMessageIDs.get(sessionID);
   if (!queue || queue.length === 0) return false;
   const now = Date.now();
-  return queue.some(e => now - e.at < SLASH_ECHO_WINDOW_MS && text === e.args);
+  return queue.some(
+    e => e.messageID === messageID && now - e.at < SLASH_ECHO_WINDOW_MS,
+  );
 }
 
 /** Consume a matching in-window echo fingerprint for this session, if any. */

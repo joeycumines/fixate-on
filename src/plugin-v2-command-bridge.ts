@@ -15,6 +15,7 @@ import {
   assertV2AttachmentsBeforeRun,
   assertV2CommandCanDispatch,
   buildV2CommandKickoffDispatch,
+  dispatchV2Kickoff,
   logV2DiagnosticEvent,
   validateV2CommandExecutionInput,
 } from './plugin-v2-command.ts';
@@ -319,22 +320,14 @@ export async function registerV2GoalCommandBridge(
                   throw new Error(
                     'Goal changed before kickoff admission; no prompt was sent.',
                   );
-                if (dispatch.method === 'prompt') {
-                  recentKickoffTexts.record(
-                    sessionID,
-                    String(dispatch.payload.text ?? ''),
-                  );
-                  const kickoffAgent = dispatch.payload.agent;
-                  if (
-                    typeof kickoffAgent === 'string' &&
-                    kickoffAgent.length > 0 &&
-                    deps.selectAgent
-                  )
-                    await deps.selectAgent(sessionID, kickoffAgent);
-                  await ctx.session.prompt(dispatch.payload);
-                } else {
-                  await ctx.session.synthetic(dispatch.payload);
-                }
+                await dispatchV2Kickoff({
+                  session: ctx.session,
+                  selectAgent: deps.selectAgent,
+                  recordKickoffText: (sid, text) =>
+                    recentKickoffTexts.record(sid, text),
+                  sessionID,
+                  dispatch,
+                });
                 admitted = true;
               } catch (error) {
                 const current = runtime.sessionGoals

@@ -662,14 +662,35 @@ async function runCase3StandaloneRunContinuation(opencode2Bin: string): Promise<
     [opencode2Bin, '--standalone', 'run', '--auto', '--model', 'mock/mock-model', 'Create a goal to write beta.txt and finish it.'],
     {cwd: dirs.workDir, env: makeEnv(dirs, dirs.workDir, eventLog), stdout: 'pipe', stderr: 'pipe'},
   );
-  const timer = setTimeout(() => proc.kill('SIGTERM'), 20_000);
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  const timer = setTimeout(() => {
+    proc.kill('SIGTERM');
+    // A child that ignores SIGTERM (or leaves a grandchild holding the pipes)
+    // otherwise hangs the campaign forever: stdout never EOFs. Escalate.
+    killTimer = setTimeout(() => proc.kill('SIGKILL'), 2_000);
+    killTimer.unref?.();
+  }, 20_000);
+  timer.unref?.();
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<'deadline'>(resolve => {
+    deadlineTimer = setTimeout(() => resolve('deadline'), 24_000);
+    deadlineTimer.unref?.();
+  });
+  const outcome = await Promise.race([
+    Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]).then(result => ({result}) as const),
+    deadline.then(() => ({timedOut: true} as const)),
   ]);
   clearTimeout(timer);
+  if (killTimer) clearTimeout(killTimer);
+  if (deadlineTimer) clearTimeout(deadlineTimer);
+  if ('timedOut' in outcome) proc.kill('SIGKILL');
   llm.stop(true);
+  assert(!('timedOut' in outcome), 'standalone run did not terminate after SIGTERM and SIGKILL');
+  const [stdout, stderr, exitCode] = outcome.result;
 
   assert(exitCode === 0, `standalone run exited ${exitCode}\nstdout=${stdout}\nstderr=${stderr}`);
   assert(existsSync(join(dirs.workDir, 'beta.txt')), 'beta.txt not written by standalone run');

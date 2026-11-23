@@ -3,6 +3,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {expect, test} from 'bun:test';
 import {setup} from '../src/plugin-v2.ts';
+import {dispatchV2Kickoff} from '../src/plugin-v2-command.ts';
 import {markCommandDispatch} from '../src/hooks.ts';
 import {createGoalState} from '../src/state-machine.ts';
 import {hydrateStoreFromDisk} from '../src/tui-disk-state.ts';
@@ -946,6 +947,85 @@ test('v2 admission retry preserves the full dispatch and survives a status comma
     await dispose();
     rmSync(root, {recursive: true, force: true});
   }
+});
+
+test('v2 kickoff dispatch selects the retained payload agent before prompting', async () => {
+  const order: string[] = [];
+  await dispatchV2Kickoff({
+    session: {
+      prompt: async payload => {
+        order.push('prompt');
+        expect(payload.files).toEqual([{path: 'required.md'}]);
+        return {};
+      },
+      synthetic: async () => {
+        order.push('synthetic');
+        return {};
+      },
+    },
+    selectAgent: async (sessionID, agent) => {
+      order.push('selectAgent');
+      expect(sessionID).toBe('s-agent');
+      expect(agent).toBe('goal');
+    },
+    sessionID: 's-agent',
+    dispatch: {
+      method: 'prompt',
+      payload: {
+        sessionID: 's-agent',
+        agent: 'goal',
+        text: 'kickoff',
+        files: [{path: 'required.md'}],
+      },
+    },
+  });
+  expect(order).toEqual(['selectAgent', 'prompt']);
+});
+
+test('v2 kickoff dispatch fails closed when the payload agent cannot be selected', async () => {
+  let prompted = false;
+  await expect(
+    dispatchV2Kickoff({
+      session: {
+        prompt: async () => {
+          prompted = true;
+          return {};
+        },
+        synthetic: async () => ({}),
+      },
+      sessionID: 's-agent',
+      dispatch: {
+        method: 'prompt',
+        payload: {sessionID: 's-agent', agent: 'goal', text: 'kickoff'},
+      },
+    }),
+  ).rejects.toThrow(/no switchAgent operation/);
+  expect(prompted).toBe(false);
+});
+
+test('v2 kickoff dispatch rejects a resolved error envelope instead of admitting it', async () => {
+  let prompted = false;
+  await expect(
+    dispatchV2Kickoff({
+      session: {
+        prompt: async () => {
+          prompted = true;
+          return {error: {message: 'session busy'}};
+        },
+        synthetic: async () => ({}),
+      },
+      sessionID: 's-agent',
+      dispatch: {
+        method: 'prompt',
+        payload: {
+          sessionID: 's-agent',
+          text: 'kickoff',
+          files: [{path: 'a.md'}],
+        },
+      },
+    }),
+  ).rejects.toThrow(/session busy/);
+  expect(prompted).toBe(true);
 });
 
 test('v2 queue-to-steer promotion of an inbox stop pauses the goal', async () => {

@@ -432,6 +432,41 @@ describe('v2 mode-implied input events drive steering', () => {
     expect(machine.snapshot().stopReason).toBe('explicit pause');
   });
 
+  test('a fenced session records no queued payload or delivery state', async () => {
+    const machine = new GoalStateMachine(makeActiveGoal(), {
+      onCommit: async () => {},
+    });
+    const depsForHooks = makeDeps(
+      makeSessionContext(machine),
+      makeMockSessionApi(),
+    );
+    const hooks = createHooks(depsForHooks) as ReturnType<
+      typeof createHooks
+    > & {
+      runtime?: typeof depsForHooks.runtime;
+    };
+    hooks.runtime = depsForHooks.runtime;
+    hooks.runtime!.canDriveSession = () => false;
+    await mapV2EventToHandlers(
+      {
+        type: 'session.input.queued',
+        data: {
+          sessionID: 'session-1',
+          inputID: 'fenced-1',
+          item: {type: 'user', payload: {text: 'stop'}},
+        },
+      },
+      bridgeDeps(hooks),
+    );
+    expect(
+      hooks.runtime!.queuedInputMessageIDs.get('session-1')?.has('fenced-1'),
+    ).not.toBe(true);
+    expect(
+      hooks.runtime!.inboxPayloadsByID?.get('session-1')?.has('fenced-1'),
+    ).not.toBe(true);
+    expect(machine.snapshot().status).toBe('active');
+  });
+
   test('a queued payload promoted to steered reaches the hook by ID', async () => {
     const machine = new GoalStateMachine(makeActiveGoal(), {
       onCommit: async () => {},

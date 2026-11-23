@@ -75,6 +75,14 @@ export async function mapV2EventToHandlers(
     return 'suppressed';
   const data = ev.data ?? {};
   const sessionID = getV2EventSessionID(data) ?? '';
+  // Session state is session-scoped: a process that cannot drive this session
+  // (foreign lease, read ceiling) must not allocate its per-session delivery
+  // or inbox-payload entries. The v1 event hook applies the same fence below,
+  // but this bridge records before forwarding, so it needs its own guard.
+  const canDriveSession =
+    !sessionID ||
+    !hooks.runtime?.canDriveSession ||
+    hooks.runtime.canDriveSession(sessionID) !== false;
   if (deps.eventLogPath) {
     try {
       const {appendFileSync} = await import('node:fs');
@@ -93,7 +101,7 @@ export async function mapV2EventToHandlers(
   // pause/stop) are respected. Queued input (delivery "queue") is NOT
   // synthesized: it waits for the turn boundary by definition and is
   // surfaced as a notice by the idle path.
-  if (ev.type === 'session.input.admitted' && sessionID) {
+  if (ev.type === 'session.input.admitted' && sessionID && canDriveSession) {
     const {delivery, id: inputID} = resolveInputDeliveryFields(
       data,
       ev.type,
@@ -131,7 +139,8 @@ export async function mapV2EventToHandlers(
   if (
     (ev.type === 'session.input.steered' ||
       ev.type === 'session.input.queued') &&
-    sessionID
+    sessionID &&
+    canDriveSession
   ) {
     const {id: inputID} = resolveInputDeliveryFields(data, ev.type, sessionID);
     recordV2InputDelivery(hooks.runtime, data, ev.type, sessionID);
@@ -208,7 +217,8 @@ export async function mapV2EventToHandlers(
   if (
     (ev.type === 'session.inbox.enqueued' ||
       ev.type === 'session.inbox.delivery.changed') &&
-    sessionID
+    sessionID &&
+    canDriveSession
   ) {
     recordV2InputDelivery(hooks.runtime, data, ev.type, sessionID);
     const {id: inboxID, delivery} = resolveInputDeliveryFields(

@@ -15,6 +15,10 @@ test('the v2 briefing assertion samples boot frames instead of one mutable captu
   const script = readFileSync(DRIVE, 'utf8');
   expect(script).toContain('01-boot-*.ansi');
   expect(script).toContain('boot_frame_has_briefing');
+  // The captures dir is never cleaned wholesale: stale 01-boot-N.ansi files
+  // from an earlier campaign would satisfy the glob before this run samples
+  // anything, turning a briefing regression into a false PASS.
+  expect(script).toMatch(/rm -f "\$CAP"\/?01-boot-\*\.ansi/);
   expect(script).not.toContain('grep -aqE "goals? need" "$CAP/01-boot.ansi"');
   expect(script).not.toContain('panel_regions "$f" \'Fixate\'');
 });

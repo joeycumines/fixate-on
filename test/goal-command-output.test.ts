@@ -124,7 +124,7 @@ describe('passive goal output', () => {
     await publisher.dispose();
   });
 
-  test('delivery failure remains visible and the receipt remains retrievable', async () => {
+  test('a rejecting RPC emit does not fail the command and the receipt stays retrievable', async () => {
     let latest:
       ((input: unknown) => Promise<GoalCommandOutput | null>) | undefined;
     const publisher = createGoalOutputPublisher();
@@ -141,9 +141,8 @@ describe('passive goal output', () => {
         };
       },
     });
-    await expect(publisher.publish('session', 'Receipt')).rejects.toThrow(
-      'output disconnected',
-    );
+    // Delivery failure must not report an already-successful command as failed.
+    await publisher.publish('session', 'Receipt');
     expect(await latest!({sessionID: 'session'})).toMatchObject({
       text: 'Receipt',
     });

@@ -214,6 +214,11 @@ cap 01-boot
 # asserting against that one mutable file can report that no briefing rendered
 # after it actually did. This is the same sampled-frame discipline already used
 # for the goal-started toast.
+# Clear only this run's sampled boot frames. The captures dir persists across
+# campaigns, and both boot_frame_has_briefing and the L2-brief PASS branch scan
+# the whole `01-boot-*.ansi` glob — a stale frame from an earlier run can make a
+# missing briefing pass. No other capture is touched.
+rm -f "$CAP"/01-boot-*.ansi
 BOOT_FRAME_SEQ=0
 capture_boot_frame() {
   BOOT_FRAME_SEQ=$((BOOT_FRAME_SEQ + 1))

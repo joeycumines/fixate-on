@@ -114,13 +114,21 @@ export function assistantTurnKey(message: unknown): string {
 }
 
 function hasComparableMonotonicIds(firstID: string, lastID: string): boolean {
-  return (
-    firstID.length > 4 &&
-    firstID.length === lastID.length &&
-    firstID.startsWith('msg_') &&
-    lastID.startsWith('msg_') &&
-    firstID !== lastID
-  );
+  if (
+    firstID.length <= 4 ||
+    firstID.length !== lastID.length ||
+    firstID === lastID
+  )
+    return false;
+  if (firstID.startsWith('msg_') && lastID.startsWith('msg_')) return true;
+  // Custom/legacy hosts may mint fixed-width monotonic ids with a different
+  // prefix family (e.g. "aaaa0002"). Accept them only when BOTH ids share the
+  // same alpha/underscore prefix followed by digits; mixed families ("u0" vs
+  // "m1") still decline so the array order is preserved.
+  const family = (id: string): string | undefined =>
+    /^([A-Za-z_]+)[0-9]+$/.exec(id)?.[1];
+  const firstFamily = family(firstID);
+  return firstFamily !== undefined && firstFamily === family(lastID);
 }
 
 /**
