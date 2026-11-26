@@ -8,7 +8,7 @@ import {readFileSync} from 'node:fs';
 import {isAbsolute, resolve} from 'node:path';
 import type {GoalState} from './state-machine.ts';
 import {chargedTokens} from './accounting.ts';
-import {escapeGoalText} from './escape.ts';
+import {escapeGoalText, escapeXmlAttribute} from './escape.ts';
 
 const CONTINUATION_TEMPLATE = `Continue working toward the active thread goal.
 
@@ -190,12 +190,12 @@ export function renderArtifactPointers(goal: GoalState, cwd?: string): string {
         content = content.slice(0, MAX_BYTES) + '\n[... truncated ...]';
       }
       blocks.push(
-        `<artifact_pointer path="${escapeGoalText(trimmedPath)}">\n${escapeGoalText(content)}\n</artifact_pointer>`,
+        `<artifact_pointer path="${escapeXmlAttribute(trimmedPath)}">\n${escapeGoalText(content)}\n</artifact_pointer>`,
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       blocks.push(
-        `<artifact_pointer path="${escapeGoalText(trimmedPath)}" error="true">\n[File not readable: ${escapeGoalText(msg)}]\n</artifact_pointer>`,
+        `<artifact_pointer path="${escapeXmlAttribute(trimmedPath)}" error="true">\n[File not readable: ${escapeGoalText(msg)}]\n</artifact_pointer>`,
       );
     }
   }

@@ -36,7 +36,7 @@ async function tuiModules(): Promise<string[]> {
  * either produced an incomplete set, and since BOTH directions of the table are
  * computed from it, such a module's row could omit a real dependency and its
  * `// Depends on:` header could too, with the gate green. That is the same hole
- *c closed in `test/no-circular-deps.test.ts` in this very change set,
+ * closed in `test/no-circular-deps.test.ts` in this very change set,
  * left open in the sibling extractor.
  *
  * Single quotes are included because nothing in `src/` uses them today, and a
@@ -68,17 +68,26 @@ async function localImports(file: string): Promise<string[]> {
 /**
  * The dependency names a module's row in docs/tui-integration.md claims, as
  * backticked bare module names in the deps cell.
+ *
+ * The row is located with the same static grammar the sibling table test
+ * uses, and the parsed path is compared by exact string equality. Building a
+ * RegExp by interpolating the module name would require escaping regex
+ * metacharacters in it — and a bare `\.`-style escape is itself the
+ * backslash gap CodeQL flags (js/incomplete-sanitization); exact equality
+ * needs no escaping at all.
  */
 async function documentedDeps(name: string): Promise<string[]> {
   const doc = await readFile(DOC, 'utf8');
-  const row = new RegExp(
-    `^\\|\\s*\`src/${name.replace(/[.]/g, '\\.')}\`\\s*\\|[^|]*\\|([^|]*)\\|`,
-    'm',
-  ).exec(doc);
-  if (!row) return [];
-  return [...row[1].matchAll(/`([a-z0-9-]+)(?:\.tsx?)?`/g)]
-    .map(m => m[1])
-    .filter(bare => bare !== name.replace(/\.tsx?$/, ''));
+  for (const line of doc.split('\n')) {
+    const row = /^\|\s*`(src\/[A-Za-z0-9_.-]+)`\s*\|([^|]*)\|([^|]*)\|/.exec(
+      line,
+    );
+    if (!row || row[1] !== `src/${name}`) continue;
+    return [...row[3].matchAll(/`([a-z0-9-]+)(?:\.tsx?)?`/g)]
+      .map(m => m[1])
+      .filter(bare => bare !== name.replace(/\.tsx?$/, ''));
+  }
+  return [];
 }
 
 /**
