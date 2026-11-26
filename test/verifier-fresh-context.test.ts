@@ -34,7 +34,17 @@ function scenario(context: (() => Promise<unknown>) | undefined) {
   const final = {
     type: 'assistant',
     id: 'final',
+    agent: 'goal-verify',
+    finish: 'stop',
+    time: {created: 2, completed: 3},
     content: [{type: 'text', text: verdict('WORKING')}],
+  };
+  const admitted = {
+    type: 'user',
+    id: 'admitted',
+    sessionID: 'child',
+    time: {created: 1},
+    payload: {text: 'review'},
   };
   let deleted = 0;
   let contextReads = 0;
@@ -56,6 +66,8 @@ function scenario(context: (() => Promise<unknown>) | undefined) {
               parentID: 'parent',
               agent: 'goal-verify',
               location: {directory: '/workspace'},
+              outcome: 'succeeded',
+              time: {busy: 1, idle: 4},
             },
       switchAgent: async () => {},
       hook: async (
@@ -72,17 +84,20 @@ function scenario(context: (() => Promise<unknown>) | undefined) {
       update: async () => {},
       prompt: async () => {
         await admit();
-        return {
-          type: 'user',
-          id: 'admitted',
-          payload: {text: 'review'},
-        };
+        return admitted;
       },
       wait: async () => {},
       context: context
         ? async () => {
             contextReads++;
-            return context();
+            const rows = await context();
+            return Array.isArray(rows)
+              ? [
+                  admitted,
+                  ...rows,
+                  {type: 'idle', outcome: 'succeeded', time: {created: 4}},
+                ]
+              : rows;
           }
         : undefined,
       remove: async () => {
@@ -98,6 +113,7 @@ function scenario(context: (() => Promise<unknown>) | undefined) {
     ctx,
     buffer,
     final,
+    admitted,
     admit,
     shim: createV2ClientShim(ctx as never, buffer),
     counts: () => ({created, deleted, contextReads}),
@@ -270,7 +286,7 @@ test('after waiting, user admission text cannot replace the fresh final verdict'
           await host.admit();
           return {
             ...completedReply(host.input.goal.goalId),
-            type: 'user',
+            ...host.admitted,
           };
         },
       },

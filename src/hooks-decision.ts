@@ -10,7 +10,8 @@ import type {GoalStateMachine} from './state-machine.ts';
 import type {ContinuationDecision, IdleContext} from './continuation-loop.ts';
 import {validatePendingIntent} from './continuation-loop.ts';
 import type {HookDeps, SessionContext} from './hooks-types.ts';
-import {isDeferError, isSessionGoneError} from './hooks-errors.ts';
+import {executeContinuation} from './hooks-continuation.ts';
+import {createGoalWorkScope} from './hooks-work-scope.ts';
 import {scanPrematureExit} from './stop-guard.ts';
 import {runCompletionGate} from './completion-gate-run.ts';
 import {buildContinueMessage, renderStopLimit} from './steering.ts';
@@ -36,294 +37,30 @@ export async function executeDecision(
   opts: {repetitionWarning?: boolean; inheritedAgent?: string} = {},
 ): Promise<void> {
   const {sessionApi} = deps;
+  const scope = createGoalWorkScope(sessionID, session, machine, deps);
 
   switch (decision.type) {
-    case 'continue': {
-      const goal = machine.snapshot();
-      const runtime = deps.runtime;
-
-      if (runtime) {
-        const sourceAssistantMessageID =
-          goal.lastAssistantMessageID || '<no-assistant>';
-        if (
-          goal.continuationClaim?.runId === goal.runId &&
-          goal.continuationClaim?.sourceAssistantMessageID ===
-            sourceAssistantMessageID
-        ) {
-          return;
-        }
-        await machine.mutate(
-          g => {
-            g.continuationClaim = {runId: g.runId, sourceAssistantMessageID};
-          },
-          {
-            source: 'idle-handler',
-            detail: 'Set continuation claim',
-            skipPersist: true,
-          },
-        );
-      }
-
-      await machine.mutate(
-        g => {
-          g.turnCount += 1;
-          g.lastContinueAt = Date.now();
-          // Preserve the blocked streak if the agent asserted blocked this turn;
-          // otherwise a normal continuation resets it. Without this guard, the
-          // consecutive-blocked count cannot accrue across idle boundaries when
-          // below the transition threshold.
-          if (!g.blockedAssertedThisTurn) {
-            g.blockedTurns = 0;
-          }
-          g.blockedAssertedThisTurn = false;
-          if (!decision.budgetWrapup && !decision.budgetLimit) {
-            g.lastStatus = `Continuing after assistant turn ${g.turnCount}.`;
-          }
-        },
-        {source: 'idle-handler', detail: 'Incremented turn count'},
+    case 'continue':
+      await executeContinuation(
+        decision,
+        sessionID,
+        session,
+        machine,
+        deps,
+        opts,
       );
-
-      if (decision.budgetLimit || decision.budgetWrapup) {
-        await machine.mutate(
-          g => {
-            g.finalizing = true;
-            if (decision.budgetLimit) {
-              g.budgetLimitReported = true;
-              g.stopReason = 'budget exhausted';
-            } else {
-              g.budgetWrapupSent = true;
-              g.stopReason = 'budget wrap-up requested';
-            }
-          },
-          {source: 'idle-handler', detail: 'Set finalizing state'},
-        );
-      }
-
-      let message: string = buildContinueMessage(machine.snapshot(), {
-        budgetLimit: decision.budgetLimit,
-        budgetWrapup: decision.budgetWrapup,
-        repetitionWarning: opts.repetitionWarning,
-        warnTurnsRemaining: deps.warnTurnsRemaining,
-        warnDurationMsRemaining: deps.warnDurationMsRemaining,
-        warnTokensRemaining: deps.warnTokensRemaining,
-      });
-      await machine.clearNotices();
-      if (machine.snapshot().objectiveUpdatedPending) {
-        await machine.mutate(
-          g => {
-            g.objectiveUpdatedPending = false;
-          },
-          {source: 'idle-handler', detail: 'Cleared objective updated pending'},
-        );
-      }
-
-      if (machine.state.status !== 'active' && !machine.state.finalizing) {
-        await machine.mutate(
-          g => {
-            g.continuationClaim = null;
-            g.finalizing = false;
-          },
-          {
-            source: 'idle-handler',
-            detail: 'Goal paused during continuation prep',
-            skipPersist: true,
-          },
-        );
-        await session.persist();
-        return;
-      }
-
-      const releasePrompt = acquirePromptInFlight(runtime, sessionID);
-      // Ensure message is a string to satisfy the host's Effect Schema validation.
-      if (typeof message !== 'string') {
-        message = String(message ?? '');
-      }
-      let response: {error?: {name?: string; message?: string}};
-      let promptFailed = false;
-      let promptDeferred = false;
-      try {
-        const promptInput: Record<string, unknown> = {
-          parts: [
-            {
-              type: 'text',
-              text: message,
-              metadata: {[GOAL_TUI_METADATA_KEY]: {kind: 'continuation'}},
-              synthetic: true,
-            },
-          ],
-        };
-        if (opts.inheritedAgent) promptInput.agent = opts.inheritedAgent;
-        response =
-          (await sessionApi.promptAsync(
-            sessionID,
-            promptInput as unknown as {
-              parts: unknown[];
-            } & Record<string, unknown>,
-          )) ?? {};
-        if (
-          response.error &&
-          isDeferError(response.error as {name?: string; message?: string})
-        ) {
-          promptDeferred = true;
-        }
-      } catch (error) {
-        const errObj = {
-          name: error instanceof Error ? error.name : 'unknown',
-          message: error instanceof Error ? error.message : String(error),
-        };
-        if (isDeferError(errObj)) {
-          promptDeferred = true;
-          response = {};
-        } else {
-          promptFailed = true;
-          response = {error: errObj};
-        }
-      } finally {
-        releasePrompt();
-        await machine.mutate(
-          g => {
-            g.finalizing = false;
-            // If the budget wrap-up prompt failed to reach the host, roll back
-            // budgetWrapupSent so the advisory prompt can be retried on a subsequent idle.
-            // In contrast, budgetLimit is terminal and is intentionally left reported.
-            if (promptFailed && decision.budgetWrapup) {
-              g.budgetWrapupSent = false;
-              if (g.stopReason === 'budget wrap-up requested')
-                g.stopReason = '';
-            }
-          },
-          {
-            source: 'idle-handler',
-            detail: 'Cleared finalizing',
-            skipPersist: true,
-          },
-        );
-      }
-
-      if (promptDeferred) {
-        // When the session is busy, defer execution and keep the goal active.
-        // Deferrals are bounded by maxPromptFailures to prevent infinite loops,
-        // do not consume turn budget, and are reported in lastStatus.
-        const deferKey = `${sessionID}:${machine.snapshot().goalId}`;
-        const deferrals = (runtime?.deferCounts.get(deferKey) ?? 0) + 1;
-        const maxFailures = deps.defaultOpts?.maxPromptFailures ?? 3;
-        if (deferrals >= maxFailures) {
-          runtime?.deferCounts.delete(deferKey);
-          await machine.mutate(
-            g => {
-              g.continuationClaim = null;
-              g.turnCount = Math.max(0, g.turnCount - 1);
-              g.promptFailures = maxFailures;
-              g.lastStatus = `Deferred ${deferrals}x (host busy); paused.`;
-            },
-            {
-              source: 'idle-handler',
-              detail: 'Continuation deferred past bound',
-              skipPersist: true,
-            },
-          );
-          await machine.transition('paused', {
-            source: 'idle-handler',
-            stopReason: 'deferred too many times',
-            detail: `Paused after ${deferrals} consecutive busy-deferrals.`,
-          });
-          await session.persist();
-        } else {
-          runtime?.deferCounts.set(deferKey, deferrals);
-          await machine.mutate(
-            g => {
-              g.continuationClaim = null;
-              g.turnCount = Math.max(0, g.turnCount - 1);
-              g.lastStatus = `Deferred (${deferrals}): host busy; will retry next idle.`;
-            },
-            {
-              source: 'idle-handler',
-              detail: 'Continuation deferred (session busy)',
-              skipPersist: true,
-            },
-          );
-          await session.persist();
-        }
-      } else if (response.error) {
-        // Continuations target the goal's owning session. If the session has been
-        // deleted, surface the specific "not found" state rather than a generic prompt
-        // failure while retaining standard retry bounds in case of transient host restarts.
-        const sessionGone = isSessionGoneError(
-          response.error as {name?: string; message?: string},
-        );
-        await machine.mutate(
-          g => {
-            g.continuationClaim = null;
-            g.promptFailures += 1;
-            const errName =
-              (response.error as {name?: string})?.name || 'unknown error';
-            const errMsg = (response.error as {message?: string})?.message;
-            g.lastStatus = sessionGone
-              ? "Auto-continue failed: the goal's session no longer exists (session not found)."
-              : errMsg
-                ? `Auto-continue failed: ${errName}: ${String(errMsg).slice(0, 300)}`
-                : `Auto-continue failed: ${errName}`;
-            const maxFailures = deps.defaultOpts?.maxPromptFailures ?? 3;
-            if (g.promptFailures >= maxFailures) {
-              g.lastStatus = sessionGone
-                ? `The goal's session no longer exists; paused after ${g.promptFailures} failure(s).`
-                : `Auto-continue failed; paused after ${g.promptFailures} failure(s).`;
-              // g.finalizing was cleared in finally block, inspect decision in scope.
-              if (
-                g.status === 'active' ||
-                decision.budgetWrapup ||
-                decision.budgetLimit ||
-                sessionGone
-              ) {
-                g.stopReason = sessionGone
-                  ? 'session not found'
-                  : 'auto-continue failures';
-              }
-            }
-          },
-          {source: 'idle-handler', detail: 'Prompt failure'},
-        );
-
-        const maxFailures = deps.defaultOpts?.maxPromptFailures ?? 3;
-        const afterFailure = machine.snapshot();
-        if (afterFailure.promptFailures >= maxFailures) {
-          await machine.transition('paused', {
-            source: 'idle-handler',
-            stopReason: sessionGone
-              ? 'session not found'
-              : 'auto-continue failures',
-            detail: sessionGone
-              ? `Paused after ${afterFailure.promptFailures} consecutive prompt failures: the goal's owning session no longer exists.`
-              : `Paused after ${afterFailure.promptFailures} consecutive prompt failures.`,
-          });
-        }
-        await session.persist();
-      } else {
-        runtime?.deferCounts.delete(
-          `${sessionID}:${machine.snapshot().goalId}`,
-        );
-        await machine.mutate(
-          g => {
-            g.promptFailures = 0;
-          },
-          {
-            source: 'idle-handler',
-            detail: 'Prompt succeeded, reset failure count',
-            skipPersist: true,
-          },
-        );
-        await session.persist();
-      }
-      break;
-    }
+      return;
 
     case 'pause': {
-      await machine.transition('paused', {
-        source: 'idle-handler',
-        stopReason: decision.stopReason,
-        detail: decision.reason,
-      });
-      await session.persist();
+      if (
+        !(await scope.transition('paused', {
+          source: 'idle-handler',
+          stopReason: decision.stopReason,
+          detail: decision.reason,
+        })) ||
+        !(await scope.persist())
+      )
+        return;
       // Auto-promote next goal in ordered sequences so execution does not stall silently.
       if (session.autoPromote && session.isOrdered()) {
         await session.autoPromote();
@@ -332,26 +69,17 @@ export async function executeDecision(
     }
 
     case 'budget-limit': {
-      const budgetResult = await machine.transition('budgetLimited', {
-        source: 'idle-handler',
-        stopReason: 'budget exhausted',
-        detail: 'API-cost budget exhausted',
-      });
-      if (!budgetResult.ok) {
-        await session.persist();
-        return;
-      }
-      await machine.mutate(
-        g => {
-          g.budgetLimitReported = true;
-        },
-        {
+      // The transition itself sets budgetLimitReported. A terminal goal does
+      // not accept the redundant field mutation that used to follow it.
+      if (
+        !(await scope.transition('budgetLimited', {
           source: 'idle-handler',
-          detail: 'Marked budget limit reported',
-          skipRevision: true,
-        },
-      );
-      await session.persist();
+          stopReason: 'budget exhausted',
+          detail: 'API-cost budget exhausted',
+        })) ||
+        !(await scope.persist())
+      )
+        return;
 
       const goal = machine.snapshot();
       let message: string = buildContinueMessage(goal, {
@@ -393,7 +121,7 @@ export async function executeDecision(
         releasePrompt();
       }
       // Retain focus on the terminating goal until its synthetic prompt completes.
-      if (session.autoPromote && session.isOrdered()) {
+      if (scope.current() && session.autoPromote && session.isOrdered()) {
         await session.autoPromote();
       }
       break;
@@ -678,16 +406,15 @@ export async function executeDecision(
     }
 
     case 'stop': {
-      const stopResult = await machine.transition('paused', {
-        source: 'idle-handler',
-        stopReason: decision.reason,
-        detail: `Goal stopped: ${decision.reason}`,
-      });
-      if (!stopResult.ok) {
-        await session.persist();
+      if (
+        !(await scope.transition('paused', {
+          source: 'idle-handler',
+          stopReason: decision.reason,
+          detail: `Goal stopped: ${decision.reason}`,
+        })) ||
+        !(await scope.persist())
+      )
         return;
-      }
-      await session.persist();
 
       // Send a final wrap-up prompt to notify the session rather than stopping silently.
       const stopGoal = machine.snapshot();
@@ -710,7 +437,7 @@ export async function executeDecision(
         releasePrompt();
       }
       // Retain focus on the stopped goal until its synthetic wrap-up prompt completes.
-      if (session.autoPromote && session.isOrdered()) {
+      if (scope.current() && session.autoPromote && session.isOrdered()) {
         await session.autoPromote();
       }
       break;
@@ -729,21 +456,27 @@ export async function sendRecoveryPrompt(
   phraseReason: string | null,
   claimText?: string,
 ): Promise<void> {
+  const scope = createGoalWorkScope(sessionID, session, machine, deps);
+  const goal = machine.snapshot();
+  if (goal.status !== 'active' && !goal.finalizing) return;
   // Persist updated recovery state on the goal for crash resilience.
-  await machine.mutate(
-    g => {
-      g.recoveryTurns = nextState.recoveryTurns;
-      g.unchangedResults = nextState.unchangedResults;
-      g.lastCandidate = nextState.lastCandidate;
-      g.lastFingerprint = nextState.lastFingerprint;
-      g.continuationClaim = null;
-      g.lastStatus = `Recovery ${recovery.recoveryTurns}/${recovery.maxRecoveryTurns}: ${verdict.outstanding.join('; ')}`;
-    },
-    {
-      source: 'update_goal',
-      detail: `Verifier WORKING — recovery ${recovery.recoveryTurns}/${recovery.maxRecoveryTurns}`,
-    },
-  );
+  if (
+    !(await scope.mutate(
+      g => {
+        g.recoveryTurns = nextState.recoveryTurns;
+        g.unchangedResults = nextState.unchangedResults;
+        g.lastCandidate = nextState.lastCandidate;
+        g.lastFingerprint = nextState.lastFingerprint;
+        g.continuationClaim = null;
+        g.lastStatus = `Recovery ${recovery.recoveryTurns}/${recovery.maxRecoveryTurns}: ${verdict.outstanding.join('; ')}`;
+      },
+      {
+        source: 'update_goal',
+        detail: `Verifier WORKING — recovery ${recovery.recoveryTurns}/${recovery.maxRecoveryTurns}`,
+      },
+    ))
+  )
+    return;
 
   // Record pressure-ladder rung transitions to make escalation visible in goal history and UI.
   const rung = determinePressureRung(
@@ -751,12 +484,15 @@ export async function sendRecoveryPrompt(
     recovery.maxRecoveryTurns,
   );
   if (machine.snapshot().pressureRung !== rung) {
-    await machine.mutate(
-      g => {
-        g.pressureRung = rung;
-      },
-      {source: 'update_goal', detail: `Pressure rung escalated to ${rung}`},
-    );
+    if (
+      !(await scope.mutate(
+        g => {
+          g.pressureRung = rung;
+        },
+        {source: 'update_goal', detail: `Pressure rung escalated to ${rung}`},
+      ))
+    )
+      return;
   }
 
   const message = buildRecoveryPrompt(
@@ -769,8 +505,8 @@ export async function sendRecoveryPrompt(
 
   // Clear pending intent to grant the agent a recovery turn to address outstanding verification gates.
   session.setPendingIntent(machine.snapshot().goalId, null);
-  await machine.addNotice('premature-exit', message);
-  await session.persist();
+  await machine.addNotice('premature-exit', message, {guard: scope.current});
+  if (!(await scope.persist())) return;
 
   if (deps.announceGoalDecision) {
     await deps.announceGoalDecision(
@@ -778,6 +514,7 @@ export async function sendRecoveryPrompt(
       `Recovery ${recovery.recoveryTurns}/${recovery.maxRecoveryTurns}: ${verdict.outstanding.join('; ')}`,
     );
   }
+  if (!scope.current()) return;
 
   // Send recovery prompt as a synthetic continuation, inheriting the active agent name when set.
   const releasePrompt = acquirePromptInFlight(deps.runtime, sessionID);

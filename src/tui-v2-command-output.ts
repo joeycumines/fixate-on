@@ -2,6 +2,7 @@
 import {
   GOAL_OUTPUT_RPC,
   parseGoalCommandOutput,
+  type GoalCommandOutput,
 } from './plugin-v2-command-output.ts';
 import {PRODUCT_DISPLAY_NAME} from './tui-components.ts';
 
@@ -27,6 +28,11 @@ export interface GoalOutputTuiContext {
   };
 }
 
+interface ReceiptRecovery {
+  sessionID: string;
+  displayedAt: number;
+}
+
 export function wireGoalCommandOutput(
   context: GoalOutputTuiContext,
   showReceipt: (text: string) => void,
@@ -35,14 +41,13 @@ export function wireGoalCommandOutput(
   const seen = new Set<string>();
   const unsubscribers: Array<() => void> = [];
   let disposed = false;
-  let received = 0;
-  let recovery = 0;
+  let recovery: ReceiptRecovery | undefined;
 
-  const display = (input: unknown) => {
-    if (disposed) return;
+  const display = (input: unknown): GoalCommandOutput | null => {
+    if (disposed) return null;
     try {
       const output = parseGoalCommandOutput(input);
-      if (!output || seen.has(output.id)) return;
+      if (!output || seen.has(output.id)) return null;
       const route = context.ui.router.current();
       if (
         output.kind === 'command' &&
@@ -60,37 +65,49 @@ export function wireGoalCommandOutput(
       }
       seen.add(output.id);
       if (seen.size > 256) seen.delete(seen.values().next().value!);
+      return output;
     } catch {
       // Isolate UI errors so the host's event listener stays alive. Leave the
       // receipt unseen so a later replay can retry its display.
+      return null;
     }
   };
 
   const recoverLatest = async () => {
     if (disposed || typeof context.client.rpc !== 'function') return;
-    const attempt = ++recovery;
-    const before = received;
+    // Only one request owns recovery. A newer reconnect invalidates it even
+    // when the user has since navigated away from a session.
+    recovery = undefined;
+    let request: ReceiptRecovery | undefined;
     try {
       const route = context.ui.router.current();
       if (route.type !== 'session' || !route.sessionID) return;
       const channel = context.client.rpc(GOAL_OUTPUT_RPC);
       if (typeof channel?.latest !== 'function') return;
+      request = {
+        sessionID: route.sessionID,
+        displayedAt: Number.NEGATIVE_INFINITY,
+      };
+      recovery = request;
       const output = parseGoalCommandOutput(
         await channel.latest({sessionID: route.sessionID}),
       );
-      // A live receipt or newer reconnect supersedes this request. An older
-      // cached response must never replace a receipt received in the meantime.
+      // Only an equally recent or newer displayed receipt for this session can
+      // supersede the result. An old SSE frame may arrive while a newer RPC
+      // response is pending; other sessions also share the same host stream.
       if (
         !disposed &&
-        attempt === recovery &&
-        before === received &&
-        output?.sessionID === route.sessionID
+        request === recovery &&
+        output?.sessionID === route.sessionID &&
+        output.timestamp > request.displayedAt
       ) {
         display(output);
       }
     } catch {
       // Older hosts may not expose latest. The live data subscription remains
       // usable even if a replay request fails while the server reconnects.
+    } finally {
+      if (request === recovery) recovery = undefined;
     }
   };
 
@@ -100,8 +117,17 @@ export function wireGoalCommandOutput(
     unsubscribers.push(
       context.data.on(`rpc.${GOAL_OUTPUT_RPC.id}.output`, event => {
         if (disposed) return;
-        received++;
-        display((event as {data?: unknown} | null)?.data);
+        const pending = recovery;
+        const output = display((event as {data?: unknown} | null)?.data);
+        // Invalid, duplicate or unsuccessfully displayed events do not replace
+        // a receipt. Capture before display, which may itself trigger reconnect.
+        if (
+          output &&
+          pending &&
+          pending === recovery &&
+          pending.sessionID === output.sessionID
+        )
+          pending.displayedAt = Math.max(pending.displayedAt, output.timestamp);
       }),
     );
     unsubscribers.push(
@@ -115,6 +141,7 @@ export function wireGoalCommandOutput(
   return () => {
     if (disposed) return;
     disposed = true;
+    recovery = undefined;
     seen.clear();
     for (const unsubscribe of unsubscribers) {
       try {

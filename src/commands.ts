@@ -88,12 +88,19 @@ export interface CommandOutcome {
    * attachments with the correct goal under concurrent commands.
    */
   targetGoalId?: string;
+  /** The semantic revision accepted by this command, before persistence awaits. */
+  targetRevision?: number;
 }
 
-const passOutcome = (text: string, targetGoalId?: string): CommandOutcome => ({
+const passOutcome = (
+  text: string,
+  targetGoalId?: string,
+  targetRevision?: number,
+): CommandOutcome => ({
   ok: true,
   text,
   ...(targetGoalId ? {targetGoalId} : {}),
+  ...(targetRevision !== undefined ? {targetRevision} : {}),
 });
 const failOutcome = (text: string): CommandOutcome => ({ok: false, text});
 
@@ -391,7 +398,11 @@ export async function handleCommandOutcome(
       ) {
         return failOutcome(ATTACHMENT_ACTIVATION_ERROR);
       }
-      return passOutcome('Goal is already running.', goal.goalId);
+      return passOutcome(
+        'Goal is already running.',
+        goal.goalId,
+        goal.revision,
+      );
     }
     if (TERMINAL_STATUSES.has(goal.status)) {
       return failOutcome(
@@ -413,6 +424,7 @@ export async function handleCommandOutcome(
     return passOutcome(
       `Goal resumed: ${goal.condition} (turn count restarted at 0 for a fresh budget window.)`,
       goal.goalId,
+      resumeResult.revision,
     );
   }
 
@@ -536,44 +548,26 @@ export async function handleCommandOutcome(
         `Goal is ${editGoal.status} (terminal) and cannot be edited. Run \`/${commandName} clear\` and create a new goal.`,
       );
     }
-    const priorEditKickoffAdmissionPending = editGoal.kickoffAdmissionPending;
-    if (options.hasAttachments) {
-      await machine.mutate(
-        goal => {
-          goal.kickoffAdmissionPending = true;
-        },
-        {
-          source: 'slash-command',
-          detail: 'Require attached kickoff inputs before activation',
-          skipPersist: true,
-        },
-      );
-    }
+    let editRevision = editGoal.revision;
     if (editGoal.status !== 'active') {
       const editTransitionResult = await machine.transition('active', {
         source: 'slash-command',
+        expectedRevision: editRevision,
         stopReason: '',
         detail: 'User edited the goal objective',
+        // Only the successful activation owns this marker. A concurrent edit
+        // that loses the transition must not restore an older marker over it.
+        // This does not reset the edit's preserved run budgets.
+        requireKickoffAdmission: options.hasAttachments,
       });
       if (!editTransitionResult.ok) {
-        if (options.hasAttachments) {
-          await machine.mutate(
-            goal => {
-              goal.kickoffAdmissionPending = priorEditKickoffAdmissionPending;
-            },
-            {
-              source: 'slash-command',
-              detail: 'Restore kickoff admission marker after failed edit',
-              skipPersist: true,
-            },
-          );
-        }
         return failOutcome(
           `Failed to edit goal: ${editTransitionResult.error}`,
         );
       }
+      editRevision = editTransitionResult.revision!;
     }
-    await machine.mutate(
+    const edited = await machine.mutate(
       goal => {
         goal.condition = newObjective;
         // An explicit replacement objective can waive inputs lost on restart.
@@ -591,8 +585,18 @@ export async function handleCommandOutcome(
         goal.lastNoToolCallMessageID = '';
         goal.lastStatus = 'Goal objective updated.';
       },
-      {source: 'slash-command', detail: 'User edited the goal objective'},
+      {
+        source: 'slash-command',
+        detail: 'User edited the goal objective',
+        guard: goal =>
+          goal.status === 'active' &&
+          goal.revision === editRevision &&
+          session
+            .listActiveGoals()
+            .some(current => current.goalId === goal.goalId),
+      },
     );
+    if (!edited.ok) return failOutcome(`Failed to edit goal: ${edited.error}`);
     const priorStatus = editGoal.status;
     const reactivated = priorStatus !== 'active';
     await session.persist();
@@ -606,6 +610,7 @@ export async function handleCommandOutcome(
         `Budgets and history are preserved. Run \`/${commandName} resume\` for a fresh budget window, or \`/${commandName} status\` to review.`,
       ].join('\n'),
       editGoal.goalId,
+      edited.revision,
     );
   }
 
@@ -721,19 +726,33 @@ export async function handleCommandOutcome(
     // running per idle event. The new goal becomes the focused target.
     const machine = session.createGoal(parsed.condition, {
       ...parsed.options,
+      ...(parsed.tokenBudget ? {tokenBudget: parsed.tokenBudget} : {}),
       kickoffAdmissionPending: options.hasAttachments,
       userCommandStartedAt,
     });
-    if (parsed.tokenBudget && parsed.tokenBudget > 0) {
-      await machine.mutate(
+    let addedRevision = machine.snapshot().revision;
+    if (
+      parsed.tokenBudget &&
+      parsed.tokenBudget > 0 &&
+      machine.snapshot().tokenBudget !== parsed.tokenBudget
+    ) {
+      const budgeted = await machine.mutate(
         goal => {
           goal.tokenBudget = parsed.tokenBudget!;
         },
-        {source: 'slash-command', detail: 'Set token budget'},
+        {
+          source: 'slash-command',
+          detail: 'Set token budget',
+          guard: goal => goal.revision === addedRevision,
+        },
       );
+      if (!budgeted.ok)
+        return failOutcome(`Failed to add goal: ${budgeted.error}`);
+      addedRevision = budgeted.revision!;
     }
+    const addedGoal = machine.snapshot();
     const addedPersisted = await session.persist();
-    const addedGoalId = machine.snapshot().goalId;
+    const addedGoalId = addedGoal.goalId;
     if (!addedPersisted) {
       const cause = session.isOwnedElsewhere?.()
         ? "NOT SAVED — this host could not write this session's file, because another process owns it."
@@ -746,12 +765,14 @@ export async function handleCommandOutcome(
           `Objective: ${parsed.condition}`,
         ].join('\n'),
         targetGoalId: addedGoalId,
+        targetRevision: addedRevision,
       };
     }
     return {
       ok: true,
       text: `Added and focused new goal: ${parsed.condition}`,
       targetGoalId: addedGoalId,
+      targetRevision: addedRevision,
     };
   }
 
@@ -781,6 +802,7 @@ export async function handleCommandOutcome(
     }
 
     let firstGoalId: string | null = null;
+    let firstRevision: number | undefined;
     for (let i = 0; i < objectives.length; i++) {
       const machine = session.createGoal(objectives[i], {
         mode: 'ordered',
@@ -789,6 +811,7 @@ export async function handleCommandOutcome(
       });
       if (i === 0) {
         firstGoalId = machine.state.goalId;
+        firstRevision = machine.snapshot().revision;
       } else {
         await machine.mutate(
           goal => {
@@ -815,7 +838,11 @@ export async function handleCommandOutcome(
       '',
       `Focused goal 1: ${objectives[0]}`,
     ];
-    return passOutcome(lines.join('\n'), firstGoalId ?? undefined);
+    return passOutcome(
+      lines.join('\n'),
+      firstGoalId ?? undefined,
+      firstRevision,
+    );
   }
 
   const firstWord = command.root;
@@ -848,17 +875,38 @@ export async function handleCommandOutcome(
 
   const machine = await session.replaceGoals(parsed.condition, {
     ...parsed.options,
+    ...(parsed.tokenBudget ? {tokenBudget: parsed.tokenBudget} : {}),
     kickoffAdmissionPending: options.hasAttachments,
     userCommandStartedAt,
   });
-  if (parsed.tokenBudget && parsed.tokenBudget > 0) {
-    await machine.mutate(
+  // replaceGoals awaits the creation checkpoint before returning. A fresh goal
+  // begins at revision zero; taking its revision after that await could adopt a
+  // concurrent edit or resume as though it belonged to this older command.
+  let createdRevision = 0;
+  if (machine.snapshot().revision !== createdRevision)
+    return failOutcome(
+      'Goal changed while the new goal was being saved; the older kickoff was cancelled.',
+    );
+  if (
+    parsed.tokenBudget &&
+    parsed.tokenBudget > 0 &&
+    machine.snapshot().tokenBudget !== parsed.tokenBudget
+  ) {
+    const budgeted = await machine.mutate(
       goal => {
         goal.tokenBudget = parsed.tokenBudget!;
       },
-      {source: 'slash-command', detail: 'Set token budget'},
+      {
+        source: 'slash-command',
+        detail: 'Set token budget',
+        guard: goal => goal.revision === createdRevision,
+      },
     );
+    if (!budgeted.ok)
+      return failOutcome(`Failed to set goal: ${budgeted.error}`);
+    createdRevision = budgeted.revision!;
   }
+  const createdGoal = machine.snapshot();
   const createdPersisted = await session.persist();
 
   const lines = createdPersisted
@@ -893,7 +941,7 @@ export async function handleCommandOutcome(
   lines.push(
     'When the goal is fully satisfied, call update_goal with status "complete". If you are truly blocked and need the user, call update_goal with status "blocked".',
   );
-  return passOutcome(lines.join('\n'), machine.snapshot().goalId);
+  return passOutcome(lines.join('\n'), createdGoal.goalId, createdRevision);
 }
 
 // Re-export formatters and parsers for backwards compatibility with existing consumers.

@@ -31,6 +31,12 @@ export interface V2SessionPromptContext {
   readonly messageID: string;
 }
 
+export interface V2SessionTitleContext {
+  readonly sessionID: string;
+  messages: unknown[];
+  result?: string;
+}
+
 export interface V2SessionDomain {
   prompt: V2SessionOp;
   synthetic: V2SessionOp;
@@ -44,14 +50,24 @@ export interface V2SessionDomain {
   update?: V2SessionOp;
   wait?: V2SessionOp;
   switchAgent?: V2SessionOp;
-  hook: <N extends 'context' | 'compaction' | 'experimental.idle' | 'prompt'>(
+  hook: <
+    N extends
+      | 'context'
+      | 'compaction'
+      | 'generate'
+      | 'title'
+      | 'experimental.idle'
+      | 'prompt',
+  >(
     name: N,
     cb: (
       input: N extends 'experimental.idle'
         ? V2SessionIdleContext
         : N extends 'prompt'
           ? V2SessionPromptContext
-          : V2SessionContext,
+          : N extends 'title'
+            ? V2SessionTitleContext
+            : V2SessionContext,
     ) => Promise<void> | void,
   ) => Promise<{dispose: () => Promise<void>}>;
 }

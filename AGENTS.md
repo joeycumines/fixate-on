@@ -47,9 +47,10 @@ with a word that already is.
   several.
 - **continuation** — a loop turn driven by the plugin, not by the user.
 - **claim** — an agent's statement about state; above all, "this is done".
-- **verifier** — something that checks a claim. Two kinds: a **command
-  verifier** (a program run, its exit status observed) and a **judge** (a model
-  asked whether the claim holds). Neither outranks the other; both are fallible.
+- **verifier** — something that checks a claim. This plugin uses a **judge**
+  (a model asked whether the claim holds). The working agent runs checks with
+  its own tools; the plugin does not execute workspace commands as verifiers.
+  Both the checks and the judge's interpretation are fallible.
 - **attestation** — a verifier's finding on a claim, naming which verifier and
   citing its evidence.
 - **attested** — a completion claim that carries an attestation.
@@ -146,12 +147,13 @@ measurement is an opinion, and must be labelled as one.
      forced it to lie in order to stop. Refusing to settle is not safety; it is a
      hang with a justification attached.
 
-   Every completion claim is checked by a **verifier**. A command verifier is an
-   optimisation the *agent* may define and register when a requirement calls for
-   it — never a flag the user must supply. A **judge** (a model asked to
-   *falsify* the claim) is always available. A judge's concurrence is weak
-   evidence and its refusal is strong, so the policy is asymmetric: easy to
-   continue, hard to settle. Phrase triage (`src/stop-guard.ts`) is advisory,
+   Completion claims are submitted to the configured **judge**, a model asked
+   to *falsify* the claim. Workspace scripts, Makefile targets, and package test
+   commands never select or replace that judge. If the judge is unavailable,
+   resolution reports a fault; it does not run a fallback command. A judge's
+   concurrence is weak evidence and its refusal is strong, so the policy is
+   asymmetric: easy to continue, hard to settle. Phrase triage
+   (`src/stop-guard.ts`) is advisory,
    abstains, and CANNOT override a verifier. An operational failure to obtain an
    attestation is a **fault**: retried with backoff, never converted into a
    verdict about the goal, and bounded — after which the goal settles with an

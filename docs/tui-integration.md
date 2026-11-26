@@ -172,8 +172,13 @@ The server registers the `fixate-on-output` RPC. Its `output` event carries
 The v2 companion subscribes through the host's reconnecting
 `context.data.on('rpc.fixate-on-output.output', ...)` event feed. It requests the
 latest receipt for the open session at startup and after `server.connected`;
-a delayed replay cannot replace a newer live receipt. Repeated receipt IDs are
-ignored.
+a delayed replay cannot replace a newer live receipt for that session. Events
+for other sessions, malformed events, already displayed duplicates, and failed
+display attempts do not suppress recovery. Repeated receipt IDs are ignored
+after successful display.
+Receipts have strictly increasing timestamps within a server instance, including
+same-millisecond bursts and backward clock adjustments. An older live event
+therefore cannot suppress a newer pending replay.
 
 For the open session, command receipts use a scrollable dialog that keeps the
 full text available as the terminal resizes. Use `up`/`down`,
@@ -399,7 +404,8 @@ requires the lag documented with numbers rather than left implicit.
 
 | Module | Role | Project dependencies |
 |---|---|---|
-| `src/tui-state.ts` | Snapshot projection, event contract, in-process store (leaf) | `accounting.ts`, `state-machine.ts` |
+| `src/tui-state.ts` | Snapshot projection, event contract, in-process store | `accounting.ts`, `state-machine.ts`, `tui-snapshot-details.ts` |
+| `src/tui-snapshot-details.ts` | Wire validation and independent copies of claim and proposal details | `goal-types.ts` |
 | `src/tui-components.ts` | Toast helpers + `PRODUCT_DISPLAY_NAME` (leaf) | None |
 | `src/tui-views.ts` | Dashboard formatter (pure) | `brake-format.ts`, `status-label.ts`, `tui-analytics.ts`, `tui-components.ts`, `tui-state.ts` |
 | `src/tui-dashboard-route.tsx` | OpenCode-native full-screen dashboard route | `tui-components.ts`, `tui-state.ts`, `tui-views.ts` (the card's text comes from `goalCardLines`, which is what makes the attribution and the brake ceiling testable without OpenCode's terminal renderer) |

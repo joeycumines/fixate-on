@@ -56,35 +56,51 @@ const MAX_OUTPUT_SESSIONS = 256;
 
 export function createGoalOutputPublisher(
   fallback?: (sessionID: string, text: string) => Promise<void>,
+  now: () => number = Date.now,
 ) {
   const latest = new Map<string, GoalCommandOutput>();
   let registration: GoalOutputRpcRegistration | undefined;
+  let registering: Promise<void> | undefined;
   let disposed = false;
+  let lastTimestamp = Number.NEGATIVE_INFINITY;
+
+  const register = async (rpc: GoalOutputRpcDomain): Promise<void> => {
+    try {
+      const reg = await rpc.register(GOAL_OUTPUT_RPC, {
+        latest: async input => {
+          const sessionID =
+            input && typeof input === 'object' && 'sessionID' in input
+              ? input.sessionID
+              : undefined;
+          return typeof sessionID === 'string'
+            ? (latest.get(sessionID) ?? null)
+            : null;
+        },
+      });
+      if (disposed) {
+        await reg.dispose();
+        return;
+      }
+      registration = reg;
+    } catch {
+      // A host with a broken RPC domain is a host without a passive output
+      // channel; treat it like one so the messenger/explicit-error fallback
+      // applies instead of failing plugin setup.
+    }
+  };
 
   return {
     async register(rpc: GoalOutputRpcDomain | undefined): Promise<void> {
       if (!rpc || disposed || registration) return;
+      // Claim the in-flight attempt before invoking the host: concurrent
+      // callers must not allocate registrations that only one dispose can own.
+      if (!registering)
+        registering = Promise.resolve().then(() => register(rpc));
+      const pending = registering;
       try {
-        const reg = await rpc.register(GOAL_OUTPUT_RPC, {
-          latest: async input => {
-            const sessionID =
-              input && typeof input === 'object' && 'sessionID' in input
-                ? input.sessionID
-                : undefined;
-            return typeof sessionID === 'string'
-              ? (latest.get(sessionID) ?? null)
-              : null;
-          },
-        });
-        if (disposed) {
-          await reg.dispose();
-          return;
-        }
-        registration = reg;
-      } catch {
-        // A host with a broken RPC domain is a host without a passive output
-        // channel; treat it like one so the messenger/explicit-error fallback
-        // applies instead of failing plugin setup.
+        await pending;
+      } finally {
+        if (registering === pending) registering = undefined;
       }
     },
 
@@ -96,12 +112,15 @@ export function createGoalOutputPublisher(
       if (disposed)
         throw new Error('Goal output is unavailable after disposal.');
       if (!sessionID || !text) return;
+      // Live events and RPC recovery may arrive in either order. Keep a strict
+      // ordering within this publisher, including bursts and clock adjustment.
+      lastTimestamp = Math.max(now(), lastTimestamp + 1);
       const output: GoalCommandOutput = {
         id: crypto.randomUUID(),
         sessionID,
         text,
         kind,
-        timestamp: Date.now(),
+        timestamp: lastTimestamp,
       };
       latest.delete(sessionID);
       latest.set(sessionID, output);

@@ -66,7 +66,7 @@ export function findLatestAssistantMessage(
  * `completed`); flat/legacy hosts put `time` or `createdAt` at the top level.
  * Returns null when nothing usable is present.
  */
-function messageCreatedAt(message: unknown): number | null {
+export function messageCreatedAt(message: unknown): number | null {
   if (!message || typeof message !== 'object') return null;
   const msg = message as Record<string, unknown>;
   const info = msg.info as Record<string, unknown> | undefined;

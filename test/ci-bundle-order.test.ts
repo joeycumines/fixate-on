@@ -19,3 +19,24 @@ test('CI builds the bundles before running tests that inspect export targets', (
   expect(testsAt).toBeGreaterThan(-1);
   expect(bundleAt).toBeLessThan(testsAt);
 });
+
+test.each(['ci.yml', 'release.yml'])(
+  '%s runs its gate with the exact Bun version recorded in package.json',
+  filename => {
+    const manifest = JSON.parse(
+      readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+    ) as {packageManager: string};
+    expect(manifest.packageManager).toMatch(/^bun@\d+\.\d+\.\d+$/);
+    const workflow = readFileSync(
+      new URL(`../.github/workflows/${filename}`, import.meta.url),
+      'utf8',
+    );
+    const setup = workflow.match(
+      /uses: oven-sh\/setup-bun@[^\n]+\n([\s\S]*?)(?=\n\s+- |$)/,
+    )?.[1];
+    expect(setup).toBeDefined();
+    expect(setup).toMatch(/bun-version-file:\s*package\.json\s*$/m);
+    // An explicit version takes precedence over the version file in setup-bun.
+    expect(setup).not.toMatch(/\bbun-version:/);
+  },
+);

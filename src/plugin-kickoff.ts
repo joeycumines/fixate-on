@@ -18,6 +18,7 @@ import {GOAL_TUI_METADATA_KEY} from './tui-state.ts';
 import type {SessionContext} from './hooks-types.ts';
 import {
   acquirePromptInFlight,
+  kickoffAdmissionGuard,
   removeKickoffDispatch,
   type RuntimeState,
   type PendingKickoffDispatch,
@@ -25,6 +26,7 @@ import {
 import type {SessionStateManager} from './session-state-manager.ts';
 import type {OpenCodeSessionApi} from './session-api.ts';
 import {TERMINAL_STATUSES, type GoalState} from './state-machine.ts';
+import {KickoffConfirmationError} from './plugin-v2-command.ts';
 
 export interface SlashCommandResult {
   handled: boolean;
@@ -40,6 +42,7 @@ export interface SlashCommandResult {
   activatedGoal: GoalState | null;
   enteredActive: boolean;
   targetGoalId?: string;
+  targetRevision?: number;
   error?: string;
 }
 
@@ -141,6 +144,51 @@ export function createKickoffWiring(args: {
     !runtime.disposed &&
     runtime.pendingKickoffDispatch?.get(sessionID)?.get(pending.goalId) ===
       pending;
+  runtime.persistKickoffInputHistory = async sessionID => {
+    if (runtime.disposed || runtime.canDriveSession?.(sessionID) === false)
+      return false;
+    return stateManager.persist(sessionID, {
+      assertActive: () => {
+        if (runtime.disposed || runtime.canDriveSession?.(sessionID) === false)
+          throw new Error(
+            'Session ownership changed before history was saved.',
+          );
+      },
+      // Stage known=true in this checkpoint and publish it only when replacement
+      // succeeds. A failed concurrent certification never rolls back another
+      // successful writer's admission history.
+      accepted: () => runtime.kickoffInputHistoryKnownSessions.add(sessionID),
+    });
+  };
+  runtime.persistKickoffInput = async (sessionID, inputID, unconfirmed) => {
+    let ids = runtime.unconfirmedKickoffInputs.get(sessionID);
+    if (!ids)
+      runtime.unconfirmedKickoffInputs.set(sessionID, (ids = new Set()));
+    if (unconfirmed) ids.add(inputID);
+    if (runtime.disposed || runtime.canDriveSession?.(sessionID) === false)
+      return false;
+    if (!unconfirmed) ids.delete(inputID);
+    try {
+      const saved = await runtime.persistKickoffInputHistory!(sessionID);
+      if (!saved && !unconfirmed) ids.add(inputID);
+      return saved;
+    } catch (error) {
+      if (!unconfirmed) ids.add(inputID);
+      throw error;
+    }
+  };
+  runtime.confirmKickoffInput = (sessionID, confirmation) =>
+    stateManager.persist(sessionID, {
+      ...confirmation,
+      accepted: () => {
+        // The staged snapshot omits this ID, but every ordinary writer retains
+        // it until the guarded atomic replacement has actually succeeded.
+        runtime.unconfirmedKickoffInputs
+          .get(sessionID)
+          ?.delete(confirmation.inputID);
+        confirmation.accepted();
+      },
+    });
   const prepareKickoffAdmission = async (
     sessionID: string,
     pending: PendingKickoffDispatch,
@@ -344,9 +392,15 @@ export function createKickoffWiring(args: {
             await runtime.retryPendingKickoffDispatch(
               sessionID,
               retained.dispatch,
+              kickoffAdmissionGuard(
+                runtime,
+                sessionID,
+                retained,
+                snap.revision,
+              ),
             );
             admitted = true;
-          } catch {
+          } catch (error) {
             if (
               runtime.canDriveSession?.(sessionID) === false ||
               !ownsDispatch(sessionID, retained)
@@ -356,6 +410,17 @@ export function createKickoffWiring(args: {
             const goal = current?.snapshot();
             if (!current || goal?.runId !== runId || current.isTerminal()) {
               removeKickoffDispatch(runtime, sessionID, retained);
+              return;
+            }
+            if (error instanceof KickoffConfirmationError) {
+              removeKickoffDispatch(runtime, sessionID, retained);
+              if (goal.status === 'active')
+                await current.transition('paused', {
+                  source: 'idle-handler',
+                  stopReason: 'kickoff admission failed',
+                  detail: error.message,
+                });
+              await runtime.announceKickoffFailure?.(sessionID, error.message);
               return;
             }
             if (goal.status !== 'active') return;
@@ -688,6 +753,13 @@ export function createKickoffWiring(args: {
         )
           activatedGoal = edited;
       }
+      // A command waiting on persistence cannot adopt a newer activation.
+      if (
+        activatedGoal &&
+        outcome.targetRevision !== undefined &&
+        activatedGoal.revision !== outcome.targetRevision
+      )
+        activatedGoal = null;
       const after = activatedGoal ?? focusedAfter;
       // Describe the state transition of the goal the command actually
       // targeted, not the focused presentation goal. A named resume/edit can
@@ -765,6 +837,9 @@ export function createKickoffWiring(args: {
         activatedGoal,
         enteredActive,
         ...(outcome.targetGoalId ? {targetGoalId: outcome.targetGoalId} : {}),
+        ...(outcome.targetRevision !== undefined
+          ? {targetRevision: outcome.targetRevision}
+          : {}),
         ...(outcome.ok ? {} : {error: text}),
       };
     } catch (err) {

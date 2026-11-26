@@ -589,6 +589,16 @@ export function createEventHook(
 
     if (eventType === 'session.execution.failed') {
       if (sessionID && typeof sessionID === 'string') {
+        // A model hook can reject a late cancelled kickoff after a replacement
+        // goal has become active. Its owned receipt is not a provider failure
+        // of that newer goal and must not change its admission revision.
+        if (
+          runtime?.isKickoffCancellationError?.(
+            sessionID,
+            event?.properties?.error,
+          )
+        )
+          return;
         const session = getSessionContext(sessionID);
         const machines = sessionMachines(session);
         let changed = false;

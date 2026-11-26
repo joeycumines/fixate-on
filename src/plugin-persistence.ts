@@ -20,7 +20,7 @@ import {
   sessionStatePaths,
 } from './session-paths.ts';
 import {MAX_STATE_FILE_BYTES, portableFileSize} from './fs-portable.ts';
-import type {RuntimeState} from './session-runtime.ts';
+import type {RuntimeState, KickoffHistoryCommit} from './session-runtime.ts';
 import type {SessionStateManager} from './session-state-manager.ts';
 import {mergeRecovered, type PluginOptions} from './plugin-options.ts';
 
@@ -29,7 +29,10 @@ export interface PersistenceWiring {
     sessionID: string,
     opts?: {report?: boolean},
   ) => Promise<boolean>;
-  persistFn: (sessionID?: string) => Promise<boolean>;
+  persistFn: (
+    sessionID?: string,
+    confirmation?: KickoffHistoryCommit,
+  ) => Promise<boolean>;
   unreadableSessions: Set<string>;
   refusedSessions: Map<string, string>;
   heldLeases: Map<string, PersistenceLease>;
@@ -88,6 +91,30 @@ export async function createPersistenceWiring(args: {
 
   /** Leases held by this process, released during disposal. */
   const heldLeases = new Map<string, PersistenceLease>();
+  runtime.ownsKickoffInputHistory = sessionID =>
+    !persistState ||
+    (heldLeases.has(sessionID) &&
+      runtime.canDriveSession?.(sessionID) !== false);
+  runtime.readKickoffInputHistory = async sessionID => {
+    if (!persistState) return {known: false, unconfirmed: new Set()};
+    const paths = pathsForSession(sessionID);
+    // A foreign owner can admit inputs after this process's startup scan. Read
+    // the same strictly validated snapshot fields again, after fetching host
+    // history; never infer acceptance from this process's stale clean cache.
+    const state = await recoverState(
+      paths.statePath,
+      paths.ledgerPath,
+      pluginOptions.ledgerRetentionFiles,
+    );
+    return {
+      known: state.kickoffInputHistoryKnown === true,
+      unconfirmed: new Set(
+        (state.unconfirmedKickoffInputs ?? [])
+          .filter(record => record.sessionID === sessionID)
+          .map(record => record.inputID),
+      ),
+    };
+  };
 
   // State persistence writes are serialized via a promise chain to prevent race conditions.
   let persistChain = Promise.resolve(true);
@@ -99,9 +126,17 @@ export async function createPersistenceWiring(args: {
    */
   const unreadableSessions = new Set<string>();
 
-  const persistFn = (sessionID?: string): Promise<boolean> => {
+  const persistFn = (
+    sessionID?: string,
+    confirmation?: KickoffHistoryCommit,
+  ): Promise<boolean> => {
     if (runtime.disposed) return Promise.resolve(false);
-    if (!persistState) return Promise.resolve(true);
+    if (!persistState) {
+      // With persistence disabled the same boundary is process-local only.
+      confirmation?.assertActive();
+      confirmation?.accepted();
+      return Promise.resolve(true);
+    }
     if (persistenceRecoveryFailed) return Promise.resolve(false);
     if (sessionID && unreadableSessions.has(sessionID))
       return Promise.resolve(false);
@@ -123,6 +158,18 @@ export async function createPersistenceWiring(args: {
           state.pendingIntents,
           state.settlementReceipts,
           state.focusedGoalIds,
+          confirmation
+            ? state.unconfirmedKickoffInputs?.filter(
+                record => record.inputID !== confirmation.inputID,
+              )
+            : state.unconfirmedKickoffInputs,
+          confirmation ? true : state.kickoffInputHistoryKnown,
+          confirmation
+            ? {
+                beforeInstall: confirmation.assertActive,
+                afterInstall: confirmation.accepted,
+              }
+            : undefined,
         );
       });
     return persistChain;
@@ -262,6 +309,16 @@ export async function createPersistenceWiring(args: {
           paths.ledgerPath,
           pluginOptions.ledgerRetentionFiles,
         );
+        if (recovered.kickoffInputHistoryKnown)
+          runtime.kickoffInputHistoryKnownSessions.add(sessionID);
+        if (recovered.snapshotUnreadable && !recovered.snapshotOverCeiling) {
+          console.error(
+            `[fixate-on] session ${sessionID}'s state snapshot could not be recovered. ` +
+              'Snapshot-only records, including unconfirmed kickoff inputs, cannot be reconstructed from the goal ledger. ' +
+              'This host will not overwrite the missing or unreadable snapshot; restore it or start a new session.',
+          );
+          unreadableSessions.add(sessionID);
+        }
 
         // If the state file exceeds read limits, fence this session to prevent overwriting
         // durable state with an incomplete snapshot. Other sessions remain unaffected.
@@ -336,6 +393,9 @@ export async function createPersistenceWiring(args: {
           focusedGoalIds: ownedFocus,
           settlementReceipts: ownedReceipts,
           pendingIntents: ownedIntents,
+          unconfirmedKickoffInputs: recovered.unconfirmedKickoffInputs?.filter(
+            entry => entry.sessionID === sessionID,
+          ),
         });
         invalidatedBySession.set(sessionID, recovered.invalidatedGoalIds);
       }

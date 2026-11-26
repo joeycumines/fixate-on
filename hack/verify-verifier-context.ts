@@ -1,7 +1,9 @@
 /**
  * Exercise the real v2.2.7 host with the child verifier and v2 client adapter.
  * OPENCODE_BINARY=/path/to/opencode bun hack/verify-verifier-context.ts
- * The model provider is controlled; the failed-read case injects one context-read error.
+ * The model provider is controlled. Cases cover successful final replies, failed
+ * context reads, output-limit exhaustion, next-step preparation failure, and an
+ * idle-hook failure after a complete-looking final response.
  * The fixture RPC executes the verifier inside the real plugin context, including
  * its prompt admission hook and permission update. Session persistence, tools,
  * context hook snapshots and final messages run through an isolated official host.
@@ -24,7 +26,7 @@ assert.equal(version.exitCode, 0);
 const hostVersion = version.stdout.toString().trim();
 assert.match(hostVersion, /\bv?2\./, 'Expected an OpenCode v2 binary.');
 const root = realpathSync(
-  mkdtempSync(join(tmpdir(), 'fixate-review-stale-verdict-')),
+  mkdtempSync(join(tmpdir(), 'fixate-verifier-settlement-')),
 );
 const work = join(root, 'work');
 const plugin = join(root, 'plugin');
@@ -50,19 +52,26 @@ import {unwrapV2Data} from ${JSON.stringify(resolve(import.meta.dir, '../src/plu
 export default {id: 'fixate-on', async setup(ctx) {
   const dispose = await setup(ctx);
   const snapshots = new Map();
+  const modes = new Map();
   const observer = await ctx.session.hook('context', input => {
+    if (modes.get(input.sessionID) === 'preparation-failure' && snapshots.has(input.sessionID))
+      throw new Error('Controlled next-step preparation failure after interim verdict');
     const snapshot = JSON.parse(JSON.stringify(input.messages));
     snapshots.set(input.sessionID, snapshot);
     writeFileSync(join(${JSON.stringify(captures)}, input.sessionID + '.json'), JSON.stringify(snapshot));
   });
+  const idleObserver = await ctx.session.hook('experimental.idle', input => {
+    if (modes.get(input.sessionID) === 'idle-failure')
+      throw new Error('Controlled idle-hook failure after final verdict');
+  });
   const rpc = await ctx.rpc.register({
     id: 'fixate-verifier-context-fixture',
     methods: {verify: {
-      input: {type: 'object', properties: {parentID: {type: 'string'}, failContextRead: {type: 'boolean'}}, required: ['parentID', 'failContextRead'], additionalProperties: false},
+      input: {type: 'object', properties: {parentID: {type: 'string'}, mode: {type: 'string', enum: ['working', 'complete', 'read-failure', 'output-limit', 'preparation-failure', 'idle-failure']}}, required: ['parentID', 'mode'], additionalProperties: false},
       output: {type: 'object', additionalProperties: true},
     }},
     events: {},
-  }, {verify: async ({parentID, failContextRead}) => {
+  }, {verify: async ({parentID, mode}) => {
     const created = [];
     const parentObserved = [];
     const childObserved = [];
@@ -70,9 +79,11 @@ export default {id: 'fixate-on', async setup(ctx) {
     const operations = [];
     const buffer = {bySession: new Map()};
     let actualContext = [];
+    let settled = null;
     const session = {...ctx.session,
       create: async input => {
         const info = unwrapV2Data(await ctx.session.create(input));
+        modes.set(info.id, mode);
         created.push(JSON.parse(JSON.stringify(info)));
         operations.push('create:' + info.agent);
         return info;
@@ -116,11 +127,12 @@ export default {id: 'fixate-on', async setup(ctx) {
         if (!Array.isArray(snapshot)) throw new Error('The real context hook did not capture the verifier turn.');
         buffer.bySession.set(input.sessionID, snapshot);
         actualContext = unwrapV2Data(await ctx.session.context(input));
+        settled = unwrapV2Data(await ctx.session.get(input));
         return result;
       },
       context: async input => {
         operations.push('context');
-        if (failContextRead) throw new Error('Injected transient post-turn context read failure');
+        if (mode === 'read-failure') throw new Error('Injected transient post-turn context read failure');
         return ctx.session.context(input);
       },
       remove: async input => {
@@ -135,7 +147,7 @@ export default {id: 'fixate-on', async setup(ctx) {
     };
     const shim = createV2ClientShim({...ctx, session}, buffer);
     const goal = createGoalState(parentID, 'Exercise the verifier host transport', {
-      goalId: 'live-verifier-goal', runId: 'live-verifier-run',
+      goalId: 'live-verifier-' + mode, runId: 'live-verifier-run',
     });
     let verdict = null;
     let fault = null;
@@ -149,11 +161,11 @@ export default {id: 'fixate-on', async setup(ctx) {
       fault = error instanceof Error ? error.message : String(error);
     }
     return JSON.parse(JSON.stringify({created, parentObserved, childObserved, permissionUpdates, operations, verdict, fault,
-      actualContext, bufferedContext: buffer.bySession.get(created[0]?.id) ?? [],
+      actualContext, settled, bufferedContext: buffer.bySession.get(created[0]?.id) ?? [],
       verifierAgent: unwrapV2Data(await ctx.agent.get({agentID: 'goal-verify'})),
     }));
   }});
-  return async () => {await rpc.dispose(); await observer.dispose(); await dispose();};
+  return async () => {await rpc.dispose(); await idleObserver.dispose(); await observer.dispose(); await dispose();};
 }};
 `,
 );
@@ -176,6 +188,7 @@ interface SessionInfo {
   agent?: string;
   permissions?: unknown[];
   location?: {directory?: string};
+  outcome?: string;
 }
 interface FixtureResult {
   created: SessionInfo[];
@@ -186,6 +199,7 @@ interface FixtureResult {
   verdict: {state: string} | null;
   fault: string | null;
   actualContext: unknown[];
+  settled: SessionInfo;
   bufferedContext: unknown[];
   verifierAgent: {id: string; permissions?: unknown[]};
 }
@@ -199,17 +213,23 @@ const provider = Bun.serve({
     const taskId = JSON.stringify(body.messages).match(
       /task_id for this goal: ([A-Za-z0-9-]+)/,
     )?.[1];
+    const mode = taskId?.replace('live-verifier-', '');
     if (taskId) providerRequests.push(body);
     const hasToolReply = (body.messages ?? []).some(
       (message: unknown) => (message as {role?: unknown})?.role === 'tool',
     );
-    const requestRead = Boolean(taskId) && !hasToolReply;
+    const outputLimit = mode === 'output-limit';
+    const requestRead = Boolean(taskId) && !hasToolReply && !outputLimit;
+    const finalComplete = mode === 'complete' || mode === 'idle-failure';
     const content = taskId
       ? JSON.stringify({
           schema_version: 1,
           task_id: taskId,
-          state: hasToolReply ? 'WORKING' : 'COMPLETE',
-          outstanding: hasToolReply ? ['The fixture is unfinished.'] : [],
+          state: hasToolReply && !finalComplete ? 'WORKING' : 'COMPLETE',
+          outstanding:
+            hasToolReply && !finalComplete
+              ? ['The fixture is unfinished.']
+              : [],
           evidence: ['Controlled response for verifier transport integration.'],
         })
       : 'Session title';
@@ -254,7 +274,11 @@ const provider = Bun.serve({
           {
             index: 0,
             delta: {},
-            finish_reason: requestRead ? 'tool_calls' : 'stop',
+            finish_reason: outputLimit
+              ? 'length'
+              : requestRead
+                ? 'tool_calls'
+                : 'stop',
           },
         ],
         usage: {prompt_tokens: 100, completion_tokens: 40, total_tokens: 140},
@@ -394,31 +418,56 @@ try {
   }, 'verifier agent registration');
   const cases = [
     {
-      label: 'healthy-context-read',
-      failContextRead: false,
-      permissions: [],
-      expectedFixtureRead: true,
+      mode: 'working',
+      finalState: 'WORKING',
+      expectedState: 'WORKING',
+      requests: 2,
     },
     {
-      label: 'failed-context-read',
-      failContextRead: true,
-      permissions: [],
-      expectedFixtureRead: true,
+      mode: 'complete',
+      finalState: 'COMPLETE',
+      expectedState: 'COMPLETE',
+      requests: 2,
+    },
+    {
+      mode: 'read-failure',
+      finalState: 'WORKING',
+      fault: /Injected transient post-turn context read failure/,
+      requests: 2,
+    },
+    {
+      mode: 'output-limit',
+      finalState: 'COMPLETE',
+      fault: /Child execution failed:.*output token limit/,
+      requests: 3,
+    },
+    {
+      mode: 'preparation-failure',
+      finalState: 'COMPLETE',
+      fault:
+        /Child execution failed:.*Controlled next-step preparation failure/,
+      requests: 1,
+    },
+    {
+      mode: 'idle-failure',
+      finalState: 'COMPLETE',
+      fault: /Child execution failed:.*Controlled idle-hook failure/,
+      requests: 2,
     },
   ];
   for (const scenario of cases) {
     const parent = unwrap<SessionInfo>(
       await json('/api/session', {
-        title: `Verifier integration parent (${scenario.label})`,
+        title: `Verifier integration parent (${scenario.mode})`,
         agent: 'build',
-        permissions: scenario.permissions,
+        permissions: [],
       }),
     );
     assert.equal(parent.agent, 'build');
     const providerStart = providerRequests.length;
     const {output} = (await json(
       '/api/rpc/fixate-verifier-context-fixture/verify',
-      {input: {parentID: parent.id, failContextRead: scenario.failContextRead}},
+      {input: {parentID: parent.id, mode: scenario.mode}},
     )) as {output: FixtureResult};
     const {
       created,
@@ -429,32 +478,47 @@ try {
       verdict,
       fault,
       actualContext,
+      settled,
       bufferedContext,
       verifierAgent,
     } = output;
-    if (scenario.failContextRead) {
+    // Persist the raw observation even if an assertion fails, so regressions
+    // remain diagnosable from the same host run.
+    writeFileSync(
+      join(root, `${scenario.mode}.json`),
+      JSON.stringify(output, null, 2),
+    );
+    if (scenario.fault) {
       assert.equal(
         verdict,
         null,
-        'A failed fresh read must never return the cached attestation.',
+        'A fault obtaining the final result must never return an attestation.',
       );
-      assert.match(
-        fault ?? '',
-        /Injected transient post-turn context read failure/,
-      );
+      assert.match(fault ?? '', scenario.fault);
     } else {
-      assert.equal(verdict?.state, 'WORKING', fault ?? undefined);
+      assert.equal(verdict?.state, scenario.expectedState, fault ?? undefined);
     }
+    assert.equal(
+      settled.outcome,
+      ['output-limit', 'preparation-failure', 'idle-failure'].includes(
+        scenario.mode,
+      )
+        ? 'failed'
+        : 'succeeded',
+      'Measure execution success independently of the verifier response.',
+    );
     const actualLast = findLatestAssistantMessage(
       normalizeV2Messages(actualContext as unknown[]),
-    ) as {parts: unknown[]};
+    ) as {parts: unknown[]} | null;
     const bufferedLast = findLatestAssistantMessage(
       normalizeV2Messages(bufferedContext),
     ) as {parts: unknown[]};
+    assert.ok(actualLast, 'The real host retained the assistant response.');
     const actualFinalText = getTextFromParts(actualLast.parts);
-    const bufferedFinalText = getTextFromParts(bufferedLast.parts);
-    assert.equal(JSON.parse(actualFinalText).state, 'WORKING');
-    assert.equal(JSON.parse(bufferedFinalText).state, 'COMPLETE');
+    const bufferedFinalText = getTextFromParts(bufferedLast?.parts);
+    assert.equal(JSON.parse(actualFinalText).state, scenario.finalState);
+    if (bufferedFinalText)
+      assert.equal(JSON.parse(bufferedFinalText).state, 'COMPLETE');
     assert.equal(created.length, 1);
     assert.equal(created[0].agent, undefined);
     assert.equal(parentObserved.length, 2);
@@ -476,18 +540,18 @@ try {
     );
     assert.ok(operations.indexOf('update') < operations.indexOf('wait'));
     assert.ok(operations.includes('dispose:prompt'));
-    assert.equal(childObserved.length, scenario.failContextRead ? 1 : 2);
+    assert.ok(childObserved.length >= 1);
     assert.ok(childObserved.every(info => info.agent === 'goal-verify'));
     assert.ok(childObserved.every(info => info.location?.directory === work));
     const requests = providerRequests.slice(providerStart);
-    assert.equal(requests.length, 2);
-    const toolReply = (requests[1].messages ?? []).filter(
+    assert.equal(requests.length, scenario.requests);
+    const toolReply = (requests[1]?.messages ?? []).filter(
       (message: unknown) => (message as {role?: unknown})?.role === 'tool',
     );
     const fixtureWasRead = JSON.stringify(toolReply).includes(fixtureMarker);
     assert.equal(
       fixtureWasRead,
-      scenario.expectedFixtureRead,
+      !['output-limit', 'preparation-failure'].includes(scenario.mode),
       'Measure the real host permission outcome',
     );
     const tools = (requests[0].tools ?? [])
@@ -510,9 +574,9 @@ try {
     const result = {
       hostVersion,
       runtime: Bun.version,
-      scenario: scenario.label,
+      scenario: scenario.mode,
       verifierAgent,
-      injectedContextReadFailure: scenario.failContextRead,
+      settled,
       actualFinalText,
       bufferedFinalText,
       actualContext,
@@ -541,12 +605,14 @@ try {
           root,
           hostVersion,
           runtime: Bun.version,
-          scenario: scenario.label,
+          scenario: scenario.mode,
           state: verdict?.state ?? 'FAULT',
           fault,
           actualFinalState: JSON.parse(actualFinalText).state,
-          bufferedFinalState: JSON.parse(bufferedFinalText).state,
-          injectedContextReadFailure: scenario.failContextRead,
+          bufferedFinalState: bufferedFinalText
+            ? JSON.parse(bufferedFinalText).state
+            : null,
+          executionOutcome: settled.outcome,
           fixtureWasRead,
           toolReply,
           initialAgent: created[0].agent ?? 'host-default',

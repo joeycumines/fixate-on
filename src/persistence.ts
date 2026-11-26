@@ -27,6 +27,14 @@ import {
   USAGE_TOKEN_FIELDS,
 } from './accounting.ts';
 import {MAX_STATE_FILE_BYTES, portableReadBounded} from './fs-portable.ts';
+import {
+  deserializeUsageReceipts,
+  deserializePendingSessionUsage,
+  copyPendingSessionUsage,
+  serializeUsageReceipts,
+  type PendingSessionUsage,
+  type SerializedUsageReceipts,
+} from './usage-receipts.ts';
 
 // Bounds: state files are untrusted input, so lengths are capped and
 // symlinks/non-regular files are rejected.
@@ -112,6 +120,7 @@ export interface SerializedGoal {
   compactionBaselineTokens: number;
   usage: UsageSnapshot;
   lastSessionUsage?: UsageSnapshot | null;
+  pendingSessionUsage?: PendingSessionUsage;
   createdAt: number;
   userCommandStartedAt?: number;
   updatedAt: number;
@@ -159,6 +168,8 @@ export interface SerializedGoal {
   claims: ClaimRecord[];
   lastClaim: ClaimRecord | null;
   messageIDs: string[];
+  messageUsage?: SerializedUsageReceipts;
+  messageUsageBaselineAt?: number;
   executionContext: ExecutionContext | null;
 }
 
@@ -238,6 +249,10 @@ export interface PersistedState {
   sessionOrdered: string[];
   invalidatedGoalIds?: string[];
   pendingIntents?: SerializedPendingIntent[];
+  /** Host inputs whose admission is not durably confirmed; never evict by age. */
+  unconfirmedKickoffInputs?: Array<{sessionID: string; inputID: string}>;
+  /** False preserves unknown prior host admission history across local writes. */
+  kickoffInputHistoryKnown?: boolean;
   /**
    * Durable settlement receipts.
    *
@@ -316,6 +331,8 @@ export function serializeGoal(goal: GoalState): SerializedGoal {
     lastSessionUsage: goal.lastSessionUsage
       ? {...goal.lastSessionUsage}
       : goal.lastSessionUsage,
+    messageUsage: serializeUsageReceipts(goal.messageUsage),
+    pendingSessionUsage: copyPendingSessionUsage(goal.pendingSessionUsage),
     artifactPointers: [...goal.artifactPointers],
     pendingProposal: goal.pendingProposal
       ? {
@@ -354,6 +371,7 @@ export function deserializeGoal(raw: unknown): GoalState {
     typeof raw === 'object' && raw !== null
       ? (raw as Record<string, unknown>)
       : {};
+  const messageUsage = deserializeUsageReceipts(source.messageUsage);
   return {
     goalId: capString(source.goalId, MAX_GOAL_META_LENGTH),
     runId: capString(source.runId, MAX_GOAL_META_LENGTH),
@@ -448,6 +466,9 @@ export function deserializeGoal(raw: unknown): GoalState {
     ),
     usage: normalizeUsage(source.usage),
     lastSessionUsage: normalizeSessionUsageWatermark(source.lastSessionUsage),
+    pendingSessionUsage: deserializePendingSessionUsage(
+      source.pendingSessionUsage,
+    ),
     createdAt: toNonNegativeInteger(source.createdAt),
     userCommandStartedAt:
       typeof source.userCommandStartedAt === 'number' &&
@@ -574,6 +595,15 @@ export function deserializeGoal(raw: unknown): GoalState {
             .map(id => capString(id, MAX_GOAL_META_LENGTH))
         : [],
     ),
+    messageUsage,
+    messageUsageBaselineAt:
+      typeof source.messageUsageBaselineAt === 'number' &&
+      Number.isSafeInteger(source.messageUsageBaselineAt) &&
+      source.messageUsageBaselineAt >= 0
+        ? source.messageUsageBaselineAt
+        : messageUsage === undefined
+          ? Date.now()
+          : undefined,
     executionContext: isPlainObject(source.executionContext)
       ? {
           agent: String(source.executionContext.agent ?? ''),

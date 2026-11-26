@@ -423,11 +423,12 @@ try {
         operations.indexOf('hook:prompt:after') <
           operations.indexOf('prompt:accepted'),
       );
-      assert.equal(childObserved.length, 2);
+      assert.equal(childObserved.length, 3);
       assert.ok(childObserved.every(info => info.agent === 'goal-verify'));
       assert.ok(childObserved.every(info => info.location?.directory === work));
       assert.deepEqual(childObserved[0].permissions, inertPermissions);
-      assert.deepEqual(childObserved[1].permissions, expectedPermissions);
+      for (const settled of childObserved.slice(1))
+        assert.deepEqual(settled.permissions, expectedPermissions);
       const requests = providerRequests.slice(providerStart);
       assert.equal(requests.length, 1);
       const tools = (requests[0].tools ?? [])

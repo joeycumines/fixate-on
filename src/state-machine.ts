@@ -2,6 +2,18 @@ import {USAGE_TOKEN_FIELDS, type UsageSnapshot} from './accounting.ts';
 import {buildRetractionNotice} from './recovery-pressure.ts';
 import {claimQualityLabel} from './claim-vocabulary.ts';
 import {
+  applyCumulativeUsage,
+  applyMessageUsage,
+  prepareMessageUsage,
+  type MessageUsagePreparation,
+  type MessageUsageUpdate,
+} from './state-usage.ts';
+import {
+  copyUsageReceipts,
+  copyPendingSessionUsage,
+  type PendingSessionUsage,
+} from './usage-receipts.ts';
+import {
   type ClaimRecord,
   type GoalMode,
   type GoalState,
@@ -19,6 +31,12 @@ import {
 // History and notice caps are machine-internal bounds enforced by the class.
 const MAX_HISTORY_ENTRIES = 100;
 const MAX_PENDING_NOTICES = 10;
+const MAX_MESSAGE_IDS = 1000;
+const USAGE_LIMITS = {
+  history: MAX_HISTORY_ENTRIES,
+  notices: MAX_PENDING_NOTICES,
+  messages: MAX_MESSAGE_IDS,
+};
 
 export {
   TERMINAL_STATUSES,
@@ -87,6 +105,7 @@ class AsyncMutex {
 export class GoalStateMachine {
   private goal: GoalState;
   private revision: number;
+  private controlEpoch = 0;
   private readonly mutex: AsyncMutex;
   private readonly callbacks: StateMachineCallbacks;
 
@@ -105,6 +124,11 @@ export class GoalStateMachine {
   /** The current revision. Incremented on every semantic mutation. */
   get currentRevision(): number {
     return this.revision;
+  }
+
+  /** Process-local lifecycle/user-command boundary for outstanding host work. */
+  get currentControlEpoch(): number {
+    return this.controlEpoch;
   }
 
   /**
@@ -151,6 +175,10 @@ export class GoalStateMachine {
           }
         : null,
       messageIDs: new Set(this.goal.messageIDs),
+      messageUsage: copyUsageReceipts(this.goal.messageUsage),
+      pendingSessionUsage: copyPendingSessionUsage(
+        this.goal.pendingSessionUsage,
+      ),
       continuationClaim: this.goal.continuationClaim
         ? {...this.goal.continuationClaim}
         : null,
@@ -184,6 +212,9 @@ export class GoalStateMachine {
     opts: TransitionOptions,
   ): Promise<TransitionResult> {
     return this.mutex.run(async () => {
+      if (opts.guard && !opts.guard(this.snapshot())) {
+        return {ok: false, error: 'goal changed before the transition'};
+      }
       const from = this.goal.status;
 
       if (
@@ -213,6 +244,7 @@ export class GoalStateMachine {
       }
 
       this.revision++;
+      this.controlEpoch++;
       this.goal.revision = this.revision;
       this.goal.status = target;
       this.goal.updatedAt = Date.now();
@@ -225,6 +257,8 @@ export class GoalStateMachine {
       this.goal.continuationClaim = null;
 
       if (target === 'active') {
+        if (opts.requireKickoffAdmission)
+          this.goal.kickoffAdmissionPending = true;
         if (opts.restart) {
           this.goal.turnCount = 0;
           this.goal.pressureRung = undefined;
@@ -316,6 +350,9 @@ export class GoalStateMachine {
     opts: MutationOptions,
   ): Promise<TransitionResult> {
     return this.mutex.run(async () => {
+      if (opts.guard && !opts.guard(this.snapshot())) {
+        return {ok: false, error: 'goal changed before the mutation'};
+      }
       // Terminal statuses are frozen for field mutations (except 'complete',
       // which allows appending notices).
       if (
@@ -380,6 +417,7 @@ export class GoalStateMachine {
 
       if (!opts.skipRevision) {
         this.revision++;
+        if (opts.source === 'slash-command') this.controlEpoch++;
         this.goal.revision = this.revision;
       }
       this.goal.updatedAt = Date.now();
@@ -429,72 +467,93 @@ export class GoalStateMachine {
     });
   }
 
+  /** Prepare a message baseline without invoking a display or persistence callback. */
+  async prepareMessageUsage(
+    input: MessageUsagePreparation,
+    options: Pick<MutationOptions, 'guard'> = {},
+  ): Promise<{ready: boolean; changed: boolean; migrationNotice?: string}> {
+    return this.mutex.run(async () => {
+      if (
+        (options.guard && !options.guard(this.snapshot())) ||
+        TERMINAL_STATUSES.has(this.goal.status)
+      )
+        return {ready: false, changed: false};
+      return {
+        ready: true,
+        ...prepareMessageUsage(this.goal, input, USAGE_LIMITS),
+      };
+    });
+  }
+
+  /** Establish all fresh cumulative baselines before a multi-goal charge begins. */
+  async prepareCumulativeUsage(
+    batch: PendingSessionUsage,
+    options: Pick<MutationOptions, 'guard'> = {},
+  ): Promise<{ready: boolean; changed: boolean}> {
+    return this.mutex.run(async () => {
+      if (
+        (options.guard && !options.guard(this.snapshot())) ||
+        TERMINAL_STATUSES.has(this.goal.status)
+      )
+        return {ready: false, changed: false};
+      const changed = this.goal.lastSessionUsage === null;
+      if (changed) this.goal.lastSessionUsage = {...batch.baseline};
+      const pending =
+        USAGE_TOKEN_FIELDS.some(
+          field => batch.observed[field] !== batch.baseline[field],
+        ) ||
+        batch.observed.cost !== batch.baseline.cost ||
+        batch.observed.costKnown !== batch.baseline.costKnown;
+      if (pending)
+        this.goal.pendingSessionUsage = copyPendingSessionUsage(batch);
+      return {ready: true, changed: changed || pending};
+    });
+  }
+
+  /** Charge a message and its replay markers atomically after checking ownership. */
+  async updateMessageUsage(
+    update: MessageUsageUpdate,
+    options: Pick<MutationOptions, 'guard'> = {},
+  ): Promise<boolean> {
+    return this.mutex.run(async () => {
+      if (options.guard && !options.guard(this.snapshot())) return false;
+      if (TERMINAL_STATUSES.has(this.goal.status)) return false;
+      const changed = applyMessageUsage(
+        this.goal,
+        update,
+        MAX_HISTORY_ENTRIES,
+        MAX_MESSAGE_IDS,
+      );
+      if (changed && this.callbacks.onUsageUpdate) {
+        try {
+          await this.callbacks.onUsageUpdate(this.snapshot());
+        } catch {
+          // A display failure cannot undo an admitted accounting update.
+        }
+      }
+      return changed;
+    });
+  }
+
   /** Charge a cumulative reading and retain its watermark as one mutation. */
   async updateCumulativeUsage(
     observed: UsageSnapshot,
     previousSession: UsageSnapshot,
+    options: Pick<MutationOptions, 'guard'> = {},
   ): Promise<{changed: boolean; migrationNotice?: string}> {
     return this.mutex.run(async () => {
+      if (options.guard && !options.guard(this.snapshot()))
+        return {changed: false};
       // Settlement may win after the caller's nonterminal filter but before
       // this queued update acquires the lock. Archived spend is then frozen.
       if (TERMINAL_STATUSES.has(this.goal.status)) return {changed: false};
-      const legacy = this.goal.lastSessionUsage === undefined;
-      const previous = legacy
-        ? observed
-        : (this.goal.lastSessionUsage ?? previousSession);
-      const next = {...observed};
-      const charged = {...this.goal.usage};
-      for (const field of USAGE_TOKEN_FIELDS) {
-        next[field] = Math.max(next[field], previous[field]);
-        charged[field] += next[field] - previous[field];
-      }
-      next.cost = Math.max(next.cost, previous.cost);
-      next.costKnown ||= previous.costKnown;
-      charged.cost += next.cost - previous.cost;
-      if (!legacy) charged.costKnown ||= next.costKnown;
-      const total = USAGE_TOKEN_FIELDS.reduce(
-        (sum, field) => sum + next[field],
-        0,
+      const result = applyCumulativeUsage(
+        this.goal,
+        observed,
+        previousSession,
+        USAGE_LIMITS,
       );
-      const changed =
-        !this.goal.lastSessionUsage ||
-        total > this.goal.totalTokens ||
-        USAGE_TOKEN_FIELDS.some(
-          field => charged[field] !== this.goal.usage[field],
-        ) ||
-        charged.cost !== this.goal.usage.cost ||
-        charged.costKnown !== this.goal.usage.costKnown;
-      if (!changed) return {changed: false};
-      this.goal.usage = charged;
-      this.goal.totalTokens = Math.max(this.goal.totalTokens, total);
-      this.goal.lastSessionUsage = next;
-      const now = Date.now();
-      this.goal.updatedAt = now;
-      const migrationNotice = legacy
-        ? `Goal ${this.goal.goalId}: restored state has no cumulative usage watermark. Previously recorded spend is preserved and accounting resumes from the current host reading. Usage accrued while the plugin was offline cannot be reconstructed; the context-token brake still uses the host's full cumulative total.`
-        : undefined;
-      if (migrationNotice) {
-        this.goal.pendingNotices.push({
-          kind: 'usage-baseline',
-          message: migrationNotice,
-          timestamp: now,
-        });
-        if (this.goal.pendingNotices.length > MAX_PENDING_NOTICES)
-          this.goal.pendingNotices.splice(
-            0,
-            this.goal.pendingNotices.length - MAX_PENDING_NOTICES,
-          );
-      }
-      this.goal.history.push({
-        type: migrationNotice ? 'usage-baseline' : 'tracking',
-        detail: migrationNotice ?? 'Updated cumulative session usage',
-        timestamp: now,
-      });
-      if (this.goal.history.length > MAX_HISTORY_ENTRIES)
-        this.goal.history.splice(
-          0,
-          this.goal.history.length - MAX_HISTORY_ENTRIES,
-        );
+      if (!result.changed) return result;
       if (this.callbacks.onUsageUpdate) {
         try {
           await this.callbacks.onUsageUpdate(this.snapshot());
@@ -502,7 +561,7 @@ export class GoalStateMachine {
           // A display failure cannot roll back authoritative usage accounting.
         }
       }
-      return {changed: true, ...(migrationNotice ? {migrationNotice} : {})};
+      return result;
     });
   }
 
@@ -510,7 +569,11 @@ export class GoalStateMachine {
    * Add a pending notice to the goal. Notices are injected into the next
    * continuation prompt and cleared after delivery.
    */
-  async addNotice(kind: NoticeKind, message: string): Promise<void> {
+  async addNotice(
+    kind: NoticeKind,
+    message: string,
+    options: Pick<MutationOptions, 'guard'> = {},
+  ): Promise<void> {
     await this.mutate(
       g => {
         g.pendingNotices.push({kind, message, timestamp: Date.now()});
@@ -526,6 +589,7 @@ export class GoalStateMachine {
         detail: 'Added notice',
         skipRevision: true,
         skipPersist: true,
+        guard: options.guard,
       },
     );
   }
@@ -647,8 +711,7 @@ export class GoalStateMachine {
   async rememberMessageID(messageID: string): Promise<void> {
     await this.mutex.run(async () => {
       this.goal.messageIDs.add(messageID);
-      const MAX = 1000;
-      while (this.goal.messageIDs.size > MAX) {
+      while (this.goal.messageIDs.size > MAX_MESSAGE_IDS) {
         const first = this.goal.messageIDs.values().next().value;
         if (first) this.goal.messageIDs.delete(first);
       }
@@ -798,6 +861,7 @@ export function createGoalState(
     claims: [],
     lastClaim: null,
     messageIDs: new Set(),
+    messageUsage: new Map(),
     executionContext: null,
   };
 }

@@ -116,6 +116,22 @@ export class SessionApiError extends Error {
   }
 }
 
+/** Only a typed missing-session receipt for this ID establishes deletion. */
+export function isMissingSessionError(
+  error: unknown,
+  sessionID: string,
+): boolean {
+  const detail = (error instanceof SessionApiError ? error.cause : error) as {
+    _tag?: unknown;
+    sessionID?: unknown;
+  } | null;
+  return (
+    (detail?._tag === 'Session.NotFoundError' ||
+      detail?._tag === 'SessionNotFoundError') &&
+    detail.sessionID === sessionID
+  );
+}
+
 function unwrapData(response: unknown, operation: string): unknown {
   // The HTTP SDK returns an error envelope unless throwOnError was enabled by
   // its caller. A fulfilled transport promise does not establish that the

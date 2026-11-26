@@ -3,7 +3,7 @@
  * Coordinates continuation decisions, progress tracking, and human intervention detection.
  */
 
-import type {GoalStateMachine} from './state-machine.ts';
+import type {GoalState, GoalStateMachine} from './state-machine.ts';
 import type {IdleContext, LoopPolicy} from './continuation-loop.ts';
 import {isLowProgressTurn} from './continuation-loop.ts';
 import type {HookDeps, SessionContext} from './hooks-types.ts';
@@ -56,6 +56,21 @@ export function sleep(ms: number, signal?: AbortSignal): Promise<boolean> {
   });
 }
 
+function ownsIdleMachine(
+  sessionID: string,
+  session: SessionContext,
+  machine: GoalStateMachine,
+  deps: HookDeps,
+): boolean {
+  return (
+    !deps.runtime?.disposed &&
+    deps.runtime?.canDriveSession?.(sessionID) !== false &&
+    (session.listMachines
+      ? session.listMachines().includes(machine)
+      : session.getMachine() === machine)
+  );
+}
+
 export async function recordIdleReadFailure(
   sessionID: string,
   session: SessionContext,
@@ -64,33 +79,42 @@ export async function recordIdleReadFailure(
   observed: {runId: string; revision: number},
   error: unknown,
 ): Promise<void> {
-  if (deps.runtime?.canDriveSession && !deps.runtime.canDriveSession(sessionID))
-    return;
+  const isOwnedTarget = () =>
+    ownsIdleMachine(sessionID, session, machine, deps);
+  const matchesObservation = (goal: Readonly<GoalState>) =>
+    isOwnedTarget() &&
+    goal.runId === observed.runId &&
+    goal.revision === observed.revision &&
+    (goal.status === 'active' || goal.finalizing);
+  if (!isOwnedTarget()) return;
   const sessionGone = isSessionGoneError(error);
   const maxFailures = deps.defaultOpts?.maxPromptFailures ?? 3;
   let failures = 0;
   const mutation = await machine.mutate(
     goal => {
-      if (
-        goal.runId !== observed.runId ||
-        goal.revision !== observed.revision ||
-        (goal.status !== 'active' && !goal.finalizing)
-      )
-        return;
       failures = ++goal.promptFailures;
       goal.lastStatus = sessionGone
         ? "Cannot continue: the goal's session no longer exists."
         : 'Cannot continue until the host session state can be read.';
-      if (goal.promptFailures >= maxFailures) goal.finalizing = false;
     },
     {
       source: 'idle-handler',
       detail: 'Session state read failed before continuation',
+      // Read availability is bookkeeping, not a change to the completion claim.
+      // Reject stale observations before mutate touches history or timestamps.
+      guard: matchesObservation,
+      skipRevision: true,
       skipPersist: true,
     },
   );
-  if (!failures) return;
+  if (!mutation.ok) return;
   let receipt: string | undefined;
+  let pauseRevision: number | undefined;
+  const stillPaused = (goal: Readonly<GoalState>) =>
+    isOwnedTarget() &&
+    goal.runId === observed.runId &&
+    goal.revision === pauseRevision &&
+    goal.status === 'paused';
   if (failures >= maxFailures) {
     const message = sessionGone
       ? `The goal's owning session no longer exists; paused after ${failures} failed session reads.`
@@ -98,16 +122,20 @@ export async function recordIdleReadFailure(
     const paused = await machine.transition('paused', {
       source: 'idle-handler',
       expectedRevision: mutation.revision,
+      guard: matchesObservation,
       stopReason: sessionGone ? 'session not found' : 'auto-continue failures',
       detail: message,
     });
     if (paused.ok) {
-      await machine.addNotice('prompt-failure', message);
+      pauseRevision = paused.revision;
+      await machine.addNotice('prompt-failure', message, {guard: stillPaused});
       receipt = message;
     }
   }
+  if (!isOwnedTarget()) return;
   await session.persist();
-  if (receipt) await deps.announceGoalDecision?.(sessionID, receipt);
+  if (receipt && stillPaused(machine.snapshot()))
+    await deps.announceGoalDecision?.(sessionID, receipt);
 }
 
 export async function processIdleEvent(
@@ -119,6 +147,11 @@ export async function processIdleEvent(
 ): Promise<void> {
   const goal = machine.snapshot();
   if (goal.status !== 'active' && !goal.finalizing) return;
+  const matchesObservation = (current: Readonly<GoalState>) =>
+    ownsIdleMachine(sessionID, session, machine, deps) &&
+    current.runId === goal.runId &&
+    current.revision === goal.revision &&
+    (current.status === 'active' || current.finalizing);
 
   const runtime = deps.runtime;
   const retainedKickoff = () => {
@@ -157,10 +190,9 @@ export async function processIdleEvent(
       // On v2, durable totals are projected before experimental.idle, while
       // the usage event may still be queued behind another session's work.
       // Refresh every idle path before deciding whether a brake permits work.
-      const usage = cumulativeSessionUsageMessage(
-        sessionID,
-        await deps.sessionApi.usage(sessionID),
-      );
+      const reading = await deps.sessionApi.usage(sessionID);
+      if (!ownsIdleMachine(sessionID, session, machine, deps)) return;
+      const usage = cumulativeSessionUsageMessage(sessionID, reading);
       runtime?.usageEventsObserved.add(sessionID);
       const targets = (session.listMachines?.() ?? [machine]).filter(
         m => !m.isTerminal(),
@@ -187,6 +219,7 @@ export async function processIdleEvent(
     await recordIdleReadFailure(sessionID, session, machine, deps, goal, error);
     return;
   }
+  if (!ownsIdleMachine(sessionID, session, machine, deps)) return;
 
   // Hosts on v1 emit no `message.updated` events, leaving `goal.totalTokens` at 0.
   // Because session messages are already fetched here, attribute usage idempotently
@@ -201,6 +234,7 @@ export async function processIdleEvent(
       m => !m.isTerminal(),
     );
     for (const message of messages) {
+      if (runtime.usageEventsObserved.has(sessionID)) break;
       if (!message || typeof message !== 'object') continue;
       try {
         await trackTokenUsage(
@@ -209,6 +243,9 @@ export async function processIdleEvent(
           targets,
           runtime,
           session,
+          false,
+          undefined,
+          () => !runtime.usageEventsObserved.has(sessionID),
         );
       } catch {
         // Usage attribution failures must never block continuation.
@@ -216,6 +253,9 @@ export async function processIdleEvent(
     }
   }
 
+  // Usage remains attributable to the goal even if the user paused during the
+  // read. Progress and continuation decisions belong to the observed revision.
+  if (!matchesObservation(machine.snapshot())) return;
   const latestAssistant = findLatestAssistantMessage(messages);
   const latestText = getTextFromParts(
     (latestAssistant as {parts?: unknown[]})?.parts,
@@ -279,8 +319,8 @@ export async function processIdleEvent(
   const repetitionInfo = detectRepetitiveDegeneration(latestText);
   const hasRepetition = repetitionInfo.isRepetitive;
 
-  if (!waitingForKickoff())
-    await machine.mutate(
+  if (!waitingForKickoff()) {
+    const tracking = await machine.mutate(
       g => {
         g.lastAssistantText = latestText;
         g.lastAssistantMessageID = latestAssistantID;
@@ -348,9 +388,12 @@ export async function processIdleEvent(
       {
         source: 'idle-handler',
         detail: 'Updated tracking fields',
+        guard: matchesObservation,
         skipRevision: true,
       },
     );
+    if (!tracking.ok) return;
+  }
 
   if (!waitingForKickoff() && goal.lastContinueAt && runtime) {
     const elapsed = Math.max(0, Date.now() - goal.lastContinueAt);
@@ -365,13 +408,7 @@ export async function processIdleEvent(
   }
 
   const postDelayGoal = machine.snapshot();
-  if (postDelayGoal.status !== 'active' && !postDelayGoal.finalizing) return;
-
-  // Verify the goal is still assigned to this session (it might have been removed during delay).
-  const stillListed = session
-    .listMachines?.()
-    ?.some(m => m.state.goalId === machine.state.goalId);
-  if (stillListed === false) return;
+  if (!matchesObservation(postDelayGoal)) return;
 
   // Detect pending user interventions: if a user submits input and the host delays or
   // drops the chat.message hook, avoid continuation so the human turn is respected.
@@ -586,10 +623,12 @@ export async function processIdleEvent(
     }
     await session.persist();
   }
+  if (!matchesObservation(machine.snapshot())) return;
   if (latestHumanIntervention !== null) {
     if (isExplicitStopMessage(latestHumanIntervention)) {
       await machine.transition('paused', {
         source: 'chat-message',
+        guard: matchesObservation,
         stopReason: 'explicit pause',
         detail:
           'Paused by an explicit stop directive; run /goal resume to continue.',
@@ -623,6 +662,7 @@ export async function processIdleEvent(
         'or explicitly edit the objective to start a new kickoff.';
       const paused = await machine.transition('paused', {
         source: 'idle-handler',
+        guard: matchesObservation,
         stopReason: 'kickoff admission failed',
         detail: message,
       });
@@ -699,6 +739,7 @@ export async function processIdleEvent(
         .join(' | ')}`,
     );
   }
+  if (!matchesObservation(machine.snapshot())) return;
   await executeDecision(decision, sessionID, session, machine, deps, {
     repetitionWarning:
       hasRepetition || (goal.turnCount > 0 && !latestHasToolCall),

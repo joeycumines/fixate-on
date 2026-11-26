@@ -9,6 +9,10 @@
  */
 
 import type {UsageSnapshot} from './accounting.ts';
+import type {
+  MessageUsageReceipt,
+  PendingSessionUsage,
+} from './usage-receipts.ts';
 
 export type GoalStatus =
   'active' | 'paused' | 'blocked' | 'budgetLimited' | 'finalizing' | 'complete';
@@ -259,6 +263,8 @@ export interface GoalState {
    * has not observed usage; undefined identifies a legacy restored record.
    */
   lastSessionUsage?: UsageSnapshot | null;
+  /** Transient durable batch receipt, removed when its cumulative reading is charged. */
+  pendingSessionUsage?: PendingSessionUsage;
   createdAt: number;
   /** Native command admission time, before asynchronous goal replacement. */
   userCommandStartedAt?: number;
@@ -366,11 +372,17 @@ export interface GoalState {
   claims: ClaimRecord[];
   lastClaim: ClaimRecord | null;
   messageIDs: Set<string>;
+  /** Durable per-message charges and pending baselines; absent in legacy state. */
+  messageUsage?: Map<string, MessageUsageReceipt>;
+  /** Earlier or undated readings need a baseline after migration or eviction. */
+  messageUsageBaselineAt?: number;
   executionContext: ExecutionContext | null;
 }
 
 export interface TransitionOptions {
   source: TransitionSource;
+  /** Checked under the state lock; false leaves state and callbacks untouched. */
+  guard?: (goal: Readonly<GoalState>) => boolean;
   /** Refuse a transition if another semantic mutation won while work was awaited. */
   expectedRevision?: number;
   stopReason?: string;
@@ -381,6 +393,8 @@ export interface TransitionOptions {
   skipPersist?: boolean;
   /** Reset the run window atomically with a successful transition to active. */
   restart?: {kickoffAdmissionPending?: boolean};
+  /** Require kickoff inputs atomically with activation, without restarting budgets. */
+  requireKickoffAdmission?: boolean;
 }
 
 export interface TransitionResult {
@@ -392,6 +406,8 @@ export interface TransitionResult {
 export interface MutationOptions {
   source: TransitionSource;
   detail: string;
+  /** Checked under the state lock; false leaves state and callbacks untouched. */
+  guard?: (goal: Readonly<GoalState>) => boolean;
   /** If true, omit calling onCommit. */
   skipPersist?: boolean;
   /** If true, do not increment the revision (for non-semantic tracking updates). */

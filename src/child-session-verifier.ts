@@ -7,7 +7,7 @@ import type {GoalState} from './state-machine.ts';
 import {
   createOpenCodeSessionApi,
   type OpenCodeSessionApi,
-  SessionApiError,
+  isMissingSessionError,
   type SessionClientCapabilities,
 } from './session-api.ts';
 import {
@@ -17,15 +17,13 @@ import {
   type VerifierJudgeFn,
 } from './completion-gate.ts';
 import {escapeGoalText} from './escape.ts';
+import {extractChildVerdictText} from './child-session-response.ts';
 import {canonicalPath} from './plugin-v2-helpers.ts';
 import {
   buildVerifierChildPermissions,
   verifierCeilingPermissions,
 } from './plugin-v2-tools-agents.ts';
-import {
-  findLatestAssistantMessage,
-  getTextFromParts,
-} from './message-helpers.ts';
+import {findLatestAssistantMessage} from './message-helpers.ts';
 
 export interface JudgeVerdict {
   approved: boolean;
@@ -318,32 +316,6 @@ function findLastJsonObject(text: string): string | null {
   return null;
 }
 
-function extractJudgeVerdictText(response: unknown): string {
-  if (typeof response === 'string') return response;
-  type AssistantResponse = {
-    parts?: unknown[];
-    info?: {error?: unknown; finish?: unknown};
-    error?: unknown;
-    finish?: unknown;
-  };
-  const r = response as (AssistantResponse & {data?: AssistantResponse}) | null;
-  // Waiting for idle establishes settlement, not success: the v2 host's
-  // awaitIdle deliberately ignores execution failures. Failed streams can
-  // retain complete-looking text, which is never an attestation.
-  for (const candidate of [r, r?.data]) {
-    const info = candidate?.info ?? candidate;
-    const failure = info?.error;
-    const finish = info?.finish;
-    if (failure != null || finish === 'error' || finish === 'content-filter') {
-      const detail = (failure as {message?: unknown} | null)?.message;
-      throw new Error(
-        `Child assistant failed: ${typeof detail === 'string' ? detail : String(failure ?? finish)}`,
-      );
-    }
-  }
-  return getTextFromParts(r?.parts) || getTextFromParts(r?.data?.parts) || '';
-}
-
 export function summarizeText(text: string, maxLen: number): string {
   const trimmed = text.trim();
   return trimmed.length > maxLen
@@ -465,7 +437,7 @@ export function createChildSessionJudge(
             agent,
           });
           checkActive();
-          let verdictText = extractJudgeVerdictText(response);
+          let verdictText = extractChildVerdictText(response);
           if (!verdictText) {
             const session = (client as {session: {messages?: unknown}}).session;
             if (typeof session.messages === 'function') {
@@ -474,7 +446,7 @@ export function createChildSessionJudge(
               const latest = findLatestAssistantMessage(
                 Array.isArray(messages) ? messages : [],
               );
-              verdictText = extractJudgeVerdictText(latest);
+              verdictText = extractChildVerdictText(latest);
             }
           }
           observedVerdict = parseJudgeVerdict(verdictText);
@@ -546,6 +518,7 @@ async function runChildSession<T>(
   ) {
     throw new Error('child-session cleanup unsupported by host');
   }
+  const deadline = performance.now() + options.timeoutMs;
   const controller = new AbortController();
   const api = createSessionApiForJudge(
     client,
@@ -569,7 +542,9 @@ async function runChildSession<T>(
   const timeoutError = () =>
     new Error(`${options.label} timed out after ${options.timeoutMs}ms`);
   const checkActive = () => {
-    if (timedOut) throw timeoutError();
+    // A synchronous host operation can block the event loop past the deadline
+    // and then resolve in microtasks before the timeout callback runs.
+    if (timedOut || performance.now() >= deadline) throw timeoutError();
   };
   const readChildPermissions = async (): Promise<Record<string, unknown>> => {
     const agentRules = api.agentPermissions
@@ -596,18 +571,10 @@ async function runChildSession<T>(
       try {
         await api.delete(id);
       } catch (error) {
-        const detail = (
-          error instanceof SessionApiError ? error.cause : error
-        ) as {_tag?: unknown; sessionID?: unknown} | null;
         // v2's typed error can have an empty message. A generic 404 or a
         // message containing "not found" does not establish that THIS child
         // is gone; only the host's session error with the matching ID does.
-        if (
-          (detail?._tag === 'Session.NotFoundError' ||
-            detail?._tag === 'SessionNotFoundError') &&
-          detail.sessionID === id
-        )
-          return;
+        if (isMissingSessionError(error, id)) return;
         const failure = new Error(
           `child-session cleanup failed: ${childSessionErrorText(error)}`,
           {cause: error},
@@ -715,6 +682,7 @@ async function runChildSession<T>(
         : error;
     }
     if (primaryFailure) throw primaryFailure.error;
+    checkActive();
     return value;
   })();
   try {
@@ -863,14 +831,14 @@ export function createChildSessionVerifier(
             agent,
           });
           checkActive();
-          let verdictText = extractJudgeVerdictText(response);
+          let verdictText = extractChildVerdictText(response);
           if (!verdictText && typeof session.messages === 'function') {
             const messages = await api.messages(childID, {limit: 10});
             checkActive();
             const latest = findLatestAssistantMessage(
               Array.isArray(messages) ? messages : [],
             );
-            verdictText = extractJudgeVerdictText(latest);
+            verdictText = extractChildVerdictText(latest);
           }
           // The host can move a session while its turn is running. Validate
           // again before returning an attestation about this workspace.
@@ -902,7 +870,7 @@ export const childSessionJudgeInternals = Object.freeze({
   buildVerdictPrompt,
   parseJudgeVerdict,
   parseVerdictFromJudge,
-  extractJudgeVerdictText,
+  extractJudgeVerdictText: extractChildVerdictText,
   escapeGoalText,
   summarizeTailText,
   buildGoalBlock,

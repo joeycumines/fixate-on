@@ -1413,7 +1413,7 @@ test('ordered budget-limit prompt is sent before the next goal is promoted', asy
   expect(promotions).toBe(1);
 });
 
-test('prompt failure does not overwrite stopReason when goal paused during prompt', async () => {
+test('late prompt failure preserves the pause reason and prior failure count', async () => {
   const goal = makeGoal({promptFailures: 2});
   const machine = new GoalStateMachine(goal, {
     onCommit: async () => {},
@@ -1453,10 +1453,10 @@ test('prompt failure does not overwrite stopReason when goal paused during promp
   const result = machine.snapshot();
   expect(result.status).toBe('paused');
   expect(result.stopReason).toBe('user intervention');
-  expect(result.promptFailures).toBe(3);
+  expect(result.promptFailures).toBe(2);
 });
 
-test('prompt failure does not overwrite stopReason when goal blocked during prompt', async () => {
+test('late prompt failure preserves the blocked reason and prior failure count', async () => {
   const goal = makeGoal({promptFailures: 2});
   const machine = new GoalStateMachine(goal, {
     onCommit: async () => {},
@@ -1497,7 +1497,7 @@ test('prompt failure does not overwrite stopReason when goal blocked during prom
   const result = machine.snapshot();
   expect(result.status).toBe('blocked');
   expect(result.stopReason).toBe('blocked');
-  expect(result.promptFailures).toBe(3);
+  expect(result.promptFailures).toBe(2);
 });
 
 test('blockedTurns survives the idle boundary when blocked was asserted this turn', async () => {

@@ -41,7 +41,11 @@ import {
   replaceGoalsOwned,
 } from './session-lifecycle.ts';
 import type {SessionLifecycleHost} from './session-lifecycle-types.ts';
-import type {DefaultGoalOptions, RuntimeState} from './session-runtime.ts';
+import type {
+  DefaultGoalOptions,
+  RuntimeState,
+  KickoffHistoryCommit,
+} from './session-runtime.ts';
 
 const MAX_ARCHIVED_PER_SESSION = 10;
 
@@ -59,7 +63,10 @@ export type {RuntimeState, DefaultGoalOptions} from './session-runtime.ts';
 export class SessionStateManager implements SessionLifecycleHost {
   runtime: RuntimeState;
   persistedState: PersistedState;
-  persistFn: (sessionID: string) => Promise<boolean>;
+  persistFn: (
+    sessionID: string,
+    confirmation?: KickoffHistoryCommit,
+  ) => Promise<boolean>;
 
   /**
    * Establishes write permissions for a session by seeding its sequence counter
@@ -123,7 +130,10 @@ export class SessionStateManager implements SessionLifecycleHost {
 
   constructor(
     runtime: RuntimeState,
-    persistFn: (sessionID: string) => Promise<boolean>,
+    persistFn: (
+      sessionID: string,
+      confirmation?: KickoffHistoryCommit,
+    ) => Promise<boolean>,
     stateRoot: string,
     initialState: PersistedState | undefined,
     initialInvalidatedBySession: ReadonlyMap<string, readonly string[]>,
@@ -152,6 +162,13 @@ export class SessionStateManager implements SessionLifecycleHost {
       this.invalidatedBySession.set(sessionID, new Set(ids));
     }
     this.settlementReceipts = [...(initialState?.settlementReceipts ?? [])];
+    for (const {sessionID, inputID} of initialState?.unconfirmedKickoffInputs ??
+      []) {
+      let ids = runtime.unconfirmedKickoffInputs.get(sessionID);
+      if (!ids)
+        runtime.unconfirmedKickoffInputs.set(sessionID, (ids = new Set()));
+      ids.add(inputID);
+    }
     // Seed live focus pointers from persisted state so focus survives restarts.
     for (const entry of this.persistedState.focusedGoalIds ?? []) {
       this.runtime.focusedGoalId.set(entry.sessionID, entry.goalId);
@@ -486,6 +503,11 @@ export class SessionStateManager implements SessionLifecycleHost {
       persistedIntents.push(serializePendingIntent(keySessionID, intent));
     }
     this.persistedState.pendingIntents = persistedIntents;
+    this.persistedState.unconfirmedKickoffInputs = [
+      ...(this.runtime.unconfirmedKickoffInputs.get(sessionID) ?? []),
+    ].map(inputID => ({sessionID, inputID}));
+    this.persistedState.kickoffInputHistoryKnown =
+      this.runtime.kickoffInputHistoryKnownSessions.has(sessionID);
     return this.persistedState;
   }
 
@@ -494,8 +516,11 @@ export class SessionStateManager implements SessionLifecycleHost {
   }
 
   /** Flushes a session's projected state to disk. */
-  async persist(sessionID: string): Promise<boolean> {
-    return this.persistFn(sessionID);
+  async persist(
+    sessionID: string,
+    confirmation?: KickoffHistoryCommit,
+  ): Promise<boolean> {
+    return this.persistFn(sessionID, confirmation);
   }
 
   async chainWalWrite(

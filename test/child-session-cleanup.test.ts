@@ -389,6 +389,24 @@ describe('verifier child cleanup is part of the outcome', () => {
 });
 
 describe('timeout and cleanup ownership', () => {
+  for (const blockedOperation of ['prompt', 'delete'] as const) {
+    test(`a synchronous ${blockedOperation} cannot escape the deadline before its timer runs`, async () => {
+      const {client, calls} = host();
+      const original = client.session[blockedOperation];
+      client.session[blockedOperation] = async () => {
+        // A host can block the event loop, then settle in microtasks before a
+        // queued deadline callback gets its turn. This exceeds the deadline
+        // deliberately; the result must still be a fault after cleanup.
+        Bun.sleepSync(25);
+        return original();
+      };
+      await expect(
+        createChildSessionVerifier(client, {timeoutMs: 10})(input),
+      ).rejects.toThrow('timed out');
+      expect(calls.delete).toBe(1);
+    });
+  }
+
   test('late creation with the wrong parent still deletes once and never reads or prompts', async () => {
     const created = deferred<unknown>();
     const deleted = deferred<void>();

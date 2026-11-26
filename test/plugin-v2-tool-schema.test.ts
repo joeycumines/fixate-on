@@ -334,6 +334,23 @@ test('v2 delete, update, and prompt wait delegate cleanly when host exposes remo
         wait: async () => {
           events.push('wait');
         },
+        context: async () => [
+          {id: 'in-1', type: 'user'},
+          {
+            id: 'reply-1',
+            type: 'assistant',
+            agent: 'goal-verify',
+            finish: 'stop',
+            time: {created: 2, completed: 3},
+            content: [{type: 'text', text: '{"verdict":"pass"}'}],
+          },
+          {type: 'idle', outcome: 'succeeded', time: {created: 4}},
+        ],
+        get: async () => ({
+          id: 'ses-child',
+          outcome: 'succeeded',
+          time: {busy: 1, idle: 4},
+        }),
       },
     } as never,
     {bySession: new Map()},

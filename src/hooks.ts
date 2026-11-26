@@ -294,13 +294,13 @@ export function createHooks(deps: HookDeps): PluginHooks {
             'Failed to read session state during idle polling',
             error,
           );
-          for (const {machine} of observedGoals) {
+          for (const {machine, goal} of observedGoals) {
             await recordIdleReadFailure(
               sessionID,
               session,
               machine,
               deps,
-              machine.snapshot(),
+              goal,
               error,
             );
           }

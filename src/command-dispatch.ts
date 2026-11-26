@@ -55,11 +55,10 @@ export function markSlashDispatch(sessionID: string, args: string): void {
 // a replayed slash echo WITHOUT swallowing a later genuine message that happens
 // to use the same text. Record the replay's message id when chat.message matches
 // the fingerprint, then skip only that id in the idle history scans.
-const echoedMessageIDs = new Map<
-  string,
-  Array<{at: number; messageID: string}>
->();
-const MAX_ECHOED_MESSAGE_IDS = MAX_SLASH_ECHO_PER_SESSION;
+// Once identified, the message remains a replay even after a slow host turn.
+// Bound retained history by identity count, not the text fingerprint's TTL.
+const echoedMessageIDs = new Map<string, Set<string>>();
+const MAX_ECHOED_MESSAGE_IDS = 256;
 
 /** Remember that a host chat replay matched a slash dispatch fingerprint. */
 export function recordSlashEchoMessage(
@@ -67,13 +66,16 @@ export function recordSlashEchoMessage(
   messageID: string | undefined,
 ): void {
   if (!sessionID || !messageID) return;
-  const now = Date.now();
-  const queue = (echoedMessageIDs.get(sessionID) ?? []).filter(
-    e => now - e.at < SLASH_ECHO_WINDOW_MS,
-  );
-  queue.push({at: now, messageID});
-  while (queue.length > MAX_ECHOED_MESSAGE_IDS) queue.shift();
-  echoedMessageIDs.set(sessionID, queue);
+  const ids = echoedMessageIDs.get(sessionID) ?? new Set<string>();
+  ids.delete(messageID);
+  ids.add(messageID);
+  while (ids.size > MAX_ECHOED_MESSAGE_IDS)
+    ids.delete(ids.values().next().value!);
+  // Refresh active sessions while evicting the least recently recorded one.
+  echoedMessageIDs.delete(sessionID);
+  echoedMessageIDs.set(sessionID, ids);
+  while (echoedMessageIDs.size > MAX_SLASH_ECHO_SESSIONS)
+    echoedMessageIDs.delete(echoedMessageIDs.keys().next().value!);
 }
 
 /** True only for the specific message that chat.message matched as an echo. */
@@ -82,12 +84,7 @@ export function isSlashEchoMessage(
   messageID: string | undefined,
 ): boolean {
   if (!sessionID || !messageID) return false;
-  const queue = echoedMessageIDs.get(sessionID);
-  if (!queue || queue.length === 0) return false;
-  const now = Date.now();
-  return queue.some(
-    e => e.messageID === messageID && now - e.at < SLASH_ECHO_WINDOW_MS,
-  );
+  return echoedMessageIDs.get(sessionID)?.has(messageID) ?? false;
 }
 
 /** Consume a matching in-window echo fingerprint for this session, if any. */

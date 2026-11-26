@@ -37,14 +37,22 @@ import {
 import {v1PartsToV2Text} from './plugin-v2-event-leaf.ts';
 import {runV2EventLoop} from './plugin-v2-event-bridge.ts';
 import {registerV2GoalCommandBridge} from './plugin-v2-command-bridge.ts';
-import type {SessionClientCapabilities} from './session-api.ts';
+import {
+  readV2SettledAssistant,
+  waitForV2Session,
+} from './plugin-v2-settlement.ts';
+import {
+  isMissingSessionError,
+  SessionApiError,
+  type SessionClientCapabilities,
+} from './session-api.ts';
 import {createGoalOutputPublisher} from './plugin-v2-command-output.ts';
 import {
   type RecentKickoffTextTracker,
   createRecentKickoffTextTracker,
-  dispatchV2Kickoff,
   markRecentKickoffMessages,
 } from './plugin-v2-command.ts';
+import {registerV2KickoffAdmission} from './plugin-v2-kickoff-admission.ts';
 import {GoalsPlugin, type PluginOptions} from './plugin-runtime.ts';
 import type {PluginHooks} from './hooks.ts';
 import {
@@ -163,42 +171,14 @@ export function createV2ClientShim(
     }
     options?.signal?.throwIfAborted();
     if (!hasAssistantReplyContent(res)) {
-      if (!targetSessionID || typeof session.wait !== 'function') {
-        throw new Error(
-          'Session completion wait is unavailable for asynchronous prompt admission.',
-        );
-      }
-      const waitPromise = Promise.resolve(
-        session.wait({sessionID: targetSessionID}),
+      await waitForV2Session(session, targetSessionID, options?.signal);
+      return readV2SettledAssistant(
+        session,
+        targetSessionID,
+        res,
+        translated.agent,
+        options?.signal,
       );
-      if (options?.signal) {
-        const signal = options.signal;
-        await new Promise<void>((resolve, reject) => {
-          if (signal.aborted) {
-            reject(signal.reason ?? new Error('aborted'));
-            return;
-          }
-          const onAbort = () => {
-            reject(signal.reason ?? new Error('aborted'));
-          };
-          signal.addEventListener('abort', onAbort, {once: true});
-          waitPromise.then(
-            () => {
-              signal.removeEventListener('abort', onAbort);
-              resolve();
-            },
-            err => {
-              signal.removeEventListener('abort', onAbort);
-              reject(err);
-            },
-          );
-        });
-      } else {
-        await waitPromise;
-      }
-      // Admission is user input, even if a host includes text parts on it.
-      // The verifier must obtain the completed assistant reply from context.
-      return {};
     }
     return res;
   };
@@ -231,6 +211,9 @@ export function createV2ClientShim(
           ? (created as {parentID?: unknown}).parentID
           : undefined;
       if (createdParentID !== createInput.parentID) {
+        const failure = new Error(
+          'parent-bound session creation unsupported by v2 host; no fork performed',
+        );
         const createdID =
           created && typeof created === 'object'
             ? (created as {id?: unknown}).id
@@ -240,11 +223,33 @@ export function createV2ClientShim(
           createdID &&
           typeof session.remove === 'function'
         ) {
-          await session.remove({sessionID: createdID}).catch(() => {});
+          try {
+            const deleted = await session.remove({sessionID: createdID});
+            if (
+              deleted &&
+              typeof deleted === 'object' &&
+              'error' in deleted &&
+              deleted.error != null
+            )
+              throw new SessionApiError('delete', deleted.error, deleted);
+          } catch (error) {
+            if (isMissingSessionError(error, createdID)) throw failure;
+            const detail =
+              error instanceof Error
+                ? error.message || String(error)
+                : String(error);
+            const cleanupFailure = new AggregateError(
+              [failure, error],
+              `${failure.message}; child-session cleanup failed (child ${createdID}): ${detail}`,
+            );
+            // Creation can settle after the verifier deadline. It has not
+            // returned this child's ID to the runner, so retain visibility of
+            // a failed orphan deletion here even after its caller timed out.
+            console.error(`[fixate-on] ${cleanupFailure.message}`);
+            throw cleanupFailure;
+          }
         }
-        throw new Error(
-          'parent-bound session creation unsupported by v2 host; no fork performed',
-        );
+        throw failure;
       }
     }
     return raw;
@@ -538,6 +543,15 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
 
   async function registerBridges(): Promise<void> {
     await goalOutput.register(ctx.rpc);
+    // Register before the message-buffer bridge: cancelled host input must not
+    // enter either a model/compaction request or the plugin's observed history.
+    const kickoffAdmission = await registerV2KickoffAdmission({
+      session: ctx.session,
+      runtime: hooks.runtime!,
+      selectAgent: client.sessionCapabilities.selectAgent,
+      recordKickoffText: (sid, text) => recentKickoffTexts.record(sid, text),
+    });
+    disposers.push(kickoffAdmission.dispose);
     // Bridge 1: session.hook("context") -> chat.params + system.transform
     if (typeof ctx.session?.hook === 'function') {
       try {
@@ -712,6 +726,7 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
     hooks.runtime!.retryPendingKickoffDispatch = async (
       sessionID: string,
       retained: unknown,
+      assertActive: () => void,
     ) => {
       const dispatch = retained as {
         method: 'prompt' | 'synthetic';
@@ -721,13 +736,7 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
       // carry the goal's resolved agent, and a retry must run under that same
       // agent rather than the host's current default. A switch failure fails
       // the retry so the bounded kickoff path retains the attachment inputs.
-      await dispatchV2Kickoff({
-        session: ctx.session,
-        selectAgent: client.sessionCapabilities.selectAgent,
-        recordKickoffText: (sid, text) => recentKickoffTexts.record(sid, text),
-        sessionID,
-        dispatch,
-      });
+      await kickoffAdmission.dispatch(sessionID, dispatch, assertActive);
     };
 
     // Bridge 3: Register goal tools with v2 schema and codemode options.
@@ -763,6 +772,7 @@ export async function setup(ctx: V2Context): Promise<() => Promise<void>> {
       publishOutput: (sessionID, text) =>
         goalOutput.publish(sessionID, text, 'command'),
       selectAgent: client.sessionCapabilities.selectAgent,
+      dispatchKickoff: kickoffAdmission.dispatch,
     });
     if (hooks.runtime) {
       hooks.runtime.announceKickoffFailure = goalOutput.publish;

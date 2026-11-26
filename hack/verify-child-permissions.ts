@@ -533,9 +533,10 @@ try {
           {action: '*', resource: '*', effect: 'deny'},
         ];
         assert.deepEqual(created[0].permissions, deniedUntilAdmission);
-        assert.equal(childObserved.length, 2);
+        assert.equal(childObserved.length, 3);
         assert.deepEqual(childObserved[0].permissions, deniedUntilAdmission);
-        assert.deepEqual(childObserved[1].permissions, expectedPermissions);
+        for (const settled of childObserved.slice(1))
+          assert.deepEqual(settled.permissions, expectedPermissions);
         assert.ok(childObserved.every(info => info.agent === 'goal-verify'));
         assert.ok(
           childObserved.every(info => info.location?.directory === work),

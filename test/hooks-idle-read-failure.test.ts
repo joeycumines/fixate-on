@@ -1,6 +1,8 @@
 import {expect, test} from 'bun:test';
 import {createOpenCodeSessionApi} from '../src/session-api.ts';
 import {createHooks} from '../src/hooks.ts';
+import {recordIdleReadFailure} from '../src/hooks-idle.ts';
+import {GoalStateMachine} from '../src/state-machine.ts';
 import {createIdleStateFixture, idleAssistant} from './idle-state-fixture.ts';
 import {deferred, waitFor} from './wait-for.ts';
 
@@ -77,8 +79,10 @@ test('a late failed read cannot replace a newer explicit pause', async () => {
     source: 'chat-message',
     stopReason: 'explicit pause',
   });
+  const paused = fixture.machine.snapshot();
   finishRead.resolve();
   await idle;
+  expect(fixture.machine.snapshot()).toEqual(paused);
   expect(fixture.machine.state.stopReason).toBe('explicit pause');
   expect(fixture.machine.state.promptFailures).toBe(2);
   expect(fixture.prompts).toHaveLength(0);
@@ -95,10 +99,147 @@ test('a failed read from before resume cannot charge the fresh run window', asyn
   const idle = fixture.idle();
   await fixture.machine.transition('paused', {source: 'slash-command'});
   await fixture.machine.transition('active', {source: 'slash-command'});
+  const resumed = fixture.machine.snapshot();
   finishRead.resolve();
   await idle;
+  expect(fixture.machine.snapshot()).toEqual(resumed);
   expect(fixture.machine.state.status).toBe('active');
   expect(fixture.machine.state.promptFailures).toBe(0);
+  expect(fixture.machine.state.pendingNotices).toHaveLength(0);
+  expect(fixture.announcements).toHaveLength(0);
+});
+
+for (const invalidation of ['ownership', 'removal', 'disposal'] as const) {
+  test(`read failure queued before ${invalidation} cannot mutate the goal`, async () => {
+    const fixture = createIdleStateFixture();
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    const machine = new GoalStateMachine(fixture.machine.snapshot(), {
+      onCommit: async () => {
+        entered.resolve();
+        await release.promise;
+      },
+    });
+    fixture.session.getMachine = () => machine;
+    fixture.session.listMachines = () => [machine];
+    let persists = 0;
+    fixture.session.persist = async () => {
+      persists++;
+      return true;
+    };
+    const lock = machine.mutate(() => {}, {
+      source: 'idle-handler',
+      detail: 'prior bookkeeping',
+      skipRevision: true,
+    });
+    await entered.promise;
+    const before = machine.snapshot();
+    const failed = recordIdleReadFailure(
+      fixture.session.sessionID,
+      fixture.session,
+      machine,
+      fixture.deps,
+      before,
+      new Error('read failed'),
+    );
+    if (invalidation === 'ownership')
+      fixture.runtime.canDriveSession = () => false;
+    else if (invalidation === 'removal')
+      fixture.session.listMachines = () => [];
+    else fixture.runtime.disposed = true;
+    release.resolve();
+    await lock;
+    await failed;
+    expect(machine.snapshot()).toEqual(before);
+    expect(persists).toBe(0);
+    expect(fixture.announcements).toHaveLength(0);
+  });
+}
+
+test('ownership lost after counting a read failure cannot pause or announce it', async () => {
+  const fixture = createIdleStateFixture({promptFailures: 2, finalizing: true});
+  const mutate = fixture.machine.mutate.bind(fixture.machine);
+  fixture.machine.mutate = async (fn, opts) => {
+    const result = await mutate(fn, opts);
+    if (opts.detail === 'Session state read failed before continuation')
+      fixture.runtime.canDriveSession = () => false;
+    return result;
+  };
+  let persists = 0;
+  fixture.session.persist = async () => {
+    persists++;
+    return true;
+  };
+  await recordIdleReadFailure(
+    fixture.session.sessionID,
+    fixture.session,
+    fixture.machine,
+    fixture.deps,
+    fixture.machine.snapshot(),
+    new Error('read failed'),
+  );
+  expect(fixture.machine.state.status).toBe('active');
+  expect(fixture.machine.state.finalizing).toBe(true);
+  expect(fixture.machine.state.pendingNotices).toHaveLength(0);
+  expect(persists).toBe(0);
+  expect(fixture.announcements).toHaveLength(0);
+});
+
+test('a resume during pause persistence suppresses late failure notice insertion', async () => {
+  const fixture = createIdleStateFixture({promptFailures: 2});
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const machine = new GoalStateMachine(fixture.machine.snapshot(), {
+    onCommit: async (_snapshot, transition) => {
+      if (transition.to === 'paused') {
+        entered.resolve();
+        await release.promise;
+      }
+    },
+  });
+  fixture.session.getMachine = () => machine;
+  fixture.session.listMachines = () => [machine];
+  const failed = recordIdleReadFailure(
+    fixture.session.sessionID,
+    fixture.session,
+    machine,
+    fixture.deps,
+    machine.snapshot(),
+    new Error('read failed'),
+  );
+  await entered.promise;
+  const resume = machine.transition('active', {source: 'slash-command'});
+  release.resolve();
+  await resume;
+  const resumed = machine.snapshot();
+  await failed;
+  expect(machine.snapshot()).toEqual(resumed);
+  expect(machine.state.pendingNotices).toHaveLength(0);
+  expect(fixture.announcements).toHaveLength(0);
+});
+
+test('a resume while a read-failure receipt is being persisted suppresses its stale announcement', async () => {
+  const fixture = createIdleStateFixture({promptFailures: 2});
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  fixture.session.persist = async () => {
+    entered.resolve();
+    await release.promise;
+    return true;
+  };
+  const failed = recordIdleReadFailure(
+    fixture.session.sessionID,
+    fixture.session,
+    fixture.machine,
+    fixture.deps,
+    fixture.machine.snapshot(),
+    new Error('read failed'),
+  );
+  await entered.promise;
+  await fixture.machine.transition('active', {source: 'slash-command'});
+  release.resolve();
+  await failed;
+  expect(fixture.machine.state.status).toBe('active');
   expect(fixture.announcements).toHaveLength(0);
 });
 

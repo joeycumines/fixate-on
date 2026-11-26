@@ -19,6 +19,17 @@ function usage(sessionID: string, input: number, output: number, cost = 0) {
   };
 }
 
+function registerMachines(
+  fixture: ReturnType<typeof createIdleStateFixture>,
+  machines: GoalStateMachine[],
+) {
+  fixture.session.getMachine = () => machines[0] ?? null;
+  fixture.session.listMachines = () => machines;
+  fixture.session.listActiveGoals = () =>
+    machines.map(machine => machine.snapshot());
+  fixture.runtime.sessionGoals.set(fixture.session.sessionID, machines);
+}
+
 test('a cumulative reading queued behind settlement cannot charge the terminal goal', async () => {
   const fixture = createIdleStateFixture();
   const sessionID = fixture.session.sessionID;
@@ -33,10 +44,11 @@ test('a cumulative reading queued behind settlement cannot charge the terminal g
       }
     },
   });
-  const update = machine.updateCumulativeUsage.bind(machine);
-  machine.updateCumulativeUsage = (...args) => {
+  registerMachines(fixture, [machine]);
+  const prepare = machine.prepareCumulativeUsage.bind(machine);
+  machine.prepareCumulativeUsage = (...args) => {
     usageQueued.resolve();
-    return update(...args);
+    return prepare(...args);
   };
   const held = machine.mutate(() => {}, {
     source: 'idle-handler',
@@ -107,6 +119,7 @@ test('a goal added after another goal retains its own charged delta across resta
     first.session,
     true,
   );
+  registerMachines(first, [first.machine, second.machine]);
   await trackTokenUsage(
     sessionID,
     cumulativeSessionUsageMessage(sessionID, usage(sessionID, 1300, 200, 2)),
@@ -132,6 +145,7 @@ test('a goal added after another goal retains its own charged delta across resta
   await restored[1]!.machine.transition('active', {source: 'slash-command'});
   const restoredRuntime = restored[0]!.runtime;
   const machines = restored.map(fixture => fixture.machine);
+  registerMachines(restored[0]!, machines);
   await trackTokenUsage(
     sessionID,
     cumulativeSessionUsageMessage(sessionID, usage(sessionID, 1600, 300, 3)),

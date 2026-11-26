@@ -612,7 +612,7 @@ export function splitLeadingGoalId(
   goals: GoalState[],
   operand: string,
 ): {goalId: string | null; rest: string} {
-  const space = operand.indexOf(' ');
+  const space = operand.search(/[ \t]/);
   if (space <= 0) return {goalId: null, rest: operand};
   const candidate = operand.slice(0, space);
   if (goals.some(g => g.goalId === candidate))

@@ -256,10 +256,13 @@ export async function dispatchV2Kickoff(args: {
   };
   selectAgent?: (sessionID: string, agent: string) => Promise<void>;
   recordKickoffText?: (sessionID: string, text: string) => void;
+  /** Recheck after every host preparation step, including agent selection. */
+  assertActive?: () => void;
   sessionID: string;
   dispatch: {method: 'prompt' | 'synthetic'; payload: Record<string, unknown>};
 }): Promise<void> {
   const {sessionID, dispatch} = args;
+  args.assertActive?.();
   const agent = dispatch.payload.agent;
   if (typeof agent === 'string' && agent.length > 0) {
     if (!args.selectAgent)
@@ -267,6 +270,7 @@ export async function dispatchV2Kickoff(args: {
         `cannot dispatch kickoff with agent ${JSON.stringify(agent)}: host has no switchAgent operation`,
       );
     await args.selectAgent(sessionID, agent);
+    args.assertActive?.();
   }
   if (dispatch.method === 'prompt') {
     args.recordKickoffText?.(sessionID, String(dispatch.payload.text ?? ''));
@@ -277,6 +281,9 @@ export async function dispatchV2Kickoff(args: {
       : await args.session.synthetic(dispatch.payload);
   assertV2KickoffResponse(result, dispatch.method);
 }
+
+/** Host acceptance must never be retried because its local receipt failed. */
+export class KickoffConfirmationError extends Error {}
 
 export interface RecentKickoffTextTracker {
   record(sessionID: string, text: string, now?: number): void;

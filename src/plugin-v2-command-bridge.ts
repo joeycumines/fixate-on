@@ -16,6 +16,7 @@ import {
   assertV2CommandCanDispatch,
   buildV2CommandKickoffDispatch,
   dispatchV2Kickoff,
+  KickoffConfirmationError,
   logV2DiagnosticEvent,
   validateV2CommandExecutionInput,
 } from './plugin-v2-command.ts';
@@ -29,6 +30,7 @@ import {GOAL_COMMAND_TEMPLATE_PREFIX} from './native-agent-config.ts';
 import type {PluginHooks} from './hooks.ts';
 import {
   acquirePromptInFlight,
+  kickoffAdmissionGuard,
   retainKickoffDispatch,
   removeKickoffDispatch,
   type RuntimeState,
@@ -37,6 +39,7 @@ import {
 import type {PluginOptions} from './plugin-runtime.ts';
 import type {RecentKickoffTextTracker} from './plugin-v2-command.ts';
 import type {V2Context} from './plugin-v2-helpers.ts';
+import type {GuardedV2KickoffDispatch} from './plugin-v2-kickoff-admission.ts';
 
 export interface V2CommandBridgeDeps {
   ctx: V2Context;
@@ -47,6 +50,8 @@ export interface V2CommandBridgeDeps {
   publishOutput?: (sessionID: string, text: string) => Promise<void>;
   /** Host-level agent switching, mirroring the v1->v2 prompt shim. */
   selectAgent?: (sessionID: string, agent: string) => Promise<void>;
+  /** Production v2 wiring fences late host preparation at the model boundary. */
+  dispatchKickoff?: GuardedV2KickoffDispatch;
 }
 
 /**
@@ -159,7 +164,9 @@ export async function registerV2GoalCommandBridge(
                 command.action === 'resume' &&
                 retained &&
                 target?.status === 'active' &&
-                target.runId === retained.runId
+                target.runId === retained.runId &&
+                (res.targetRevision === undefined ||
+                  target.revision === res.targetRevision)
               ) {
                 res.enteredActive = !retained.inFlight;
                 res.activatedGoal = retained.inFlight ? null : target;
@@ -202,7 +209,9 @@ export async function registerV2GoalCommandBridge(
               if (
                 !live ||
                 live.runId !== activated.runId ||
-                live.status !== 'active'
+                live.status !== 'active' ||
+                (res.targetRevision !== undefined &&
+                  live.revision !== res.targetRevision)
               )
                 throw new Error(
                   'Goal changed before kickoff admission; no prompt was sent.',
@@ -320,14 +329,26 @@ export async function registerV2GoalCommandBridge(
                   throw new Error(
                     'Goal changed before kickoff admission; no prompt was sent.',
                   );
-                await dispatchV2Kickoff({
-                  session: ctx.session,
-                  selectAgent: deps.selectAgent,
-                  recordKickoffText: (sid, text) =>
-                    recentKickoffTexts.record(sid, text),
+                const assertActive = kickoffAdmissionGuard(
+                  runtime,
                   sessionID,
-                  dispatch,
-                });
+                  pending,
+                  live.revision,
+                  interventionAtStart,
+                );
+                if (deps.dispatchKickoff) {
+                  await deps.dispatchKickoff(sessionID, dispatch, assertActive);
+                } else {
+                  await dispatchV2Kickoff({
+                    session: ctx.session,
+                    selectAgent: deps.selectAgent,
+                    recordKickoffText: (sid, text) =>
+                      recentKickoffTexts.record(sid, text),
+                    sessionID,
+                    dispatch,
+                    assertActive,
+                  });
+                }
                 admitted = true;
               } catch (error) {
                 const current = runtime.sessionGoals
@@ -339,7 +360,15 @@ export async function registerV2GoalCommandBridge(
                     ?.get(sessionID)
                     ?.get(live.goalId) === pending;
                 if (owns && !runtime.disposed) {
-                  if (
+                  if (error instanceof KickoffConfirmationError) {
+                    removeKickoffDispatch(runtime, sessionID, pending);
+                    if (currentGoal?.status === 'active')
+                      await current!.transition('paused', {
+                        source: 'slash-command',
+                        stopReason: 'kickoff admission failed',
+                        detail: error.message,
+                      });
+                  } else if (
                     !current ||
                     current.isTerminal() ||
                     currentGoal?.runId !== live.runId

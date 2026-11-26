@@ -58,6 +58,23 @@ export const DEFAULT_GOAL_OPTIONS: Required<DefaultGoalOptions> = {
   languageTriage: true,
 };
 
+export interface KickoffHistoryCommit {
+  /** Omit when certifying clean history without acknowledging a host input. */
+  inputID?: string;
+  assertActive: () => void;
+  /** Called synchronously with the successful snapshot replacement. Must not throw. */
+  accepted: () => void;
+}
+
+export interface KickoffInputConfirmation extends KickoffHistoryCommit {
+  inputID: string;
+}
+
+export interface KickoffInputHistory {
+  known: boolean;
+  unconfirmed: ReadonlySet<string>;
+}
+
 export interface RuntimeState {
   /** Active and backgrounded goals indexed by session ID. */
   sessionGoals: Map<string, GoalStateMachine[]>;
@@ -181,6 +198,29 @@ export interface RuntimeState {
   scheduleKickoff?: (sessionID: string, goalId: string, runId: string) => void;
   /** Retained admissions per session and goal; unrelated goals never overwrite each other. */
   pendingKickoffDispatch?: Map<string, Map<string, PendingKickoffDispatch>>;
+  /** Durable guards for native host inputs that may have arrived after cancellation. */
+  unconfirmedKickoffInputs: Map<string, Set<string>>;
+  /** Sessions whose admission history was read or written without loss. */
+  kickoffInputHistoryKnownSessions: Set<string>;
+  /** Only a current session lease makes the cached admission history authoritative. */
+  ownsKickoffInputHistory?: (sessionID: string) => boolean;
+  /** Refresh foreign-session admission receipts without acquiring or writing its lease. */
+  readKickoffInputHistory?: (sessionID: string) => Promise<KickoffInputHistory>;
+  /** Matches only this plugin instance's own model-hook cancellation receipts. */
+  isKickoffCancellationError?: (sessionID: string, error: unknown) => boolean;
+  /** Persist an input guard before host admission, or its acknowledged removal. */
+  persistKickoffInput?: (
+    sessionID: string,
+    inputID: string,
+    unconfirmed: boolean,
+  ) => Promise<boolean>;
+  /** Establish a clean, fully observed admission history before compaction. */
+  persistKickoffInputHistory?: (sessionID: string) => Promise<boolean>;
+  /** Atomically install an accepted input receipt while its initiating command is current. */
+  confirmKickoffInput?: (
+    sessionID: string,
+    confirmation: KickoffInputConfirmation,
+  ) => Promise<boolean>;
   /** Passive host receipt for exhausted admission retries. */
   announceKickoffFailure?: (sessionID: string, text: string) => Promise<void>;
   /** Persist the input requirement before admitting an attachment-bearing kickoff. */
@@ -197,6 +237,7 @@ export interface RuntimeState {
   retryPendingKickoffDispatch?: (
     sessionID: string,
     dispatch: unknown,
+    assertActive: () => void,
   ) => Promise<void>;
   /** Reports the status of a session goal without mutating it. */
   getGoalStatus?: (
@@ -229,6 +270,7 @@ export interface RuntimeState {
     activatedGoal: GoalState | null;
     enteredActive: boolean;
     targetGoalId?: string;
+    targetRevision?: number;
     error?: string;
   }>;
   drainPersistence: (() => Promise<boolean>) | null;
@@ -242,6 +284,34 @@ export interface PendingKickoffDispatch {
   attempts?: number;
   exhausted?: boolean;
   inFlight?: boolean;
+}
+
+/** A semantic change, replacement, stop or disposal invalidates this attempt. */
+export function kickoffAdmissionGuard(
+  runtime: RuntimeState,
+  sessionID: string,
+  pending: PendingKickoffDispatch,
+  revision: number,
+  intervention = runtime.userInterventions.get(sessionID),
+): () => void {
+  return () => {
+    const goal = runtime.sessionGoals
+      .get(sessionID)
+      ?.find(machine => machine.snapshot().goalId === pending.goalId)
+      ?.snapshot();
+    if (
+      runtime.disposed ||
+      runtime.canDriveSession?.(sessionID) === false ||
+      runtime.pendingKickoffDispatch?.get(sessionID)?.get(pending.goalId) !==
+        pending ||
+      !goal ||
+      goal.status !== 'active' ||
+      goal.runId !== pending.runId ||
+      goal.revision !== revision ||
+      runtime.userInterventions.get(sessionID) !== intervention
+    )
+      throw new Error('Goal changed before kickoff admission completed.');
+  };
 }
 
 /** Each release belongs to one admission; another admission keeps the fence held. */
@@ -315,6 +385,8 @@ export function createRuntimeState(): RuntimeState {
     promptInFlightSessions: new Set(),
     recoveryPendingSessions: new Set(),
     pendingKickoffDispatch: new Map(),
+    unconfirmedKickoffInputs: new Map(),
+    kickoffInputHistoryKnownSessions: new Set(),
     seenIdleEventIDs: new Set(),
     backgroundBlockedUntil: new Map(),
     backgroundDeferrals: new Map(),
