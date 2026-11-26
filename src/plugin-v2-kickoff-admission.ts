@@ -27,7 +27,7 @@ let inputCounter = 0;
  * Rejection-sampled uniform characters from a cryptographically secure
  * source. `randomInt` consumes a rejection-sampled, uniformly distributed
  * integer rather than a biased `byte % alphabet.length` reduction, so every
- * alphabet symbol is equiprobable (CodeQL js/insecure-randomness-modulo).
+ * alphabet symbol is equiprobable (CodeQL js/biased-cryptographic-random).
  */
 function createUnbiasedEntropy(alphabet: string, length: number): string {
   let entropy = '';

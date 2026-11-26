@@ -32,7 +32,7 @@ test('native kickoff IDs use the host timestamp/counter layout and message ID le
 });
 
 test('kickoff ID entropy characters stay uniformly distributed', () => {
-  // CodeQL js/insecure-randomness-modulo regression: reducing a random byte
+  // CodeQL js/biased-cryptographic-random regression: reducing a random byte
   // modulo the 62-symbol alphabet biases symbols '0'-'7' (five source byte
   // values each) roughly +25% above the rest (four each). Rejection sampling
   // via randomInt must keep every symbol at the same expected frequency.
