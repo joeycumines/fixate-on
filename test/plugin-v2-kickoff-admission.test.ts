@@ -31,6 +31,27 @@ test('native kickoff IDs use the host timestamp/counter layout and message ID le
   expect(second > first).toBe(true);
 });
 
+test('kickoff ID entropy characters stay uniformly distributed', () => {
+  // CodeQL js/insecure-randomness-modulo regression: reducing a random byte
+  // modulo the 62-symbol alphabet biases symbols '0'-'7' (five source byte
+  // values each) roughly +25% above the rest (four each). Rejection sampling
+  // via randomInt must keep every symbol at the same expected frequency.
+  const samples = 62_000;
+  const counts = new Map<string, number>();
+  for (let index = 0; index < samples; index++)
+    for (const character of createV2KickoffInputID().slice(16))
+      counts.set(character, (counts.get(character) ?? 0) + 1);
+  const total = samples * 14;
+  const expected = total / 62;
+  // Uniform fluctuation is ~sqrt(expected) ≈ 120; the biased reduction would
+  // push '0'-'7' about +3.5k from expected. 6% bounds noise at ~6σ while
+  // still catching the regression several times over.
+  const tolerance = expected * 0.06;
+  expect(counts.size).toBe(62);
+  for (const count of counts.values())
+    expect(Math.abs(count - expected)).toBeLessThan(tolerance);
+});
+
 test('another current-cycle input before a late cancelled kickoff still runs', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'fixate-current-cycle-'));
   const f = await fixture(directory);

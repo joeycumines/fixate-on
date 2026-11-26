@@ -5,7 +5,7 @@
  * model hooks prevent a late, cancelled input reaching a model.
  */
 
-import {createHmac, randomBytes} from 'node:crypto';
+import {createHmac, randomBytes, randomInt} from 'node:crypto';
 import type {RuntimeState, KickoffInputHistory} from './session-runtime.ts';
 import type {
   V2SessionContext,
@@ -23,6 +23,19 @@ export const MAX_UNCONFIRMED_KICKOFF_INPUTS = 1024;
 let lastInputTimestamp = 0;
 let inputCounter = 0;
 
+/**
+ * Rejection-sampled uniform characters from a cryptographically secure
+ * source. `randomInt` consumes a rejection-sampled, uniformly distributed
+ * integer rather than a biased `byte % alphabet.length` reduction, so every
+ * alphabet symbol is equiprobable (CodeQL js/insecure-randomness-modulo).
+ */
+function createUnbiasedEntropy(alphabet: string, length: number): string {
+  let entropy = '';
+  for (let index = 0; index < length; index++)
+    entropy += alphabet[randomInt(alphabet.length)];
+  return entropy;
+}
+
 /** Same prefix layout as v2.2.7 schema/identifier.ts for host-ID ordering. */
 export function createV2KickoffInputID(timestamp = Date.now()): string {
   if (timestamp !== lastInputTimestamp) {
@@ -33,9 +46,7 @@ export function createV2KickoffInputID(timestamp = Date.now()): string {
     (BigInt(timestamp) * 0x1000n + BigInt(++inputCounter)) & 0xffffffffffffn;
   const alphabet =
     '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
-  const entropy = [...crypto.getRandomValues(new Uint8Array(14))]
-    .map(value => alphabet[value % alphabet.length])
-    .join('');
+  const entropy = createUnbiasedEntropy(alphabet, 14);
   return `msg_${packed.toString(16).padStart(12, '0')}${entropy}`;
 }
 
