@@ -33,7 +33,7 @@ import {createGoalState, GoalStateMachine} from '../src/state-machine.ts';
 import type {UsageSnapshot} from '../src/accounting.ts';
 import {createLoopPolicy} from '../src/continuation-loop.ts';
 import {GoalsPlugin} from '../src/plugin-runtime.ts';
-import {v1PartsToV2Text} from '../src/plugin-v2.ts';
+import {v1PartsToV2Text} from '../src/plugin-v2-event-leaf.ts';
 
 // FIX-A fixtures (mirror hooks.test.ts harness)
 
@@ -135,7 +135,7 @@ function makeDeps(session: SessionContext, sessionApi: SessionApi): HookDeps {
   };
 }
 
-describe('FIX-A: user-intervention pause re-arms on idle (yield-then-continue)', () => {
+describe('user-intervention pause re-arms on idle (yield-then-continue)', () => {
   test("paused 'user intervention' + idle -> re-armed active AND continuation prompt sent", async () => {
     const machine = new GoalStateMachine(makePausedGoal('user intervention'), {
       onCommit: async () => {},
@@ -346,7 +346,7 @@ async function promptsAfterKickoffDeadline(
   return prompts.filter(p => p['sessionID'] === sessionID);
 }
 
-describe('FIX-B: v1 command.execute.before kicks off the loop when no agent turn exists', () => {
+describe('v1 command.execute.before kicks off the loop when no agent turn exists', () => {
   test('/goal add schedules a kickoff prompt when no assistant responds', async () => {
     const dir = tmpdir();
     try {
@@ -675,7 +675,7 @@ describe('v1 echo guard: chat.message replaying command-hook output', () => {
 
 // FX-E: a whole-message stop imperative must NOT be auto-resumed
 
-describe('FX-E explicit stop: conversational halt is not re-armed at idle', () => {
+describe('explicit stop: conversational halt is not re-armed at idle', () => {
   test("'stop' pauses with 'explicit pause' and stays paused across idles", async () => {
     const goal = createGoalState('session-stop', 'Stop the grind', {
       minDelayMs: 0,
@@ -1111,6 +1111,18 @@ describe('a goal whose owning session is gone', () => {
     ).toBe(true);
     // Name-only, and message-only, both classify.
     expect(isSessionGoneError({name: 'NotFoundError'})).toBe(true);
+    // Newer hosts throw a plain Error whose typed tag carries the diagnosis.
+    expect(
+      isSessionGoneError({name: 'Error', _tag: 'Session.NotFoundError'}),
+    ).toBe(true);
+    // A structured data.message must not be masked by an empty top-level message.
+    expect(
+      isSessionGoneError({
+        name: 'Error',
+        message: '',
+        data: {message: 'Session not found: ses_abc'},
+      }),
+    ).toBe(true);
     expect(isSessionGoneError({message: 'Session not found'})).toBe(true);
     expect(isSessionGoneError({message: 'session no longer exists'})).toBe(
       true,

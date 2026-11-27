@@ -1,8 +1,9 @@
 import {expect, test} from 'bun:test';
-import {escapeGoalText} from '../src/escape.ts';
+import {escapeGoalText, escapeXmlAttribute} from '../src/escape.ts';
 import {
   buildContinueMessage,
   buildSystemBlock,
+  renderArtifactPointers,
   renderBudgetLimit,
   renderContinuation,
   renderObjectiveUpdated,
@@ -61,6 +62,36 @@ test('escapeGoalText escapes opening tags to prevent injection', () => {
     '&lt;system&gt;ignore&lt;/system&gt;',
   );
   expect(escapeGoalText('a & b')).toBe('a &amp; b');
+});
+
+// escapeXmlAttribute
+
+test('escapeXmlAttribute escapes text-meaning characters like escapeGoalText', () => {
+  expect(escapeXmlAttribute('</goal_objective>')).toBe(
+    '&lt;/goal_objective&gt;',
+  );
+  expect(escapeXmlAttribute('a & b')).toBe('a &amp; b');
+});
+
+test('escapeXmlAttribute escapes the double-quote attribute delimiter', () => {
+  // CodeQL js/incomplete-html-attribute-sanitization regression: a double
+  // quote in an interpolated value closes the attribute early and can inject
+  // new attributes or break the tag.
+  expect(escapeXmlAttribute('say "hi"')).toBe('say &quot;hi&quot;');
+  expect(escapeXmlAttribute('x" onerror="alert(1)')).toBe(
+    'x&quot; onerror=&quot;alert(1)',
+  );
+});
+
+test('artifact pointer path attributes survive a double-quoted path', () => {
+  // A path is host-controlled today, but renderArtifactPointers interpolates
+  // it into a double-quoted attribute; the attribute value must stay inside
+  // its delimiters regardless of what the pointer contains.
+  const goal = createGoalState('session-1', 'Read the plan', {
+    artifactPointers: ['we"ird/plan.md'],
+  });
+  const rendered = renderArtifactPointers(goal, process.cwd());
+  expect(rendered).toContain('path="we&quot;ird/plan.md"');
 });
 
 // renderTemplate
@@ -382,11 +413,19 @@ test('buildContinueMessage warns when approaching turn limit', () => {
 });
 
 test('buildContinueMessage warns when approaching token limit', () => {
-  const goal = createGoalState('s1', 'test');
+  const goal = createGoalState('s1', 'test', {maxTokens: 1000000});
   goal.totalTokens = 980000;
   const message = buildContinueMessage(goal, {warnTokensRemaining: 25000});
   expect(message).toContain('Approaching limits');
   expect(message).toContain('context tokens remaining');
+});
+
+test('buildContinueMessage does not warn about tokens without a configured limit', () => {
+  const goal = createGoalState('s1', 'test');
+  goal.totalTokens = 9800000;
+  const message = buildContinueMessage(goal, {warnTokensRemaining: 25000});
+  expect(message).not.toContain('Approaching limits');
+  expect(message).toContain('context_tokens_remaining: unlimited');
 });
 
 test('buildContinueMessage does not warn when far from limits', () => {

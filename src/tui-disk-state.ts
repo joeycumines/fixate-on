@@ -213,7 +213,7 @@ function snapshotsFromParsed(
       revision: typeof r.revision === 'number' ? r.revision : 0,
       turnCount: typeof r.turnCount === 'number' ? r.turnCount : 0,
       totalTokens: typeof r.totalTokens === 'number' ? r.totalTokens : 0,
-      maxTokens: typeof r.maxTokens === 'number' ? r.maxTokens : 1000000,
+      maxTokens: typeof r.maxTokens === 'number' ? r.maxTokens : 0,
       maxTurns: typeof r.maxTurns === 'number' ? r.maxTurns : 0,
       tokenBudget: typeof r.tokenBudget === 'number' ? r.tokenBudget : null,
       usage: (r.usage ?? {

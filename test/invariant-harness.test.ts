@@ -46,10 +46,11 @@ describe('Invariant harness: core invariants and the product prompt surface', ()
 
   // 1. Legal State Machine Transitions Invariant
 
-  it('strictly enforces legal transition DAG across all possible source transitions', async () => {
+  it('enforces all 36 status transitions without side effects on rejection', async () => {
     const allStatuses: GoalStatus[] = [
       'active',
       'paused',
+      'blocked',
       'finalizing',
       'complete',
       'budgetLimited',
@@ -63,7 +64,13 @@ describe('Invariant harness: core invariants and the product prompt surface', ()
           {goalId: `goal-${fromStatus}-${toStatus}`},
         );
         goal.status = fromStatus;
-        const machine = new GoalStateMachine(goal);
+        let commits = 0;
+        const machine = new GoalStateMachine(goal, {
+          onCommit: async () => {
+            commits++;
+          },
+        });
+        const before = machine.snapshot();
 
         const isAllowed =
           TRANSITION_TABLE.get(fromStatus)?.has(toStatus) ?? false;
@@ -75,9 +82,12 @@ describe('Invariant harness: core invariants and the product prompt surface', ()
         if (isAllowed) {
           expect(result.ok).toBe(true);
           expect(machine.snapshot().status).toBe(toStatus);
+          expect(machine.snapshot().revision).toBe(before.revision + 1);
+          expect(commits).toBe(1);
         } else {
           expect(result.ok).toBe(false);
-          expect(machine.snapshot().status).toBe(fromStatus);
+          expect(machine.snapshot()).toEqual(before);
+          expect(commits).toBe(0);
         }
       }
     }

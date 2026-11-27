@@ -9,6 +9,10 @@
  */
 
 import type {UsageSnapshot} from './accounting.ts';
+import type {
+  MessageUsageReceipt,
+  PendingSessionUsage,
+} from './usage-receipts.ts';
 
 export type GoalStatus =
   'active' | 'paused' | 'blocked' | 'budgetLimited' | 'finalizing' | 'complete';
@@ -75,7 +79,9 @@ export type NoticeKind =
   | 'hard-limit'
   | 'prompt-failure'
   | 'persistence-failure'
+  | 'usage-baseline'
   | 'tool-surface-unavailable'
+  | 'background-completion-unreported'
   | 'user-intervention'
   | 'retraction'
   | 'completion-gate'
@@ -252,7 +258,16 @@ export interface GoalState {
   totalTokens: number;
   compactionBaselineTokens: number;
   usage: UsageSnapshot;
+  /**
+   * Last host cumulative reading charged to this goal. Null means a new goal
+   * has not observed usage; undefined identifies a legacy restored record.
+   */
+  lastSessionUsage?: UsageSnapshot | null;
+  /** Transient durable batch receipt, removed when its cumulative reading is charged. */
+  pendingSessionUsage?: PendingSessionUsage;
   createdAt: number;
+  /** Native command admission time, before asynchronous goal replacement. */
+  userCommandStartedAt?: number;
   updatedAt: number;
   startedAt: number;
   pausedAt: number;
@@ -316,6 +331,13 @@ export interface GoalState {
    */
   languageTriage: boolean;
   lastStatus: string;
+  /**
+   * The host has not durably confirmed admission of this goal's kickoff inputs.
+   * The payload is process-local, so recovery must request the original inputs
+   * when this marker survives without a retained dispatch. Ordinary resumes
+   * preserve it until admission succeeds or the user replaces the objective.
+   */
+  kickoffAdmissionPending?: boolean;
   lastAssistantText: string;
   lastAssistantMessageID: string;
   /**
@@ -323,6 +345,13 @@ export interface GoalState {
    * multiple idle ticks on the same turn from advancing the streak counter.
    */
   lastCountedProgressMessageID?: string;
+  /**
+   * Evaluation of the turn pinned in `lastCountedProgressMessageID`: true when
+   * one stall was counted, false when progress was confirmed, and undefined
+   * while a first short prose observation is still tentative. The value only
+   * applies to that key and is reset together with progress tracking.
+   */
+  stalledTurnCounted?: boolean;
   /**
    * Assistant message ID already counted toward `noToolCallTurns`, ensuring turns
    * rather than idle ticks are counted.
@@ -343,17 +372,29 @@ export interface GoalState {
   claims: ClaimRecord[];
   lastClaim: ClaimRecord | null;
   messageIDs: Set<string>;
+  /** Durable per-message charges and pending baselines; absent in legacy state. */
+  messageUsage?: Map<string, MessageUsageReceipt>;
+  /** Earlier or undated readings need a baseline after migration or eviction. */
+  messageUsageBaselineAt?: number;
   executionContext: ExecutionContext | null;
 }
 
 export interface TransitionOptions {
   source: TransitionSource;
+  /** Checked under the state lock; false leaves state and callbacks untouched. */
+  guard?: (goal: Readonly<GoalState>) => boolean;
+  /** Refuse a transition if another semantic mutation won while work was awaited. */
+  expectedRevision?: number;
   stopReason?: string;
   blockedReason?: string;
   detail?: string;
   historyType?: string;
   /** If true, omit calling onCommit (the caller will handle persistence). */
   skipPersist?: boolean;
+  /** Reset the run window atomically with a successful transition to active. */
+  restart?: {kickoffAdmissionPending?: boolean};
+  /** Require kickoff inputs atomically with activation, without restarting budgets. */
+  requireKickoffAdmission?: boolean;
 }
 
 export interface TransitionResult {
@@ -365,6 +406,8 @@ export interface TransitionResult {
 export interface MutationOptions {
   source: TransitionSource;
   detail: string;
+  /** Checked under the state lock; false leaves state and callbacks untouched. */
+  guard?: (goal: Readonly<GoalState>) => boolean;
   /** If true, omit calling onCommit. */
   skipPersist?: boolean;
   /** If true, do not increment the revision (for non-semantic tracking updates). */

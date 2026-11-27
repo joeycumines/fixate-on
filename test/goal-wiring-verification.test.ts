@@ -62,7 +62,7 @@ async function runGoalCommand(
 
 // FIX-A: setPendingIntent / getPendingIntent
 
-test('FIX-A: setPendingIntent stores intent and getPendingIntent retrieves it', async () => {
+test('setPendingIntent stores intent and getPendingIntent retrieves it', async () => {
   const {hooks} = await makePlugin();
   await runGoalCommand(hooks, 's1', 'fix tests');
 
@@ -84,7 +84,7 @@ test('FIX-A: setPendingIntent stores intent and getPendingIntent retrieves it', 
   expect(parsed.pendingCompletion).toBe(true);
 });
 
-test('FIX-A: update_goal tool sets pending intent via session context', async () => {
+test('update_goal tool sets pending intent via session context', async () => {
   const {hooks} = await makePlugin();
   await runGoalCommand(hooks, 's1', 'fix tests');
 
@@ -104,7 +104,7 @@ test('FIX-A: update_goal tool sets pending intent via session context', async ()
   expect(parsed.pendingCompletion).toBe(true);
 });
 
-test('FIX-A: getPendingIntent returns null when no intent set', async () => {
+test('getPendingIntent returns null when no intent set', async () => {
   const {hooks} = await makePlugin();
   await runGoalCommand(hooks, 's1', 'fix tests');
   const getGoalTool = hooks.tool?.get_goal as
@@ -120,7 +120,7 @@ test('FIX-A: getPendingIntent returns null when no intent set', async () => {
 
 // FIX-B: trackTokenUsage persists
 
-test('FIX-B: trackTokenUsage calls real persist (not stub)', async () => {
+test('trackTokenUsage calls real persist (not stub)', async () => {
   const {hooks} = await makePlugin();
   await runGoalCommand(hooks, 's1', 'fix tests');
 
@@ -150,7 +150,7 @@ test('FIX-B: trackTokenUsage calls real persist (not stub)', async () => {
 
 // FIX-C: WAL entries are written on transitions
 
-test('FIX-C: WAL entries written on goal creation with persistence', async () => {
+test('WAL entries written on goal creation with persistence', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'goal-wal-fix-'));
   const paths = sessionStatePaths(dir, 's1');
   const hooks = await GoalsPlugin(
@@ -174,7 +174,7 @@ test('FIX-C: WAL entries written on goal creation with persistence', async () =>
 
 // FIX-D: writeStateFile creates parent directory
 
-test("FIX-D: writeStateFile creates parent directory when it doesn't exist", async () => {
+test("writeStateFile creates parent directory when it doesn't exist", async () => {
   const dir = await mkdtemp(join(tmpdir(), 'goal-mkdir-'));
   const nestedPath = join(dir, 'deep', 'nested', 'state.json');
 
@@ -188,7 +188,7 @@ test("FIX-D: writeStateFile creates parent directory when it doesn't exist", asy
   await rm(dir, {recursive: true, force: true});
 });
 
-test('FIX-D: writeStateFile creates directory with 0700 permissions', async () => {
+test('writeStateFile creates directory with 0700 permissions', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'goal-perms-'));
   const nestedPath = join(dir, 'secure', 'state.json');
 
@@ -204,7 +204,7 @@ test('FIX-D: writeStateFile creates directory with 0700 permissions', async () =
 
 // FIX-E: autoPromote fires after completion in ordered session
 
-test('FIX-E: autoPromote is wired and callable', async () => {
+test('autoPromote is wired and callable', async () => {
   const {hooks} = await makePlugin();
   await runGoalCommand(hooks, 's1', 'sequence build; test; ship');
   const list = await runGoalCommand(hooks, 's1', 'list');
@@ -213,7 +213,7 @@ test('FIX-E: autoPromote is wired and callable', async () => {
 
 // FIX-F: sequence registers ordered session
 
-test('FIX-F: sequence command registers session as ordered', async () => {
+test('sequence command registers session as ordered', async () => {
   const {hooks} = await makePlugin();
   await runGoalCommand(hooks, 's1', 'sequence build; test; ship');
   const list = await runGoalCommand(hooks, 's1', 'list');
@@ -222,7 +222,7 @@ test('FIX-F: sequence command registers session as ordered', async () => {
 
 // FIX-I: CI uses bun
 
-test('FIX-I: active runtime contracts use bun', async () => {
+test('active runtime contracts use bun', async () => {
   const fs = await import('node:fs/promises');
   const ci = await fs.readFile(
     join(process.cwd(), '.github/workflows/ci.yml'),
@@ -234,7 +234,7 @@ test('FIX-I: active runtime contracts use bun', async () => {
   expect(ci).not.toContain('node --test');
 });
 
-test('FIX-I: active package commands do not invoke node or npm', async () => {
+test('active package commands do not invoke node or npm', async () => {
   const fs = await import('node:fs/promises');
   const manifest = JSON.parse(
     await fs.readFile(join(process.cwd(), 'package.json'), 'utf8'),

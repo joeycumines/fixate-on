@@ -122,6 +122,7 @@ export function mergeRecovered(
     pendingIntents: [],
     settlementReceipts: [],
     focusedGoalIds: [],
+    unconfirmedKickoffInputs: [],
   };
   base.goals.push(...recovered.goals.map(serializeGoal));
   base.results.push(...recovered.results);
@@ -130,6 +131,9 @@ export function mergeRecovered(
   base.pendingIntents!.push(...recovered.pendingIntents);
   base.settlementReceipts!.push(...recovered.settlementReceipts);
   base.focusedGoalIds!.push(...recovered.focusedGoalIds);
+  (base.unconfirmedKickoffInputs ??= []).push(
+    ...(recovered.unconfirmedKickoffInputs ?? []),
+  );
   // Deduplicate invalidated goal IDs across sessions to avoid redundant fences.
   base.invalidatedGoalIds = [...new Set(base.invalidatedGoalIds)];
   return base;

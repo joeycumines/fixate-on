@@ -9,8 +9,8 @@
  * - Buffering transport for host environments where tool metadata carries events
  *
  * Architecture and design invariants:
- * - Leaf dependency: Imports types only from `state-machine.ts` and `accounting.ts`
- *   to eliminate circular dependencies across plugin, hooks, and persistence modules.
+ * - Shared snapshot-detail validation imports types only from `goal-types.ts`,
+ *   keeping the TUI state graph independent of plugin, hooks, and persistence.
  * - Transport abstraction: The broadcaster publishes via a generic `publish` callback,
  *   decoupling state updates from host-specific IPC or toast APIs.
  * - Monotonic revisions: The store drops stale revisions for existing goals, ensuring
@@ -27,6 +27,12 @@ import type {
   GoalStatus,
 } from './state-machine.ts';
 import type {UsageSnapshot} from './accounting.ts';
+import {
+  copyClaimRecord,
+  copyGoalProposal,
+  isNonNegativeFinite,
+  parseTuiSnapshotDetails,
+} from './tui-snapshot-details.ts';
 
 /**
  * Event title marker stamped on published TUI events. The TUI companion filters
@@ -51,7 +57,7 @@ export type GoalTuiEventKind = 'create' | 'transition' | 'usage' | 'remove';
 
 /**
  * Frozen, serializable projection of a `GoalState` for consumption by the TUI layer.
- * Contains only rendering state, omitting internal bookkeeping (mutexes, claims, pending intents).
+ * Contains rendering state and claim provenance, omitting internal bookkeeping and pending intents.
  */
 export interface GoalTuiSnapshot {
   readonly goalId: string;
@@ -100,36 +106,6 @@ export interface GoalTuiSnapshot {
 }
 
 /**
- * Memoized frozen history cache.
- *
- * Frequent events (e.g. streaming usage updates) do not modify history.
- * Reusing the previously frozen array when reference and length match avoids
- * allocating and recursively freezing large arrays on every token tick.
- */
-type HistoryEntry = {type: string; detail: string; timestamp: number};
-let memoHistoryRef: ReadonlyArray<HistoryEntry> | null = null;
-let memoHistoryLen = -1;
-let memoHistoryFrozen: ReadonlyArray<HistoryEntry> = [];
-
-function frozenHistory(
-  history: ReadonlyArray<HistoryEntry>,
-): ReadonlyArray<HistoryEntry> {
-  if (history === memoHistoryRef && history.length === memoHistoryLen) {
-    return memoHistoryFrozen;
-  }
-  memoHistoryRef = history;
-  memoHistoryLen = history.length;
-  memoHistoryFrozen = deepFreeze(
-    history.map(h => ({
-      type: h.type,
-      detail: h.detail,
-      timestamp: h.timestamp,
-    })),
-  );
-  return memoHistoryFrozen;
-}
-
-/**
  * Projects a `GoalState` into a deeply frozen, immutable `GoalTuiSnapshot`.
  */
 export function serializeGoalForTui(
@@ -140,9 +116,11 @@ export function serializeGoalForTui(
     sessionID: state.sessionID,
     condition: state.condition,
     artifactPointers: state.artifactPointers ? [...state.artifactPointers] : [],
-    pendingProposal: state.pendingProposal ? {...state.pendingProposal} : null,
-    claims: state.claims ? state.claims.map(c => ({...c})) : [],
-    lastClaim: state.lastClaim ? {...state.lastClaim} : null,
+    pendingProposal: state.pendingProposal
+      ? copyGoalProposal(state.pendingProposal)
+      : null,
+    claims: state.claims ? state.claims.map(copyClaimRecord) : [],
+    lastClaim: state.lastClaim ? copyClaimRecord(state.lastClaim) : null,
     status: state.status,
     revision: state.revision,
     turnCount: state.turnCount,
@@ -172,7 +150,13 @@ export function serializeGoalForTui(
           timestamp: state.lastCheckpoint.timestamp,
         }
       : null,
-    history: frozenHistory(state.history),
+    // History is mutable and length-capped; reference plus length cannot
+    // establish freshness once an append evicts the oldest entry.
+    history: state.history.map(entry => ({
+      type: entry.type,
+      detail: entry.detail,
+      timestamp: entry.timestamp,
+    })),
   };
   return deepFreeze(snapshot);
 }
@@ -237,7 +221,7 @@ function validateTuiEvent(value: unknown): GoalTuiEvent | null {
   const sessionID = obj.sessionID;
   if (typeof sessionID !== 'string' || sessionID.length === 0) return null;
   const timestamp = obj.timestamp;
-  if (typeof timestamp !== 'number' || !Number.isFinite(timestamp)) return null;
+  if (!isNonNegativeFinite(timestamp)) return null;
 
   if (kind === 'remove') {
     const goalId = obj.goalId;
@@ -252,44 +236,54 @@ function validateTuiEvent(value: unknown): GoalTuiEvent | null {
   // misrouted events from corrupting the session store index.
   if (snapshot.sessionID !== sessionID) return null;
 
+  const previousStatus = obj.previousStatus;
+  if (
+    previousStatus !== undefined &&
+    (typeof previousStatus !== 'string' ||
+      !VALID_GOAL_STATUSES.has(previousStatus))
+  )
+    return null;
+  const prior =
+    previousStatus === undefined
+      ? {}
+      : {previousStatus: previousStatus as GoalStatus};
+
   if (kind === 'transition') {
     const transition = validateTransition(obj.transition);
     if (!transition) return null;
-    return {kind, sessionID, timestamp, snapshot, transition};
+    return {kind, sessionID, timestamp, snapshot, transition, ...prior};
   }
 
-  return {kind, sessionID, timestamp, snapshot};
+  return {kind, sessionID, timestamp, snapshot, ...prior};
 }
 
 function validateSnapshot(value: unknown): GoalTuiSnapshot | null {
-  if (!value || typeof value !== 'object') return null;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const s = value as Record<string, unknown>;
   if (
     typeof s.goalId !== 'string' ||
+    s.goalId.length === 0 ||
     typeof s.sessionID !== 'string' ||
+    s.sessionID.length === 0 ||
     typeof s.condition !== 'string' ||
     typeof s.status !== 'string' ||
     !VALID_GOAL_STATUSES.has(s.status) ||
-    typeof s.revision !== 'number' ||
-    typeof s.turnCount !== 'number' ||
-    typeof s.totalTokens !== 'number' ||
-    typeof s.maxTokens !== 'number' ||
-    typeof s.maxTurns !== 'number' ||
-    (s.tokenBudget !== null && typeof s.tokenBudget !== 'number') ||
+    !isNonNegativeFinite(s.revision) ||
+    !isNonNegativeFinite(s.turnCount) ||
+    !isNonNegativeFinite(s.totalTokens) ||
+    !isNonNegativeFinite(s.maxTokens) ||
+    !isNonNegativeFinite(s.maxTurns) ||
+    (s.tokenBudget !== null && !isNonNegativeFinite(s.tokenBudget)) ||
     typeof s.stopReason !== 'string' ||
-    typeof s.pausedAt !== 'number' ||
-    !Number.isFinite(s.pausedAt) ||
-    s.pausedAt < 0 ||
-    typeof s.stoppedAt !== 'number' ||
-    !Number.isFinite(s.stoppedAt) ||
-    s.stoppedAt < 0 ||
+    !isNonNegativeFinite(s.pausedAt) ||
+    !isNonNegativeFinite(s.stoppedAt) ||
     typeof s.blockedReason !== 'string' ||
-    typeof s.createdAt !== 'number' ||
-    typeof s.updatedAt !== 'number'
+    !isNonNegativeFinite(s.createdAt) ||
+    !isNonNegativeFinite(s.updatedAt)
   ) {
     return null;
   }
-  if (s.finishedAt !== null && typeof s.finishedAt !== 'number') return null;
+  if (s.finishedAt !== null && !isNonNegativeFinite(s.finishedAt)) return null;
   const usage = validateUsage(s.usage);
   if (!usage) return null;
   const history = validateHistory(s.history);
@@ -298,7 +292,11 @@ function validateSnapshot(value: unknown): GoalTuiSnapshot | null {
   const checkpoint = validateCheckpoint(s.lastCheckpoint);
   if (checkpoint === INVALID_CHECKPOINT) return null;
 
+  const details = parseTuiSnapshotDetails(s);
+  if (details === null) return null;
+
   const snapshot: GoalTuiSnapshot = {
+    ...details,
     goalId: s.goalId,
     sessionID: s.sessionID,
     condition: s.condition,
@@ -327,12 +325,12 @@ function validateUsage(value: unknown): UsageSnapshot | null {
   if (!value || typeof value !== 'object') return null;
   const u = value as Record<string, unknown>;
   if (
-    typeof u.input !== 'number' ||
-    typeof u.output !== 'number' ||
-    typeof u.reasoning !== 'number' ||
-    typeof u.cacheRead !== 'number' ||
-    typeof u.cacheWrite !== 'number' ||
-    typeof u.cost !== 'number' ||
+    !isNonNegativeFinite(u.input) ||
+    !isNonNegativeFinite(u.output) ||
+    !isNonNegativeFinite(u.reasoning) ||
+    !isNonNegativeFinite(u.cacheRead) ||
+    !isNonNegativeFinite(u.cacheWrite) ||
+    !isNonNegativeFinite(u.cost) ||
     typeof u.costKnown !== 'boolean'
   ) {
     return null;
@@ -365,7 +363,7 @@ function validateHistory(value: unknown): ReadonlyArray<
     if (
       typeof e.type !== 'string' ||
       typeof e.detail !== 'string' ||
-      typeof e.timestamp !== 'number'
+      !isNonNegativeFinite(e.timestamp)
     ) {
       return null;
     }
@@ -388,7 +386,7 @@ function validateCheckpoint(value: unknown):
   if (value === null) return null;
   if (!value || typeof value !== 'object') return INVALID_CHECKPOINT;
   const c = value as Record<string, unknown>;
-  if (typeof c.summary !== 'string' || typeof c.timestamp !== 'number')
+  if (typeof c.summary !== 'string' || !isNonNegativeFinite(c.timestamp))
     return INVALID_CHECKPOINT;
   return {summary: c.summary, timestamp: c.timestamp};
 }
@@ -399,7 +397,9 @@ function validateTransition(value: unknown): Readonly<CommitTransition> | null {
   if (
     typeof t.source !== 'string' ||
     typeof t.from !== 'string' ||
+    !VALID_GOAL_STATUSES.has(t.from) ||
     typeof t.to !== 'string' ||
+    !VALID_GOAL_STATUSES.has(t.to) ||
     typeof t.detail !== 'string'
   ) {
     return null;

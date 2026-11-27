@@ -13,6 +13,13 @@ function makeSM(overrides: Partial<GoalState> = {}): GoalStateMachine {
   return new GoalStateMachine({...goal, ...overrides});
 }
 
+test('createGoalState defaults context-token limit to unlimited and preserves explicit limits', () => {
+  expect(createGoalState('s1', 'default').maxTokens).toBe(0);
+  expect(createGoalState('s1', 'limited', {maxTokens: 200000}).maxTokens).toBe(
+    200000,
+  );
+});
+
 // Transition Table
 
 test('active → paused is permitted', async () => {

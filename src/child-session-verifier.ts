@@ -7,6 +7,8 @@ import type {GoalState} from './state-machine.ts';
 import {
   createOpenCodeSessionApi,
   type OpenCodeSessionApi,
+  isMissingSessionError,
+  type SessionClientCapabilities,
 } from './session-api.ts';
 import {
   type CandidateIdentity,
@@ -15,10 +17,13 @@ import {
   type VerifierJudgeFn,
 } from './completion-gate.ts';
 import {escapeGoalText} from './escape.ts';
+import {extractChildVerdictText} from './child-session-response.ts';
+import {canonicalPath} from './plugin-v2-helpers.ts';
 import {
-  findLatestAssistantMessage,
-  getTextFromParts,
-} from './message-helpers.ts';
+  buildVerifierChildPermissions,
+  verifierCeilingPermissions,
+} from './plugin-v2-tools-agents.ts';
+import {findLatestAssistantMessage} from './message-helpers.ts';
 
 export interface JudgeVerdict {
   approved: boolean;
@@ -311,12 +316,6 @@ function findLastJsonObject(text: string): string | null {
   return null;
 }
 
-function extractJudgeVerdictText(response: unknown): string {
-  if (typeof response === 'string') return response;
-  const r = response as {parts?: unknown[]; data?: {parts?: unknown[]}} | null;
-  return getTextFromParts(r?.parts) || getTextFromParts(r?.data?.parts) || '';
-}
-
 export function summarizeText(text: string, maxLen: number): string {
   const trimmed = text.trim();
   return trimmed.length > maxLen
@@ -404,132 +403,309 @@ export function createChildSessionJudge(
     sessionID,
     latestText,
   }: JudgeContext): Promise<JudgeVerdict> => {
-    const c = client as
-      | {
-          session?: {
-            create?: (...args: unknown[]) => Promise<unknown>;
-            prompt?: (...args: unknown[]) => Promise<unknown>;
-            messages?: (...args: unknown[]) => Promise<unknown>;
-            abort?: (...args: unknown[]) => Promise<unknown>;
-            delete?: (...args: unknown[]) => Promise<unknown>;
-          };
-        }
-      | undefined;
-
-    let childID: string | undefined;
-    let timedOut = false;
-    let cleanupCompleted = false;
-
-    const run = async (): Promise<JudgeVerdict> => {
-      if (!c?.session?.create || !c?.session?.prompt) {
-        return operationalFailure('child-session API unavailable');
-      }
-
-      const sessionApi = createSessionApiForJudge(client, sdkShape);
-      const created = await sessionApi.createChild(sessionID, {
-        title: 'goal completion judge',
-      });
-      const createdObj = created as {
-        id?: string;
-        sessionID?: string;
-        parentID?: string;
-      } | null;
-      childID = createdObj?.id || createdObj?.sessionID;
-      if (!childID) return operationalFailure('child session id unavailable');
-      if (
-        createdObj?.parentID !== undefined &&
-        createdObj.parentID !== sessionID
-      ) {
-        return operationalFailure(
-          'child session parent relationship was not preserved',
-        );
-      }
-
-      // If the timeout fired while createChild was in flight, clean up the
-      // now-known child before returning. The outer finally ran before the
-      // create call resolved, so it could not see this late child.
-      if (timedOut) {
-        if (typeof c?.session?.delete !== 'function') {
-          return operationalFailure(
-            `judge timed out after ${timeoutMs}ms; child-session cleanup unsupported by host`,
-          );
-        }
-        try {
-          await createSessionApiForJudge(client, sdkShape).delete(childID);
-          cleanupCompleted = true;
-        } catch (error) {
-          return operationalFailure(
-            `judge timed out after ${timeoutMs}ms; child-session cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
-          );
-        }
-        return operationalFailure(`judge timed out after ${timeoutMs}ms`);
-      }
-
-      const response = await sessionApi.prompt(childID, {
-        parts: [{type: 'text', text: buildJudgePrompt(goal, latestText)}],
-        agent,
-      });
-
-      let verdictText = extractJudgeVerdictText(response);
-      if (!verdictText && c.session.messages) {
-        const messages = await sessionApi.messages(childID, {limit: 10});
-        const latest = findLatestAssistantMessage(
-          Array.isArray(messages) ? messages : [],
-        );
-        verdictText = getTextFromParts(
-          (latest as {parts?: unknown[]} | null)?.parts,
-        );
-      }
-      return parseJudgeVerdict(verdictText);
-    };
-
-    let timerID: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<JudgeVerdict>(resolve => {
-      timerID = setTimeout(() => {
-        timedOut = true;
-        resolve(operationalFailure(`judge timed out after ${timeoutMs}ms`));
-        if (childID && typeof c?.session?.abort === 'function') {
-          const abortApi = createSessionApiForJudge(client, sdkShape);
-          void abortApi.abort(childID).catch(() => {});
-        }
-      }, timeoutMs);
-    });
-
-    const runPromise = run();
-    runPromise.catch(() => {});
+    let observedVerdict: JudgeVerdict | undefined;
     try {
-      const result = await Promise.race([runPromise, timeout]);
-      return result;
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      return operationalFailure(`judge error: ${msg}`);
-    } finally {
-      if (timerID) clearTimeout(timerID);
-      if (childID) {
-        if (typeof c?.session?.delete !== 'function') {
-          const reason = 'child-session cleanup unsupported by host';
-          await defaultGoalMessenger(client, sessionID, reason);
-          if (failurePolicy === 'reject') return operationalFailure(reason);
-        } else if (!cleanupCompleted) {
-          try {
-            await createSessionApiForJudge(client, sdkShape).delete(childID);
-            cleanupCompleted = true;
-          } catch (error) {
-            const reason = `child-session cleanup failed: ${error instanceof Error ? error.message : String(error)}`;
-            await defaultGoalMessenger(client, sessionID, reason);
-            if (failurePolicy === 'reject') return operationalFailure(reason);
+      return await runChildSession(
+        client,
+        {parentID: sessionID, sdkShape, timeoutMs, agent, label: 'judge'},
+        async ({api, createChild, checkActive, childPermissions}) => {
+          const childID = await createChild({
+            title: 'goal completion judge',
+            ...childPermissions,
+          });
+          const session = (client as {session: Record<string, unknown>})
+            .session;
+          const capabilities = (
+            client as
+              {sessionCapabilities?: SessionClientCapabilities} | undefined
+          )?.sessionCapabilities;
+          if (
+            agent &&
+            capabilities?.selectAgent &&
+            typeof session.get === 'function'
+          ) {
+            const actual = (await api.get(childID)) as {agent?: unknown} | null;
+            checkActive();
+            if (actual?.agent === undefined || String(actual.agent) !== agent) {
+              throw new Error(
+                `child judge is running under agent ${String(actual?.agent ?? 'unset')}, not ${agent}`,
+              );
+            }
           }
-        }
+          const response = await api.prompt(childID, {
+            parts: [{type: 'text', text: buildJudgePrompt(goal, latestText)}],
+            agent,
+          });
+          checkActive();
+          let verdictText = extractChildVerdictText(response);
+          if (!verdictText) {
+            const session = (client as {session: {messages?: unknown}}).session;
+            if (typeof session.messages === 'function') {
+              const messages = await api.messages(childID, {limit: 10});
+              checkActive();
+              const latest = findLatestAssistantMessage(
+                Array.isArray(messages) ? messages : [],
+              );
+              verdictText = extractChildVerdictText(latest);
+            }
+          }
+          observedVerdict = parseJudgeVerdict(verdictText);
+          return observedVerdict;
+        },
+      );
+    } catch (error) {
+      // A cleanup fault cannot change an actual rejection into an approval,
+      // even when the caller opted into approval for unavailable judgments.
+      if (observedVerdict && !observedVerdict.approved) {
+        return {
+          approved: false,
+          reason: `${observedVerdict.reason}; judge error: ${childSessionErrorText(error)}`,
+        };
       }
+      return operationalFailure(`judge error: ${childSessionErrorText(error)}`);
     }
   };
+}
+
+function childSessionErrorText(error: unknown): string {
+  return error instanceof Error
+    ? error.message || String(error)
+    : String(error);
+}
+
+function combineChildSessionErrors(
+  first: unknown,
+  second: unknown,
+): AggregateError {
+  return new AggregateError(
+    [first, second],
+    `${childSessionErrorText(first)}; ${childSessionErrorText(second)}`,
+  );
+}
+
+/** Runs work and cleanup under one deadline, retaining ownership of late children. */
+async function runChildSession<T>(
+  client: unknown,
+  options: {
+    parentID: string;
+    sdkShape: 'flat' | 'legacy';
+    timeoutMs: number;
+    agent: string;
+    label: 'judge' | 'verifier';
+  },
+  work: (scope: {
+    api: OpenCodeSessionApi;
+    createChild: (input: Record<string, unknown>) => Promise<string>;
+    checkActive: () => void;
+    childPermissions: Record<string, unknown>;
+  }) => Promise<T>,
+): Promise<T> {
+  const session = (client as {session?: Record<string, unknown>} | undefined)
+    ?.session;
+  const capabilities = (
+    client as {sessionCapabilities?: SessionClientCapabilities} | undefined
+  )?.sessionCapabilities;
+  if (
+    typeof session?.create !== 'function' ||
+    typeof session?.prompt !== 'function'
+  ) {
+    throw new Error('child-session API unavailable');
+  }
+  // A host with no deletion operation cannot release a child at all.
+  if (
+    typeof session.delete !== 'function' ||
+    capabilities?.deleteSession === false
+  ) {
+    throw new Error('child-session cleanup unsupported by host');
+  }
+  const deadline = performance.now() + options.timeoutMs;
+  const controller = new AbortController();
+  const api = createSessionApiForJudge(
+    client,
+    options.sdkShape,
+    controller.signal,
+    capabilities?.promptAdmissionHook
+      ? async () => {
+          checkActive();
+          if (!childID) throw new Error('child session id unavailable');
+          const permissions = await readChildPermissions();
+          checkActive();
+          await api.update(childID, permissions);
+          checkActive();
+        }
+      : undefined,
+  );
+  let childID: string | undefined;
+  let timedOut = false;
+  let cleanupPromise: Promise<void> | undefined;
+  let primaryFailure: {error: unknown} | undefined;
+  const timeoutError = () =>
+    new Error(`${options.label} timed out after ${options.timeoutMs}ms`);
+  const checkActive = () => {
+    // A synchronous host operation can block the event loop past the deadline
+    // and then resolve in microtasks before the timeout callback runs.
+    if (timedOut || performance.now() >= deadline) throw timeoutError();
+  };
+  const readChildPermissions = async (): Promise<Record<string, unknown>> => {
+    const agentRules = api.agentPermissions
+      ? await api.agentPermissions(options.agent)
+      : [];
+    checkActive();
+    if (typeof session.get === 'function') {
+      const parent = await api.get(options.parentID);
+      checkActive();
+      return buildVerifierChildPermissions(
+        parent,
+        options.parentID,
+        agentRules,
+      );
+    }
+    return verifierCeilingPermissions(options.sdkShape, agentRules);
+  };
+  const cleanup = (): Promise<void> => {
+    if (!childID) return Promise.resolve();
+    const id = childID;
+    // Set the promise before invoking the host so timeout and run completion
+    // share the same deletion, including a rejection or an in-flight deletion.
+    cleanupPromise ??= Promise.resolve().then(async () => {
+      try {
+        await api.delete(id);
+      } catch (error) {
+        // v2's typed error can have an empty message. A generic 404 or a
+        // message containing "not found" does not establish that THIS child
+        // is gone; only the host's session error with the matching ID does.
+        if (isMissingSessionError(error, id)) return;
+        const failure = new Error(
+          `child-session cleanup failed: ${childSessionErrorText(error)}`,
+          {cause: error},
+        );
+        if (timedOut) {
+          // The caller may already have received its timeout receipt. Keep
+          // this later cleanup fault observable without starting a model turn.
+          console.error(
+            `[fixate-on] ${options.label} ${failure.message} after timeout (child ${id})`,
+          );
+        }
+        if (timedOut || options.label === 'judge') {
+          void Promise.resolve()
+            .then(() =>
+              defaultGoalMessenger(client, options.parentID, failure.message),
+            )
+            .catch(() => {});
+        }
+        throw failure;
+      }
+    });
+    return cleanupPromise;
+  };
+
+  let timerID: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<T>((_resolve, reject) => {
+    timerID = setTimeout(() => {
+      timedOut = true;
+      const error = timeoutError();
+      controller.abort(error);
+      reject(
+        primaryFailure
+          ? combineChildSessionErrors(primaryFailure.error, error)
+          : error,
+      );
+      if (childID && typeof session.abort === 'function') {
+        const id = childID;
+        void Promise.resolve()
+          .then(() => api.abort(id))
+          .catch(() => {});
+      }
+      // Cleanup must begin even if get/prompt never settles. If creation is
+      // still pending, the run path records and cleans its late child below.
+      void cleanup().catch(() => {});
+    }, options.timeoutMs);
+  });
+  const run = (async (): Promise<T> => {
+    let value!: T;
+    try {
+      // Preserve the parent's read restrictions while imposing the verifier's
+      // read-only ceiling. When the host exposes session.get, propagate lookup
+      // or validation failures (fail closed) rather than widening beyond parent
+      // denials; only fall back to the ceiling when session.get is absent.
+      const policy = await readChildPermissions();
+      // v2 activation can still be applying configuration when recovery starts.
+      // Keep the child inert until the post-activation prompt hook installs the
+      // freshly resolved policy. Even a host that skips the hook cannot grant
+      // read access using an incomplete policy captured during startup.
+      const childPermissions = capabilities?.promptAdmissionHook
+        ? Object.hasOwn(policy, 'permissions')
+          ? {permissions: [{action: '*', resource: '*', effect: 'deny'}]}
+          : {permission: [{permission: '*', pattern: '*', action: 'deny'}]}
+        : policy;
+      value = await work({
+        api,
+        checkActive,
+        childPermissions,
+        createChild: async input => {
+          checkActive();
+          const created = (await api.createChild(options.parentID, input)) as {
+            id?: unknown;
+            sessionID?: unknown;
+            parentID?: unknown;
+          } | null;
+          const id = created?.id || created?.sessionID;
+          if (typeof id !== 'string' || !id)
+            throw new Error('child session id unavailable');
+          childID = id;
+          // Remember the ID before every guard: any failure, including a
+          // late or incorrectly parented creation, still owns cleanup.
+          checkActive();
+          if (
+            created?.parentID !== undefined &&
+            created.parentID !== options.parentID
+          ) {
+            throw new Error(
+              'child session parent relationship was not preserved',
+            );
+          }
+          if (options.agent && capabilities?.selectAgent) {
+            await capabilities.selectAgent(id, options.agent);
+            checkActive();
+          }
+          return id;
+        },
+      });
+    } catch (error) {
+      primaryFailure = {error};
+    }
+    try {
+      await cleanup();
+    } catch (error) {
+      throw primaryFailure
+        ? combineChildSessionErrors(primaryFailure.error, error)
+        : error;
+    }
+    if (primaryFailure) throw primaryFailure.error;
+    checkActive();
+    return value;
+  })();
+  try {
+    // The race observes the run's eventual rejection even when timeout wins.
+    // A COMPLETE value cannot escape before cleanup succeeds.
+    return await Promise.race([run, timeout]);
+  } finally {
+    if (timerID !== undefined) clearTimeout(timerID);
+  }
 }
 
 function createSessionApiForJudge(
   client: unknown,
   sdkShape: 'flat' | 'legacy',
+  signal?: AbortSignal,
+  beforePromptAdmission?: () => Promise<void>,
 ): OpenCodeSessionApi {
-  return createOpenCodeSessionApi(client, {preferredShape: sdkShape});
+  return createOpenCodeSessionApi(client, {
+    preferredShape: sdkShape,
+    signal,
+    requireFreshMessages: true,
+    beforePromptAdmission,
+  });
 }
 
 export interface VerifierOptions {
@@ -583,112 +759,97 @@ export function createChildSessionVerifier(
     // the child location (a host that ignores the field behaves as before).
     const location = cwd ? {directory: cwd} : undefined;
 
-    const c = client as
-      | {
-          session?: {
-            create?: (...args: unknown[]) => Promise<unknown>;
-            prompt?: (...args: unknown[]) => Promise<unknown>;
-            messages?: (...args: unknown[]) => Promise<unknown>;
-            abort?: (...args: unknown[]) => Promise<unknown>;
-            delete?: (...args: unknown[]) => Promise<unknown>;
-          };
-        }
-      | undefined;
-
-    let childID: string | undefined;
-    let timedOut = false;
-    let cleanupCompleted = false;
-
-    const run = async (): Promise<CompletionVerdict> => {
-      if (!c?.session?.create || !c?.session?.prompt) {
-        throw new Error('child-session API unavailable');
-      }
-
-      const sessionApi = createSessionApiForJudge(client, sdkShape);
-      const created = await sessionApi.createChild(goal.sessionID, {
-        title: 'goal completion verification',
-        ...(location ? {location} : {}),
-      });
-      const createdObj = created as {
-        id?: string;
-        sessionID?: string;
-        parentID?: string;
-      } | null;
-      childID = createdObj?.id || createdObj?.sessionID;
-      if (!childID) throw new Error('child session id unavailable');
-      if (
-        createdObj?.parentID !== undefined &&
-        createdObj.parentID !== goal.sessionID
-      ) {
-        throw new Error('child session parent relationship was not preserved');
-      }
-
-      if (timedOut) {
-        // The timeout may win while createChild is still in flight. The
-        // outer finally ran before childID became known, so clean up this
-        // late-created child here before reporting the timeout.
-        if (typeof c?.session?.delete !== 'function') {
-          throw new Error(
-            'verifier timed out; child-session cleanup unsupported by host',
-          );
-        }
-        try {
-          await sessionApi.delete(childID);
-          cleanupCompleted = true;
-        } catch (error) {
-          throw new Error(
-            `verifier timed out; child-session cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
-          );
-        }
-        throw new Error(`verifier timed out after ${timeoutMs}ms`);
-      }
-
-      const response = await sessionApi.prompt(childID, {
-        parts: [
-          {
-            type: 'text',
-            text: buildVerdictPrompt(goal, latestText, candidateIdentity),
-          },
-        ],
-        agent,
-      });
-
-      let verdictText = extractJudgeVerdictText(response);
-      if (!verdictText && c.session.messages) {
-        const messages = await sessionApi.messages(childID, {limit: 10});
-        const latest = findLatestAssistantMessage(
-          Array.isArray(messages) ? messages : [],
-        );
-        verdictText = getTextFromParts(
-          (latest as {parts?: unknown[]} | null)?.parts,
-        );
-      }
-      return parseVerdictFromJudge(verdictText, taskId);
-    };
-
-    let timerID: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<CompletionVerdict>((resolve, reject) => {
-      timerID = setTimeout(() => {
-        timedOut = true;
-        reject(new Error(`verifier timed out after ${timeoutMs}ms`));
-        if (childID && typeof c?.session?.abort === 'function') {
-          const abortApi = createSessionApiForJudge(client, sdkShape);
-          void abortApi.abort(childID).catch(() => {});
-        }
-      }, timeoutMs);
-    });
-
-    const runPromise = run();
-    runPromise.catch(() => {});
     try {
-      const result = await Promise.race([runPromise, timeout]);
-      return result;
+      return await runChildSession(
+        client,
+        {
+          parentID: goal.sessionID,
+          sdkShape,
+          timeoutMs,
+          agent,
+          label: 'verifier',
+        },
+        async ({api, createChild, checkActive, childPermissions}) => {
+          const childID = await createChild({
+            title: 'goal completion verification',
+            ...(location ? {location} : {}),
+            ...childPermissions,
+          });
+          const session = (client as {session: Record<string, unknown>})
+            .session;
+          const capabilities = (
+            client as
+              {sessionCapabilities?: SessionClientCapabilities} | undefined
+          )?.sessionCapabilities;
+          const validateWorkspace = async () => {
+            if (typeof session.get !== 'function') return;
+            const actual = (await api.get(childID)) as {
+              agent?: unknown;
+              directory?: unknown;
+              location?: {directory?: unknown};
+            } | null;
+            checkActive();
+            const rawDir = actual?.location?.directory ?? actual?.directory;
+            const actualDir = typeof rawDir === 'string' ? rawDir : undefined;
+            const expectedDir = cwd ? canonicalPath(cwd) : undefined;
+            if (
+              expectedDir &&
+              (!actualDir ||
+                !actualDir.trim() ||
+                canonicalPath(actualDir) !== expectedDir)
+            ) {
+              throw new Error(
+                'child verifier workspace location does not match the goal workspace',
+              );
+            }
+            if (agent) {
+              if (capabilities?.selectAgent) {
+                if (
+                  actual?.agent === undefined ||
+                  String(actual.agent) !== agent
+                ) {
+                  throw new Error(
+                    `child verifier is running under agent ${String(actual?.agent ?? 'unset')}, not ${agent}`,
+                  );
+                }
+              } else if (actual?.agent && String(actual.agent) !== agent) {
+                throw new Error(
+                  `child verifier is running under agent ${String(actual.agent)}, not ${agent}`,
+                );
+              }
+            }
+          };
+          await validateWorkspace();
+          checkActive();
+          const response = await api.prompt(childID, {
+            parts: [
+              {
+                type: 'text',
+                text: buildVerdictPrompt(goal, latestText, candidateIdentity),
+              },
+            ],
+            agent,
+          });
+          checkActive();
+          let verdictText = extractChildVerdictText(response);
+          if (!verdictText && typeof session.messages === 'function') {
+            const messages = await api.messages(childID, {limit: 10});
+            checkActive();
+            const latest = findLatestAssistantMessage(
+              Array.isArray(messages) ? messages : [],
+            );
+            verdictText = extractChildVerdictText(latest);
+          }
+          // The host can move a session while its turn is running. Validate
+          // again before returning an attestation about this workspace.
+          await validateWorkspace();
+          return parseVerdictFromJudge(verdictText, taskId);
+        },
+      );
     } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
+      const msg = childSessionErrorText(error);
       if (failurePolicy === 'approve') {
-        // fail-open: synthesize a WORKING verdict (still NOT COMPLETE) so
-        // bounded recovery continues. This is the only fail-open path and
-        // it never fabricates COMPLETE.
+        // Operational faults, including cleanup, synthesize WORKING only.
         return {
           schema_version: 1,
           task_id: taskId,
@@ -699,22 +860,7 @@ export function createChildSessionVerifier(
           evidence: ['verifier failed; fail-open policy synthesized WORKING'],
         };
       }
-      throw new Error(`verifier error: ${msg}`);
-    } finally {
-      if (timerID) clearTimeout(timerID);
-      if (childID && !cleanupCompleted) {
-        if (typeof c?.session?.delete !== 'function') {
-          throw new Error('child-session cleanup unsupported by host');
-        }
-        try {
-          await createSessionApiForJudge(client, sdkShape).delete(childID);
-          cleanupCompleted = true;
-        } catch (error) {
-          throw new Error(
-            `child-session cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
-          );
-        }
-      }
+      throw new Error(`verifier error: ${msg}`, {cause: error});
     }
   };
 }
@@ -724,7 +870,7 @@ export const childSessionJudgeInternals = Object.freeze({
   buildVerdictPrompt,
   parseJudgeVerdict,
   parseVerdictFromJudge,
-  extractJudgeVerdictText,
+  extractJudgeVerdictText: extractChildVerdictText,
   escapeGoalText,
   summarizeTailText,
   buildGoalBlock,

@@ -190,6 +190,46 @@ describe('every option a tracked config names is an option the plugin accepts', 
       );
     }
   });
+
+  test('v2 harness server and cli configs target a plugin directory with server.js and tui.js', () => {
+    const published = publishedOptionKeys();
+    const v2Configs = [
+      'hack/e2e-harness/cfg/opencode.json',
+      'hack/e2e-harness/cfg/cli.json',
+    ];
+    for (const relative of v2Configs) {
+      const raw = readFileSync(join(ROOT, relative), 'utf8');
+      const parsed = JSON.parse(raw) as {
+        plugins?: Array<
+          string | {package?: string; options?: Record<string, unknown>}
+        >;
+      };
+      expect(Array.isArray(parsed.plugins) && parsed.plugins.length > 0).toBe(
+        true,
+      );
+      for (const entry of parsed.plugins!) {
+        const pkg = typeof entry === 'string' ? entry : (entry.package ?? '');
+        expect(
+          pkg,
+          `${relative} must target a directory (v2.2+ rejects/skips .js files)`,
+        ).not.toMatch(/\.m?[jt]s$/);
+        expect(pkg).toContain('hack/e2e-harness/plugin-dir');
+      }
+      for (const {key, at} of pluginOptionKeys(parsed, relative)) {
+        expect(
+          published.has(key),
+          `${relative}: ${at} names unknown option "${key}"`,
+        ).toBe(true);
+      }
+      expect(raw).toContain('"stateRoot"');
+    }
+    expect(
+      existsSync(join(ROOT, 'hack/e2e-harness/plugin-dir/server.js')),
+    ).toBe(true);
+    expect(existsSync(join(ROOT, 'hack/e2e-harness/plugin-dir/tui.js'))).toBe(
+      true,
+    );
+  });
 });
 
 describe('the retired root-level state file stays unnamed', () => {

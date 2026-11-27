@@ -303,13 +303,14 @@ export interface GoalsPluginOptions {
    * progress, so a hung tool call cannot hold the goal open.
    * @default 1800000 */
   maxDurationMs?: number;
-  /** The maximum context-token budget a goal may use before it is stopped for
-   * exceeding a limit. Set it for one goal with `--max-tokens`, or with the
-   * `--budget` shorthand, which takes a `k` or `m` suffix such as `100k` or `1.5m`.
+  /** Optional cumulative context-token ceiling. By default, no context-token
+   * stop or wrap-up threshold is applied. Set a positive value for one goal
+   * with `--max-tokens`, or with the `--budget` shorthand, which takes a `k` or
+   * `m` suffix such as `100k` or `1.5m`; zero disables the ceiling.
    *
    * The count is cumulative over the whole goal (`totalTokens + compactionBaselineTokens`),
-   * so compaction does not reduce it. It is a ceiling, not a target.
-   * @default 1000000 */
+   * so compaction does not reduce it.
+   * @default 0 */
   maxTokens?: number;
   /** The minimum delay, in milliseconds, between two auto-continue prompts. Set it
    * for one goal with `--cooldown-ms`.
@@ -378,13 +379,13 @@ export interface GoalsPluginOptions {
    * @default '<cwd>/.opencode/goals' */
   stateRoot?: string;
   /** The workspace directory used to resolve `stateRoot` and other relative paths.
-   * The v2 Context does not expose the host's workspace location to plugins. A v2
-   * host whose `process.cwd` differs from the project, for example a from-source
-   * checkout that changes directory before it starts the CLI, must pass the
-   * workspace path here. When the option is absent the plugin uses
-   * `process.cwd`, which is correct for v1 hosts and for installed v2 binaries
-   * that set their own working directory.
-   * @default process.cwd */
+   * On a v2 host the plugin reads the workspace from `ctx.location.directory` when
+   * this option is absent; `process.cwd()` is the last fallback, which is correct
+   * for v1 hosts and for installed v2 binaries that set their own working
+   * directory. Pass the workspace path here only when the host's `process.cwd`
+   * differs from the project, for example a from-source checkout that changes
+   * directory before it starts the CLI.
+   * @default ctx.location.directory on v2, otherwise process.cwd */
   workspaceDirectory?: string;
   /** The maximum size, in bytes, of one lifecycle-ledger generation. Each session has
    * its own ledger at `<sessions>/<sessionID>/state.json.ledger.jsonl`.
@@ -438,9 +439,12 @@ export interface GoalsPluginOptions {
    * No host-visible channel is used, because the v1 `client.tui.publish` endpoint
    * shows every envelope as a toast. */
   tuiTransport?: GoalTuiPublishFn;
-  /** Whether the plugin installs its `command.execute.before` hook. Set it to
-   * `false` if you only want auto-continue and persistence, driven through
-   * {@link registerTools}, and do not want the plugin to own a slash command.
+  /** Whether the plugin owns the slash command: through the
+   * `command.execute.before` hook on 1.x hosts, and through the v2 Context's
+   * `command.transform` (registering its own `goal` command, overriding the
+   * built-in `opencode.goal`) on 2.x hosts. Set it to `false` if you only want
+   * auto-continue and persistence, driven through {@link registerTools}, and do
+   * not want the plugin to own a slash command.
    * @default true */
   registerCommand?: boolean;
   /** Whether the plugin registers the agent-facing goal tools
@@ -455,8 +459,10 @@ export interface GoalsPluginOptions {
    * is a version floor, not an import.
    * @default true */
   registerTools?: boolean;
-  /** Register the `goal` and `goal-verify` agents through OpenCode's config hook.
-   * An existing agent with either name is left unchanged.
+  /** Register the `goal` and `goal-verify` agents: through OpenCode's config hook
+   * on 1.x hosts, and through the v2 Context's `agent.transform` on 2.x hosts
+   * (which never call the 1.x config hook). An existing agent with either name
+   * is left unchanged.
    * @default true */
   registerAgents?: boolean;
   /** The name of the goal agent the plugin registers. @default "goal" */

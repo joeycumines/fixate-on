@@ -324,7 +324,7 @@ describe('multi-goal execution: one idle drives EVERY unfinished goal', () => {
     expect(session.machines[1]!.state.turnCount).toBe(2);
   });
 
-  test('autoPromote only promotes a QUEUED candidate, never a user-paused one (D8)', async () => {
+  test('autoPromote only promotes a QUEUED candidate, never a user-paused one', async () => {
     // D8: the promotion loop read the FOCUSED goal's terminality and never the
     // CANDIDATE's stopReason. A queued successor is the only valid promotion
     // target; a candidate parked by the user (or by a brake) must stay parked,
@@ -702,7 +702,7 @@ describe('token accounting covers EVERY goal in the session', () => {
   });
 });
 
-describe('v2 usage events feed token accounting (FX-H)', () => {
+describe('v2 usage events feed token accounting', () => {
   test('session.usage.updated accrues usage to every non-terminal goal across steps', async () => {
     const session = new MultiGoalSession([
       ['goal-A', 'Alpha usage'],
@@ -815,7 +815,7 @@ describe('v2 usage events feed token accounting (FX-H)', () => {
     expect(a.cost).toBeCloseTo(0.02);
   });
 
-  test('FX-H magnitude: N steps of cumulative usage charge the FINAL total, not N times it', async () => {
+  test('cumulative usage magnitude: N steps charge the final total, not N times it', async () => {
     // The defect this locks (Run-9 BLK-9.1): session.usage.updated carries the
     // session's RUNNING TOTAL. Charging each event in full made a goal's usage
     // grow with the SQUARE of the step count, so the token budget fired at a

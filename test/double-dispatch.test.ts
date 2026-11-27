@@ -315,6 +315,41 @@ describe('v1 double-dispatch guard (hook + command template)', () => {
 });
 
 describe('command dispatch ledger semantics', () => {
+  test('a tab-separated pause no-op cannot pause a goal again after a later resume', async () => {
+    const hooks = await makePlugin();
+    const sessionID = 'dd-tabbed-pause-after-resume';
+    try {
+      await viaCommandHook(hooks, sessionID, 'add preserve the newer resume');
+      const id = await focusedGoalId(hooks, sessionID);
+      await viaCommandHook(hooks, sessionID, 'pause');
+      const noOp = await viaCommandHook(hooks, sessionID, `pause\t${id}`);
+      expect(noOp).toContain('already paused');
+      await viaCommandHook(hooks, sessionID, `resume ${id}`);
+      expect(await goalStatus(hooks, sessionID)).toBe('active');
+      const replay = await viaGoalCommandTool(hooks, sessionID, `pause\t${id}`);
+      expect(replay).toContain('already paused');
+      expect(await goalStatus(hooks, sessionID)).toBe('active');
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  for (const line of [
+    'clear\tmissing',
+    'stop\tmissing',
+    'accept-proposal\tid',
+    'focus\t1',
+  ]) {
+    test(`records no-op mutation using execution syntax: ${JSON.stringify(line)}`, () => {
+      const sessionID = `dd-parsed-${line}`;
+      markCommandDispatch(sessionID, line, 'Original outcome', '', false);
+      expect(consumeCommandDispatch(sessionID, line)).toEqual({
+        result: 'Original outcome',
+        receipt: '',
+      });
+    });
+  }
+
   test('state-moving dispatches are consumed once, then no longer match', () => {
     markCommandDispatch(
       'ledger-once',

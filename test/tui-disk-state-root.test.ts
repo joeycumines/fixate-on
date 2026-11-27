@@ -49,6 +49,17 @@ function goalIn(sessionID: string, goalId: string): Record<string, unknown> {
   };
 }
 
+test('legacy dashboard snapshots without maxTokens use the unlimited default', () => {
+  const legacyGoal = goalIn('ses_legacy', 'g-legacy');
+  delete legacyGoal.maxTokens;
+
+  const [snapshot] = parseStateFileGoals(
+    JSON.stringify({goals: [legacyGoal]}),
+    'ses_legacy',
+  );
+  expect(snapshot?.maxTokens).toBe(0);
+});
+
 /** A per-session state file, written the way the plugin writes it. */
 async function writeSession(
   directory: string,

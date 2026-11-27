@@ -5,6 +5,13 @@ import {
   unlink as fsUnlink,
 } from 'node:fs/promises';
 
+export interface PortableWriteCommit {
+  /** Synchronous final guard after staging; throwing leaves the old file intact. */
+  beforeInstall: () => void;
+  /** Non-throwing publication in the same JavaScript turn as atomic replacement. */
+  afterInstall: () => void;
+}
+
 /**
  * Maximum state file size accepted by this plugin (16 MiB).
  * Prevents memory exhaustion when parsing corrupted or runaway workspace snapshots.
@@ -47,11 +54,12 @@ export async function portableWriteFile(
   filePath: string,
   data: string,
   mode: 0o600 | 0o700 = 0o600,
+  commit?: PortableWriteCommit,
 ): Promise<void> {
   const {dirname} = await import('node:path');
   const {open} = await import('node:fs/promises');
   const {randomUUID} = await import('node:crypto');
-  const {constants} = await import('node:fs');
+  const {constants, renameSync} = await import('node:fs');
 
   await fsMkdir(dirname(filePath), {recursive: true, mode: 0o700});
   const temporaryPath = `${filePath}.tmp-${randomUUID()}`;
@@ -85,21 +93,29 @@ export async function portableWriteFile(
       );
     }
 
+    // Guarded confirmations linearize at replacement: no command, intervention
+    // or disposal can run between this final guard, rename and publication.
+    // File creation, writing and fsync above remain asynchronous.
+    commit?.beforeInstall();
     // Attempt direct atomic rename (works on POSIX even if target exists).
     // On Windows, if destination exists, rename throws EPERM/EEXIST; fall back to staging backup.
     try {
-      await fsRename(temporaryPath, filePath);
+      if (commit) renameSync(temporaryPath, filePath);
+      else await fsRename(temporaryPath, filePath);
       installed = true;
     } catch (renameError) {
       if (!existing) throw renameError;
       backupPath = `${filePath}.bak-${randomUUID()}`;
-      await fsRename(filePath, backupPath);
+      if (commit) renameSync(filePath, backupPath);
+      else await fsRename(filePath, backupPath);
       try {
-        await fsRename(temporaryPath, filePath);
+        if (commit) renameSync(temporaryPath, filePath);
+        else await fsRename(temporaryPath, filePath);
         installed = true;
       } catch (fallbackError) {
         try {
-          await fsRename(backupPath, filePath);
+          if (commit) renameSync(backupPath, filePath);
+          else await fsRename(backupPath, filePath);
         } catch (restoreError) {
           throw new Error(
             `snapshot replacement failed and prior snapshot restore failed; prior snapshot preserved at ${backupPath}: ${
@@ -112,8 +128,9 @@ export async function portableWriteFile(
         }
         throw fallbackError;
       }
-      await fsUnlink(backupPath).catch(() => {});
     }
+    commit?.afterInstall();
+    if (backupPath) await fsUnlink(backupPath).catch(() => {});
 
     // Best-effort directory fsync for metadata durability on POSIX systems.
     try {

@@ -281,6 +281,24 @@ export function formatHistory(history: GoalLifecycleEvent[]): string {
   return lines.join('\n');
 }
 
+/**
+ * The full raw lifecycle trail, including bookkeeping `tracking`/`mutation`
+ * entries the signal-filtered {@link formatHistory} hides. Used by
+ * `/goal history --verbose` / `--full`.
+ */
+export function formatHistoryRaw(history: GoalLifecycleEvent[]): string {
+  if (history.length === 0) return 'No lifecycle events recorded.';
+  const lines: string[] = [];
+  for (const entry of history) {
+    lines.push(
+      `[${formatRelativeTime(entry.timestamp)}] ${entry.type}: ${String(
+        entry.detail ?? '',
+      )}`,
+    );
+  }
+  return lines.join('\n');
+}
+
 export function formatGoalList(
   goals: GoalState[],
   archived: GoalResult[],

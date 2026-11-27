@@ -70,8 +70,8 @@ export function budgetLimitNeeded(goal: GoalState): boolean {
 }
 
 /**
- * Checks if the context window is nearly full (>= 80% by default).
- * Advisory only: triggers a wrapup prompt without stopping the goal.
+ * Checks whether a configured context-token ceiling has reached its wrap-up
+ * threshold. Advisory only: it prompts for a wrap-up without stopping the goal.
  *
  * Incorporates compactionBaselineTokens so tokens consumed prior to the last
  * compaction are preserved, ensuring compaction does not bypass the budget.

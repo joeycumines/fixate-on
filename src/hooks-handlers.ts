@@ -20,6 +20,7 @@ import {
   isCommandTemplateEcho,
   isExplicitStopMessage,
   matchSlashEcho,
+  recordSlashEchoMessage,
 } from './command-dispatch.ts';
 import {USER_INTERVENTION_STOP_REASON} from './status-label.ts';
 import {escapeGoalText} from './escape.ts';
@@ -30,6 +31,11 @@ import {getTextFromParts} from './message-helpers.ts';
 import {isInternalAgent} from './agent-resolve.ts';
 import {brakeCeiling, brakeCeilingFormatted} from './brake-format.ts';
 import {copyGoalsToForkedSession, extractForkParentID} from './fork-bind.ts';
+import {
+  addToCappedIDSet,
+  recordEventInputDelivery,
+  resolveInputDeliveryFields,
+} from './session-runtime.ts';
 import {
   COMPACTION_LOOP_STOP_REASON,
   COMPACTION_LOOP_THRESHOLD,
@@ -131,37 +137,6 @@ export function createChatMessageHook(
       );
     });
 
-    if (
-      !isSynthetic &&
-      deps.runtime?.promptInFlightSessions.has(input.sessionID)
-    ) {
-      try {
-        await deps.sessionApi.abort?.(input.sessionID);
-      } catch {
-        // Best-effort abort; ignore failures.
-      }
-    }
-
-    const session = getSessionContext(input.sessionID);
-    if (!session) return;
-    const machines = sessionMachines(session);
-    if (machines.length === 0) return;
-    const hasRunnable = machines.some(m => {
-      const g = m.snapshot();
-      return g.status === 'active' || g.finalizing;
-    });
-    // Sessions with solely yielding goals still need this message to renew
-    // their yield timeout.
-    const hasYielding = machines.some(m => {
-      const g = m.snapshot();
-      return (
-        g.status === 'paused' &&
-        g.stopReason === USER_INTERVENTION_STOP_REASON &&
-        !m.isTerminal()
-      );
-    });
-    if (!hasRunnable && !hasYielding) return;
-
     if (isSynthetic) return;
 
     const text = getTextFromParts(output?.parts);
@@ -183,11 +158,39 @@ export function createChatMessageHook(
     if (isCommandTemplateEcho(text)) return;
 
     // Ignore bare arguments echoing a just-dispatched fingerprint within its time window.
-    if (matchSlashEcho(input.sessionID, text)) return;
+    if (matchSlashEcho(input.sessionID, text)) {
+      recordSlashEchoMessage(
+        input.sessionID,
+        (input as {messageID?: string}).messageID,
+      );
+      return;
+    }
 
     // Latest user instruction takes precedence session-wide: pause every active goal.
     // Explicit stop directives remain paused; regular text can be re-armed later.
     const explicitStop = isExplicitStopMessage(text);
+    if (deps.runtime?.canDriveSession?.(input.sessionID) === false) return;
+    // Record before any await and before checking for machines. Replacement
+    // removes the old goal before persisting/creating the new one; a stop in
+    // that gap still cancels the older command's eventual activation.
+    deps.runtime?.userInterventions.set(input.sessionID, {
+      stopReason: explicitStop
+        ? 'explicit pause'
+        : USER_INTERVENTION_STOP_REASON,
+    });
+    deps.runtime?.continuationControllers.get(input.sessionID)?.abort();
+    if (deps.runtime?.promptInFlightSessions.has(input.sessionID)) {
+      // Host interruption can wait for a running tool. Pause plugin state
+      // immediately; waiting for that response would keep admission open.
+      void Promise.resolve()
+        .then(() => deps.sessionApi.abort?.(input.sessionID))
+        .catch(() => {});
+    }
+
+    const session = getSessionContext(input.sessionID);
+    if (!session) return;
+    const machines = sessionMachines(session);
+    if (machines.length === 0) return;
     let pausedAny = false;
     for (const machine of machines) {
       const g = machine.snapshot();
@@ -382,12 +385,48 @@ export function createEventHook(
 
     // Guard against modifying sessions not owned by this process host instance.
     // Unchecked state mutations would otherwise overwrite valid session token metrics.
+    // Delivery recording also stays below this guard: unowned sessions must not
+    // allocate entries in the runtime's per-session delivery sets.
     if (
       sessionID &&
       runtime?.canDriveSession &&
       !runtime.canDriveSession(sessionID)
     )
       return;
+
+    // Record inbox delivery mode so the idle path can tell interrupting ("steer")
+    // input from queued ("queue") input. OpenCode 2.x emits session.inbox.enqueued
+    // (item.delivery) and session.inbox.delivery.changed (delivery); newer hosts
+    // emit session.input.admitted (input.delivery) / session.input.queued /
+    // session.input.steered (mode implied by the event type). One shared helper
+    // resolves the fields; the id field is inboxID on the inbox events and
+    // inputID on the input events.
+    if (
+      sessionID &&
+      (eventType === 'session.inbox.enqueued' ||
+        eventType === 'session.inbox.delivery.changed' ||
+        eventType === 'session.input.admitted' ||
+        eventType === 'session.input.queued' ||
+        eventType === 'session.input.steered')
+    ) {
+      recordEventInputDelivery(
+        runtime,
+        (event?.properties ?? event ?? {}) as Record<string, unknown>,
+        eventType,
+        sessionID,
+      );
+      const {id: inputID, delivery} = resolveInputDeliveryFields(
+        (event?.properties ?? event ?? {}) as Record<string, unknown>,
+        eventType,
+        sessionID,
+      );
+      const hasLiveGoal = (runtime?.sessionGoals.get(sessionID) ?? []).some(
+        m => !m.isTerminal(),
+      );
+      if (inputID && delivery === 'queue' && !hasLiveGoal && runtime) {
+        addToCappedIDSet(runtime.surfacedQueuedMessageIDs, sessionID, inputID);
+      }
+    }
 
     // Track liveness for sessions delivered directly by the host in this process.
     // Exclude synthetic poller IDs so stale sessions are not inadvertently marked live.
@@ -429,6 +468,9 @@ export function createEventHook(
             runtime,
             session,
             true,
+            message =>
+              deps.announceGoalDecision?.(sessionID, message) ??
+              Promise.resolve(),
           );
         }
       } catch (error) {
@@ -509,6 +551,7 @@ export function createEventHook(
               g.noProgressTurns = 0;
               g.noToolCallTurns = 0;
               g.lastCountedProgressMessageID = '';
+              g.stalledTurnCounted = false;
               g.lastNoToolCallMessageID = '';
             },
             {
@@ -546,6 +589,16 @@ export function createEventHook(
 
     if (eventType === 'session.execution.failed') {
       if (sessionID && typeof sessionID === 'string') {
+        // A model hook can reject a late cancelled kickoff after a replacement
+        // goal has become active. Its owned receipt is not a provider failure
+        // of that newer goal and must not change its admission revision.
+        if (
+          runtime?.isKickoffCancellationError?.(
+            sessionID,
+            event?.properties?.error,
+          )
+        )
+          return;
         const session = getSessionContext(sessionID);
         const machines = sessionMachines(session);
         let changed = false;

@@ -14,6 +14,7 @@ import {
   portableFileExists,
   portableFileSize,
   portableWriteFile,
+  type PortableWriteCommit,
 } from './fs-portable.ts';
 import {
   lstat as fsLstat,
@@ -21,6 +22,7 @@ import {
   unlink as fsUnlink,
 } from 'node:fs/promises';
 import {toNonNegativeInteger} from './accounting.ts';
+import {SESSION_ID_PATTERN} from './session-paths.ts';
 import {
   capString,
   deserializeGoal,
@@ -233,6 +235,8 @@ export interface RecoveredState {
   sessionOrdered: string[];
   invalidatedGoalIds: string[];
   pendingIntents: SerializedPendingIntent[];
+  unconfirmedKickoffInputs?: Array<{sessionID: string; inputID: string}>;
+  kickoffInputHistoryKnown?: boolean;
   settlementReceipts: SettlementReceipt[];
   focusedGoalIds: Array<{sessionID: string; goalId: string}>;
   /**
@@ -247,6 +251,9 @@ export interface RecoveredState {
    * erase snapshot-only records (results, focus pointers, settlement receipts).
    */
   snapshotOverCeiling: boolean;
+  snapshotReadable?: boolean;
+  /** Existing snapshot-only records cannot be reconstructed from the goal WAL. */
+  snapshotUnreadable?: boolean;
 }
 
 /**
@@ -276,6 +283,7 @@ export async function recoverState(
     focusedGoalIds: [],
   };
   let snapshotOverCeiling = false;
+  let snapshotReadable = false;
   if (exists) {
     try {
       const {text, truncated} = await readBoundedText(statePath);
@@ -286,12 +294,41 @@ export async function recoverState(
         );
       }
       const raw = JSON.parse(text);
+      const unconfirmed = raw.unconfirmedKickoffInputs;
+      if (
+        raw.kickoffInputHistoryKnown !== undefined &&
+        typeof raw.kickoffInputHistoryKnown !== 'boolean'
+      )
+        throw new Error('invalid kickoff input history marker');
+      if (
+        unconfirmed !== undefined &&
+        (!Array.isArray(unconfirmed) ||
+          unconfirmed.some(
+            (entry: unknown) =>
+              !entry ||
+              typeof entry !== 'object' ||
+              typeof (entry as {sessionID?: unknown}).sessionID !== 'string' ||
+              !SESSION_ID_PATTERN.test(
+                (entry as {sessionID: string}).sessionID,
+              ) ||
+              typeof (entry as {inputID?: unknown}).inputID !== 'string' ||
+              !(entry as {inputID: string}).inputID.trim() ||
+              (entry as {inputID: string}).inputID.trim() !==
+                (entry as {inputID: string}).inputID,
+          ))
+      ) {
+        // Losing one of these guards could replay an input cancelled before a
+        // crash. Refuse to overwrite the snapshot rather than dropping it.
+        throw new Error('invalid unconfirmed kickoff input records');
+      }
       const version = Number(raw.version ?? STATE_VERSION);
       if (version !== STATE_VERSION) {
         throw new Error(`unsupported state version: ${version}`);
       }
       snapshot = {
         version,
+        unconfirmedKickoffInputs: unconfirmed ?? [],
+        kickoffInputHistoryKnown: raw.kickoffInputHistoryKnown,
         goals: Array.isArray(raw.goals)
           ? raw.goals.slice(0, MAX_PERSISTED_ENTRIES)
           : [],
@@ -351,6 +388,7 @@ export async function recoverState(
               .filter(r => r.sessionID !== '' && r.goalId !== '')
           : [],
       };
+      snapshotReadable = true;
     } catch {
       // Corrupted state file — fall back to WAL only.
     }
@@ -461,9 +499,15 @@ export async function recoverState(
     sessionOrdered: snapshot.sessionOrdered,
     invalidatedGoalIds: [...invalidatedGoalIds],
     pendingIntents,
+    unconfirmedKickoffInputs: snapshot.unconfirmedKickoffInputs ?? [],
+    kickoffInputHistoryKnown:
+      snapshotReadable && snapshot.kickoffInputHistoryKnown !== false,
     settlementReceipts: snapshot.settlementReceipts ?? [],
     focusedGoalIds: snapshot.focusedGoalIds ?? [],
     snapshotOverCeiling,
+    snapshotReadable,
+    snapshotUnreadable:
+      !snapshotReadable && (exists || wal.entries.length > 0 || wal.truncated),
     ledgerOverCeiling: wal.truncated,
   };
 }
@@ -481,6 +525,9 @@ export async function writeStateFile(
   pendingIntents: SerializedPendingIntent[] = [],
   settlementReceipts: SettlementReceipt[] = [],
   focusedGoalIds: Array<{sessionID: string; goalId: string}> = [],
+  unconfirmedKickoffInputs: Array<{sessionID: string; inputID: string}> = [],
+  kickoffInputHistoryKnown?: boolean,
+  commit?: PortableWriteCommit,
 ): Promise<boolean> {
   const cappedIntents = pendingIntents
     .slice(0, MAX_PERSISTED_ENTRIES)
@@ -495,10 +542,21 @@ export async function writeStateFile(
     pendingIntents: cappedIntents,
     settlementReceipts: settlementReceipts.slice(-256),
     focusedGoalIds: focusedGoalIds.slice(0, MAX_PERSISTED_ENTRIES),
+    // These guards cannot be truncated until the host confirms their input
+    // can no longer execute. Admission enforces a cap without eviction.
+    unconfirmedKickoffInputs,
+    ...(kickoffInputHistoryKnown !== undefined
+      ? {kickoffInputHistoryKnown}
+      : {}),
   };
   try {
     // portableWriteFile applies permissions through the open descriptor to avoid symlink replacement races.
-    await portableWriteFile(statePath, JSON.stringify(state, null, 2), 0o600);
+    await portableWriteFile(
+      statePath,
+      JSON.stringify(state, null, 2),
+      0o600,
+      commit,
+    );
     return true;
   } catch {
     return false;

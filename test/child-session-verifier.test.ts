@@ -1,8 +1,11 @@
 import {describe, expect, test} from 'bun:test';
 import {
   buildVerdictPrompt,
+  createChildSessionVerifier,
   parseVerdictFromJudge,
 } from '../src/child-session-verifier.ts';
+import {VERIFIER_SESSION_PERMISSIONS} from '../src/plugin-v2-tools-agents.ts';
+import {verifierSessionID, verifierSessionInfo} from './verifier-fixtures.ts';
 import type {GoalState} from '../src/state-machine.ts';
 import {createGoalState} from '../src/state-machine.ts';
 import type {CandidateIdentity} from '../src/completion-gate.ts';
@@ -424,5 +427,307 @@ describe('verdict prompt is falsification-first', () => {
     expect(prompt).toContain('"schema_version":1');
     expect(prompt).toContain('evidence MUST have at least one entry');
     expect(prompt).toContain('outstanding MUST be empty');
+  });
+});
+
+describe('verifier child-session isolation', () => {
+  function makeClient(child: unknown): {
+    session: Record<string, (...args: unknown[]) => Promise<unknown>>;
+  } {
+    return {
+      session: {
+        create: async () => child,
+        get: async (arg: unknown) => {
+          const rec = arg as {sessionID?: string; path?: {id?: string}} | null;
+          const id = rec?.sessionID ?? rec?.path?.id;
+          if (id === 'session-1') {
+            return {
+              id: 'session-1',
+              location: {directory: '/target/workspace'},
+              permissions: [],
+            };
+          }
+          return child;
+        },
+        prompt: async () => ({
+          parts: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                schema_version: 1,
+                task_id: 'goal-123',
+                state: 'WORKING',
+                outstanding: ['not done'],
+                evidence: ['looked'],
+              }),
+            },
+          ],
+        }),
+        delete: async () => ({}),
+        abort: async () => ({}),
+        messages: async () => [],
+      },
+    };
+  }
+
+  const verdictArgs = {
+    cwd: '/target/workspace',
+    taskId: 'goal-123',
+    candidateIdentity: {candidate: 'c', fingerprint: 'f'},
+    goal: createGoalState('session-1', 'Ship the release', {
+      goalId: 'goal-123',
+      runId: 'r1',
+    }),
+    latestText: 'Done',
+  };
+
+  test('verifier rejects a child whose actual workspace differs from the goal cwd', async () => {
+    const wrong = {
+      id: 'child-1',
+      parentID: 'session-1',
+      agent: 'goal-verify',
+      location: {directory: '/other/workspace'},
+    };
+    const verifier = createChildSessionVerifier(makeClient(wrong), {});
+    await expect(verifier(verdictArgs as never)).rejects.toThrow(
+      /location|workspace/i,
+    );
+  });
+
+  test('verifier rejects a child running under an unexpected agent', async () => {
+    const wrong = {
+      id: 'child-1',
+      parentID: 'session-1',
+      agent: 'build',
+      location: {directory: '/target/workspace'},
+    };
+    const verifier = createChildSessionVerifier(makeClient(wrong), {});
+    await expect(verifier(verdictArgs as never)).rejects.toThrow(/agent/i);
+  });
+
+  test('verifier rejects a child with no readable location', async () => {
+    const wrong = {id: 'child-1', parentID: 'session-1', agent: 'goal-verify'};
+    const verifier = createChildSessionVerifier(makeClient(wrong), {});
+    await expect(verifier(verdictArgs as never)).rejects.toThrow(
+      /location|workspace/i,
+    );
+  });
+
+  test('verifier accepts a v1 child whose workspace is a top-level directory', async () => {
+    const child = {
+      id: 'child-v1',
+      parentID: 'session-1',
+      agent: 'goal-verify',
+      directory: '/target/workspace',
+    };
+    const client = makeClient(child);
+    const deleted: string[] = [];
+    const captureDeleteInput = (input: unknown): void => {
+      const record = input as {
+        sessionID?: unknown;
+        path?: {id?: unknown};
+        body?: {sessionID?: unknown};
+      };
+      deleted.push(
+        String(
+          record.sessionID ?? record.path?.id ?? record.body?.sessionID ?? '',
+        ),
+      );
+    };
+    client.session.delete = async input => {
+      captureDeleteInput(input);
+      return {};
+    };
+    const verdict = await createChildSessionVerifier(
+      client,
+      {},
+    )(verdictArgs as never);
+    expect(verdict.state).toBe('WORKING');
+    expect(deleted).toEqual(['child-v1']);
+  });
+
+  test('verifier deletes a child created after timeout even when get fails', async () => {
+    let resolveCreate: ((value: unknown) => void) | undefined;
+    const deleted: string[] = [];
+    let getCalls = 0;
+    const captureDeleteInput = (input: unknown): void => {
+      const record = input as {
+        sessionID?: unknown;
+        path?: {id?: unknown};
+        body?: {sessionID?: unknown};
+      };
+      deleted.push(
+        String(
+          record.sessionID ?? record.path?.id ?? record.body?.sessionID ?? '',
+        ),
+      );
+    };
+    const client = {
+      session: {
+        create: async () =>
+          await new Promise<unknown>(resolve => {
+            resolveCreate = resolve;
+          }),
+        get: async (arg: unknown) => {
+          if (verifierSessionID(arg) === 'session-1')
+            return verifierSessionInfo(arg, '/target/workspace');
+          getCalls += 1;
+          throw new Error('lookup failed');
+        },
+        prompt: async () => ({}),
+        delete: async (input: unknown) => {
+          captureDeleteInput(input);
+          return {};
+        },
+        abort: async () => ({}),
+        messages: async () => [],
+      },
+    };
+    const verdictPromise = createChildSessionVerifier(client, {timeoutMs: 5})(
+      verdictArgs as never,
+    );
+    const timedOut = expect(verdictPromise).rejects.toThrow(/timed out/);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    resolveCreate?.({id: 'late-child', parentID: 'session-1'});
+    await timedOut;
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(deleted).toEqual(['late-child']);
+    // Child lookups still throw; cleanup uses the retained ID and never
+    // consults that path. The one successful lookup reads the parent policy
+    // before creation.
+    expect(getCalls).toBe(0);
+  });
+
+  test('verifier deletes a late-created child whose location is invalid', async () => {
+    let resolveCreate: ((value: unknown) => void) | undefined;
+    const deleted: string[] = [];
+    const captureDeleteInput = (input: unknown): void => {
+      const record = input as {
+        sessionID?: unknown;
+        path?: {id?: unknown};
+        body?: {sessionID?: unknown};
+      };
+      deleted.push(
+        String(
+          record.sessionID ?? record.path?.id ?? record.body?.sessionID ?? '',
+        ),
+      );
+    };
+    const client = {
+      session: {
+        create: async () =>
+          await new Promise<unknown>(resolve => {
+            resolveCreate = resolve;
+          }),
+        get: async (arg: unknown) => {
+          const rec = arg as {sessionID?: string; path?: {id?: string}} | null;
+          if ((rec?.sessionID ?? rec?.path?.id) === 'session-1') {
+            return {
+              id: 'session-1',
+              location: {directory: '/target/workspace'},
+              permissions: [],
+            };
+          }
+          return {id: 'late-child', parentID: 'session-1'};
+        },
+        prompt: async () => ({}),
+        delete: async (input: unknown) => {
+          captureDeleteInput(input);
+          return {};
+        },
+        abort: async () => ({}),
+        messages: async () => [],
+      },
+    };
+    const verdictPromise = createChildSessionVerifier(client, {timeoutMs: 5})(
+      verdictArgs as never,
+    );
+    const timedOut = expect(verdictPromise).rejects.toThrow(/timed out/);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    resolveCreate?.({id: 'late-child', parentID: 'session-1'});
+    await timedOut;
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(deleted).toEqual(['late-child']);
+  });
+
+  test('verifier child is created with an explicit restrictive session permission policy', async () => {
+    // On v2 hosts a parent-bound child inherits the parent session's permission
+    // rules and the host applies session rules AFTER agent rules (last match
+    // wins), so a permissive parent would override the verifier agent's denies
+    // unless the child carries its own restrictive policy.
+    let capturedCreateInput: Record<string, unknown> | undefined;
+    let capturedCreateBody: Record<string, unknown> | undefined;
+    const client = {
+      session: {
+        create: async (input: unknown) => {
+          const i = input as Record<string, unknown>;
+          // The SDK shim calls create either flat ({...body}) or legacy
+          // ({body}); capture whichever carries the fields.
+          if (i.body && typeof i.body === 'object') {
+            capturedCreateBody = i.body as Record<string, unknown>;
+          } else {
+            capturedCreateInput = i;
+          }
+          return {id: 'child-1', parentID: 'session-1'};
+        },
+        get: async (arg: unknown) => {
+          const rec = arg as {sessionID?: string; path?: {id?: string}} | null;
+          if ((rec?.sessionID ?? rec?.path?.id) === 'session-1') {
+            return {
+              id: 'session-1',
+              location: {directory: '/target/workspace'},
+              permissions: [],
+            };
+          }
+          return {
+            id: 'child-1',
+            parentID: 'session-1',
+            location: {directory: '/target/workspace'},
+          };
+        },
+        prompt: async () => ({
+          parts: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                schema_version: 1,
+                task_id: 'goal-123',
+                state: 'WORKING',
+                outstanding: ['not done'],
+                evidence: ['looked'],
+              }),
+            },
+          ],
+        }),
+        delete: async () => ({}),
+        abort: async () => ({}),
+        messages: async () => [],
+      },
+    };
+    const verifier = createChildSessionVerifier(client, {});
+    await verifier({
+      cwd: '/target/workspace',
+      taskId: 'goal-123',
+      candidateIdentity: {candidate: 'c', fingerprint: 'f'},
+      goal: createGoalState('session-1', 'Ship the release', {
+        goalId: 'goal-123',
+        runId: 'r1',
+      }),
+      latestText: 'Done',
+    } as never);
+    const perms = (capturedCreateInput ?? capturedCreateBody)?.permissions as
+      Array<{action: string; resource: string; effect: string}> | undefined;
+    expect(Array.isArray(perms)).toBe(true);
+    // deny-all must be present and ordered FIRST so it cannot be overridden by
+    // later rules; mutation actions must be denied.
+    expect(perms![0]).toEqual({action: '*', resource: '*', effect: 'deny'});
+    for (const action of ['edit', 'write', 'patch', 'bash']) {
+      const rule = perms!.findLast(
+        r => r.action === action || r.action === '*',
+      );
+      expect(rule?.effect).toBe('deny');
+    }
+    // The policy must equal the shared VERIFIER_SESSION_PERMISSIONS constant.
+    expect(perms).toEqual(VERIFIER_SESSION_PERMISSIONS.map(r => ({...r})));
   });
 });

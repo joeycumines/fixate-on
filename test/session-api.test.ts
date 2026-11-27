@@ -289,3 +289,37 @@ test("TypeError that doesn't match shape patterns is not retried", async () => {
   );
   expect(calls).toBe(1);
 });
+
+test('requireFreshMessages unwraps SDK envelopes and propagates error envelopes', async () => {
+  const fresh = {role: 'assistant', text: 'latest verdict'};
+  const client = {
+    session: {
+      messages: async () => {
+        throw new Error('fresh read must use the capability');
+      },
+    },
+    sessionCapabilities: {
+      readFreshMessages: async (
+        _sessionID: string,
+        _options: {limit?: number},
+      ) => ({
+        data: [fresh],
+      }),
+    },
+  };
+  const api = createOpenCodeSessionApi(client, {requireFreshMessages: true});
+  expect(await api.messages('s1', {limit: 10})).toEqual([fresh]);
+
+  const failing = createOpenCodeSessionApi(
+    {
+      session: client.session,
+      sessionCapabilities: {
+        readFreshMessages: async () => ({
+          error: {message: 'context read failed'},
+        }),
+      },
+    },
+    {requireFreshMessages: true},
+  );
+  await expect(failing.messages('s1')).rejects.toThrow(/context read failed/);
+});

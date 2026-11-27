@@ -60,6 +60,10 @@ export interface CreateGoalOptions {
   /** Threshold for consecutive blocked turns before action (distinct from maxUnchangedResults). */
   maxBlockedTurns?: number;
   languageTriage?: boolean;
+  /** Internal command-admission state, persisted with the first creation record. */
+  kickoffAdmissionPending?: boolean;
+  /** Native command admission time, captured before any async replacement. */
+  userCommandStartedAt?: number;
 }
 
 export interface ToolSessionContext {

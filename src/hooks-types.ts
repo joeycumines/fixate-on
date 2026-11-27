@@ -15,6 +15,8 @@ import type {VerifierAvailability} from './steering.ts';
 
 export interface SessionApi {
   messages: (sessionID: string, opts?: {limit?: number}) => Promise<unknown[]>;
+  /** Authoritative cumulative totals on hosts that expose them. */
+  usage?: (sessionID: string) => Promise<unknown>;
   promptAsync: (
     sessionID: string,
     input: {parts: unknown[]},

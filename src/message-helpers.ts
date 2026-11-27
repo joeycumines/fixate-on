@@ -66,7 +66,7 @@ export function findLatestAssistantMessage(
  * `completed`); flat/legacy hosts put `time` or `createdAt` at the top level.
  * Returns null when nothing usable is present.
  */
-function messageCreatedAt(message: unknown): number | null {
+export function messageCreatedAt(message: unknown): number | null {
   if (!message || typeof message !== 'object') return null;
   const msg = message as Record<string, unknown>;
   const info = msg.info as Record<string, unknown> | undefined;
@@ -113,6 +113,24 @@ export function assistantTurnKey(message: unknown): string {
   return createdAt === null ? '' : `#${createdAt}`;
 }
 
+function hasComparableMonotonicIds(firstID: string, lastID: string): boolean {
+  if (
+    firstID.length <= 4 ||
+    firstID.length !== lastID.length ||
+    firstID === lastID
+  )
+    return false;
+  if (firstID.startsWith('msg_') && lastID.startsWith('msg_')) return true;
+  // Custom/legacy hosts may mint fixed-width monotonic ids with a different
+  // prefix family (e.g. "aaaa0002"). Accept them only when BOTH ids share the
+  // same alpha/underscore prefix followed by digits; mixed families ("u0" vs
+  // "m1") still decline so the array order is preserved.
+  const family = (id: string): string | undefined =>
+    /^([A-Za-z_]+)[0-9]+$/.exec(id)?.[1];
+  const firstFamily = family(firstID);
+  return firstFamily !== undefined && firstFamily === family(lastID);
+}
+
 /**
  * Return the NEWEST message from a `session.messages` result, regardless of
  * the order the host returned them in.
@@ -127,19 +145,20 @@ export function assistantTurnKey(message: unknown): string {
  * whole-list fallback: an empty/heuristic comparison is never mixed with
  * timestamps, so a partially-timestamped list cannot invert a known order.
  */
-export function findNewestMessage(messages: unknown[]): unknown | null {
-  if (!Array.isArray(messages) || messages.length === 0) return null;
+function collectAllTimestamps(messages: unknown[]): number[] | null {
   const times: number[] = [];
-  let allTimed = true;
   for (const message of messages) {
     const t = messageCreatedAt(message);
-    if (t === null) {
-      allTimed = false;
-      break;
-    }
+    if (t === null) return null;
     times.push(t);
   }
-  if (allTimed) {
+  return times;
+}
+
+export function findNewestMessage(messages: unknown[]): unknown | null {
+  if (!Array.isArray(messages) || messages.length === 0) return null;
+  const times = collectAllTimestamps(messages);
+  if (times !== null) {
     let bestIndex = 0;
     for (let i = 1; i < times.length; i++) {
       if (times[i] > times[bestIndex]) {
@@ -164,21 +183,16 @@ export function findNewestMessage(messages: unknown[]): unknown | null {
   // both hosts mint ascending ids whose first 12 characters after "msg_" are a
   // fixed-width hex encoding of (timestamp * 0x1000 + counter), so a string
   // compare corresponds to chronological order. The comparison requires matching
-  // lengths (e.g. 24 characters on v1, 30 on v2) to prevent false ordering from
-  // variable-width custom ids.
+  // `msg_` prefix and matching lengths (e.g. 24 chars on v1, 30 on v2) so
+  // mixed-prefix or variable-width mock/custom ids never invert array order.
   const first = messages[0];
   const last = messages[messages.length - 1];
   const firstID = getMessageID(first);
   const lastID = getMessageID(last);
-  if (
-    firstID &&
-    lastID &&
-    firstID !== lastID &&
-    firstID.length === lastID.length
-  ) {
+  if (hasComparableMonotonicIds(firstID, lastID)) {
     return lastID > firstID ? last : first;
   }
-  // Fall back to array order if ids are absent or have mismatched widths.
+  // Fall back to array order if ids are absent, mixed-prefix, or mismatched widths.
   return last ?? null;
 }
 
@@ -190,6 +204,35 @@ export function getMessageID(message: unknown): string {
   const msg = message as Record<string, unknown>;
   const info = msg.info as Record<string, unknown> | undefined;
   return String(msg.id ?? info?.id ?? '');
+}
+
+/**
+ * The host's inbox delivery mode for a user-role message, read structurally.
+ *
+ * OpenCode (both 1.x and 2.x through v2.2.5) distinguishes "steer" input — which
+ * wakes execution mid-turn and therefore genuinely interrupts the running agent —
+ * from "queue" input, which waits for the turn boundary and does not interrupt.
+ * The mode lives on the session inbox, not on the persisted message Info, so a
+ * message read back from `session.messages` carries it only when the host or an
+ * event payload annotates it (v2 `session.inbox.enqueued`/`delivery.changed`
+ * and `session.input.*` events). This reader accepts any of the structural
+ * placements: top-level `delivery`, `info.delivery`, or a nested
+ * `inbox`/`pending` object. It returns undefined when nothing carries the mode,
+ * which callers treat as "unknown" rather than as "steer".
+ */
+export function getMessageDelivery(message: unknown): string | undefined {
+  if (!message || typeof message !== 'object') return undefined;
+  const msg = message as Record<string, unknown>;
+  const candidates: unknown[] = [
+    msg.delivery,
+    (msg.info as Record<string, unknown> | undefined)?.delivery,
+    (msg.inbox as Record<string, unknown> | undefined)?.delivery,
+    (msg.pending as Record<string, unknown> | undefined)?.delivery,
+  ];
+  for (const candidate of candidates) {
+    if (candidate === 'steer' || candidate === 'queue') return candidate;
+  }
+  return undefined;
 }
 
 /**
@@ -262,6 +305,92 @@ export function windowHasToolCallNewerThan(
     if (id > referenceID) return true;
   }
   return false;
+}
+
+export function chronologicalMessages(messages: unknown[]): unknown[] {
+  if (!Array.isArray(messages) || messages.length < 2) return messages;
+  const times = collectAllTimestamps(messages);
+  if (times !== null) {
+    const firstTime = times[0]!;
+    const lastTime = times[times.length - 1]!;
+    if (firstTime !== lastTime) {
+      return firstTime > lastTime ? [...messages].reverse() : messages;
+    }
+  }
+  const firstID = getMessageID(messages[0]);
+  const lastID = getMessageID(messages[messages.length - 1]);
+  if (hasComparableMonotonicIds(firstID, lastID)) {
+    return firstID > lastID ? [...messages].reverse() : messages;
+  }
+  return messages;
+}
+
+/**
+ * Narrow a session message window to the current assistant cycle so historical
+ * tool calls from prior turns cannot indefinitely suppress `noToolCallTurns`.
+ */
+export function sliceCurrentCycleMessages(
+  messages: unknown[],
+  options: {
+    lastNoToolCallMessageID?: string;
+    lastAssistantMessageID?: string;
+    assistantRepeated?: boolean;
+    focusTurnKey?: string;
+    isQueuedMessage?: (message: unknown, id: string) => boolean;
+  },
+): unknown[] {
+  if (!Array.isArray(messages) || messages.length === 0) return [];
+  const ordered = chronologicalMessages(messages);
+  let startIdx = 0;
+
+  // Classify the cycle of the assistant turn being evaluated, not whatever
+  // message happens to be last. A duplicate idle after a synthetic continuation
+  // has no newer assistant yet; slicing from that unanswered prompt would cut
+  // the tool call out of the already-completed turn and miscount it as tool-free.
+  let scanEnd = ordered.length - 1;
+  if (options.focusTurnKey) {
+    for (let i = ordered.length - 1; i >= 0; i--) {
+      if (assistantTurnKey(ordered[i]) === options.focusTurnKey) {
+        scanEnd = i;
+        break;
+      }
+    }
+  }
+
+  const isQueued = (entry: unknown): boolean => {
+    const id = getMessageID(entry);
+    if (options.isQueuedMessage) return options.isQueuedMessage(entry, id);
+    return getMessageDelivery(entry) === 'queue';
+  };
+  for (let i = scanEnd; i >= 0; i--) {
+    const entry = ordered[i];
+    if (!entry || typeof entry !== 'object') continue;
+    const msg = entry as {info?: {role?: string}; role?: string};
+    const role = msg.info?.role ?? msg.role;
+    if (role === 'user' && !isQueued(entry)) {
+      startIdx = Math.max(startIdx, i + 1);
+      break;
+    }
+  }
+
+  const noToolRef = options.lastNoToolCallMessageID;
+  if (noToolRef) {
+    for (let i = ordered.length - 1; i >= startIdx; i--) {
+      if (assistantTurnKey(ordered[i]) === noToolRef) {
+        startIdx = Math.max(startIdx, i + 1);
+        break;
+      }
+    }
+  } else if (!options.assistantRepeated && options.lastAssistantMessageID) {
+    for (let i = ordered.length - 1; i >= startIdx; i--) {
+      if (getMessageID(ordered[i]) === options.lastAssistantMessageID) {
+        startIdx = Math.max(startIdx, i + 1);
+        break;
+      }
+    }
+  }
+
+  return startIdx > 0 ? ordered.slice(startIdx) : ordered;
 }
 
 /**

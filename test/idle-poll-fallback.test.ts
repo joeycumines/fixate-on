@@ -1,4 +1,4 @@
-// fxj-idle-poll.test.ts — FX-J locks: the continuation loop must wake on
+// idle-poll-fallback.test.ts — FX-J locks: the continuation loop must wake on
 // hosts that never deliver idle events (stock opencode 1.18.19 delivers ZERO
 // events to the plugin event hook — R2, confirmed by probe-plugin evidence),
 // plus the POL batch from the reset reviews (deferCounts GC, honest
@@ -123,7 +123,7 @@ function makeDeps(session: SessionContext, sessionApi: SessionApi): HookDeps {
   } as unknown as HookDeps;
 }
 
-describe('evaluateQuietWindow (FX-J stability gate)', () => {
+describe('evaluateQuietWindow stability gate', () => {
   const QUIET = 10_000;
 
   test('first sight opens the window without firing', () => {
@@ -166,7 +166,7 @@ describe('evaluateQuietWindow (FX-J stability gate)', () => {
   });
 });
 
-describe('FX-J synthetic idle wakes the loop without any host event delivery', () => {
+describe('synthetic idle wakes the loop without any host event delivery', () => {
   test('v1-poll event drives a continuation for an active goal', async () => {
     const machine = new GoalStateMachine(makeActiveGoal(), {
       onCommit: async () => {},
@@ -215,6 +215,30 @@ describe('FX-J synthetic idle wakes the loop without any host event delivery', (
       expect(api.promptsSent.length).toBe(0);
       expect(deps.runtime!.recoveryPendingSessions.has('session-1')).toBe(true);
       expect(machine.snapshot().status).toBe('paused');
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('a shared background-work deferral stops the fallback poller from synthesizing an idle', async () => {
+    const machine = new GoalStateMachine(makeActiveGoal(), {
+      onCommit: async () => {},
+    });
+    const api = makeMockSessionApi(makeWrappedAssistantMessages());
+    const deps = makeDeps(makeSessionContext(machine), api);
+    deps.runtime!.sessionGoals.set('session-1', [machine]);
+    deps.runtime!.liveSessions.add('session-1');
+    deps.runtime!.backgroundBlockedUntil.set('session-1', Date.now() + 30_000);
+    const hooks = createHooks({
+      ...deps,
+      idlePollerIntervalMs: 20,
+      idleQuietMs: 30,
+      idleGraceMs: 0,
+    });
+    try {
+      await new Promise(r => setTimeout(r, 250));
+      expect(api.promptsSent.length).toBe(0);
+      expect(machine.snapshot().status).toBe('active');
     } finally {
       await hooks.dispose?.();
     }

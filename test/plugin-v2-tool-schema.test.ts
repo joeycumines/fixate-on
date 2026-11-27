@@ -1,10 +1,13 @@
+import {existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
 import {expect, test} from 'bun:test';
+import {waitFor} from './wait-for.ts';
+import {createV2ClientShim, setup, shapeToolResult} from '../src/plugin-v2.ts';
 import {
-  createV2ClientShim,
   getV2EventSessionID,
-  setup,
-  shapeToolResult,
-} from '../src/plugin-v2.ts';
+  v1PartsToV2Text,
+} from '../src/plugin-v2-event-leaf.ts';
 
 // v2 tool input schema contract
 //
@@ -29,39 +32,114 @@ interface RegisteredTool {
 }
 
 /** A minimal v2 Context whose tool.transform captures the registered inputs. */
-function capturingCtx(tools: RegisteredTool[]): {
+function capturingCtx(
+  tools: RegisteredTool[],
+  opts?: {
+    options?: Record<string, unknown>;
+    location?: {directory: string; workspaceID?: string};
+    events?: AsyncIterable<{
+      id?: string;
+      type: string;
+      location?: {directory?: string; workspaceID?: string} | null;
+      data?: Record<string, unknown>;
+    }>;
+    createdInputs?: Array<Record<string, unknown>>;
+    rejectHooks?: string[];
+    sessionContext?: (
+      input: Record<string, unknown>,
+    ) => Promise<unknown> | unknown;
+    sessionGet?: (input: Record<string, unknown>) => Promise<unknown> | unknown;
+    onPrompt?: (input: Record<string, unknown>) => Promise<unknown> | unknown;
+    onSynthetic?: (
+      input: Record<string, unknown>,
+    ) => Promise<unknown> | unknown;
+    onRemove?: (input: Record<string, unknown>) => Promise<unknown> | unknown;
+    onUpdate?: (input: Record<string, unknown>) => Promise<unknown> | unknown;
+    onWait?: (input: Record<string, unknown>) => Promise<unknown> | unknown;
+    agentTransform?: (
+      draft: unknown,
+    ) =>
+      Promise<{dispose: () => Promise<void>}> | {dispose: () => Promise<void>};
+    onDispose?: () => void;
+    onIterReturn?: () => void;
+  },
+): {
   ctx: Parameters<typeof setup>[0];
   captured: RegisteredTool[];
   contextHook: {current?: (input: unknown) => Promise<void> | void};
+  sessionHooks: Record<string, (input: unknown) => Promise<void> | void>;
 } {
   const contextHook: {current?: (input: unknown) => Promise<void> | void} = {};
+  const sessionHooks: Record<string, (input: unknown) => Promise<void> | void> =
+    {};
   const ctx = {
     app: {name: 'test'},
+    ...(opts?.location ? {location: opts.location} : {}),
     // persistState:false avoids acquiring the persistence lease (which would
     // conflict with any live opencode process). The tool-transform contract
-    // under test does not depend on persistence.
-    options: {persistState: false},
+    // under test does not depend on persistence unless overridden via opts.options.
+    options: opts?.options ?? {persistState: false},
     session: {
-      prompt: async () => ({}),
-      synthetic: async () => ({}),
+      prompt: async (input: Record<string, unknown>) =>
+        opts?.onPrompt ? opts.onPrompt(input) : {},
+      synthetic: async (input: Record<string, unknown>) =>
+        opts?.onSynthetic ? opts.onSynthetic(input) : {},
       command: async () => ({}),
-      create: async () => ({data: {id: 's1'}}),
-      get: async () => ({}),
+      create: async (input: Record<string, unknown>) => {
+        opts?.createdInputs?.push(input);
+        return {data: {id: 's1'}};
+      },
+      get: async (input: Record<string, unknown>) =>
+        opts?.sessionGet?.(input) ?? {
+          id: input.sessionID,
+          cost: 0,
+          tokens: {
+            input: 0,
+            output: 0,
+            reasoning: 0,
+            cache: {read: 0, write: 0},
+          },
+        },
       interrupt: async () => ({}),
       generate: async () => ({}),
+      ...(opts?.sessionContext ? {context: opts.sessionContext} : {}),
+      ...(opts?.onRemove ? {remove: opts.onRemove} : {}),
+      ...(opts?.onUpdate ? {update: opts.onUpdate} : {}),
+      ...(opts?.onWait ? {wait: opts.onWait} : {}),
       hook: async (
-        _name: string,
+        name: string,
         cb: (input: unknown) => Promise<void> | void,
       ) => {
-        contextHook.current = cb;
+        if (opts?.rejectHooks?.includes(name)) {
+          throw new Error(`unsupported session hook: ${name}`);
+        }
+        sessionHooks[name] = cb;
+        if (name === 'context') {
+          contextHook.current = cb;
+        }
         return {
           dispose: async () => {},
         };
       },
     },
     event: {
-      // An immediately-ending async iterable so the subscribe loop exits.
-      subscribe: async function* () {},
+      // An immediately-ending async iterable unless tests provide a custom stream.
+      subscribe: () =>
+        opts?.events ??
+        ({
+          [Symbol.asyncIterator]: () => ({
+            next: async () => ({done: true, value: undefined}),
+            return: async () => {
+              opts?.onIterReturn?.();
+              return {done: true, value: undefined};
+            },
+          }),
+        } as AsyncIterable<{
+          id?: string;
+          type: string;
+          location?: {directory?: string; workspaceID?: string} | null;
+          data?: Record<string, unknown>;
+        }>),
     },
     tool: {
       transform: async (
@@ -83,9 +161,31 @@ function capturingCtx(tools: RegisteredTool[]): {
         dispose: async () => {},
       }),
     },
+    ...(opts?.agentTransform ? {agent: {transform: opts.agentTransform}} : {}),
   } as unknown as Parameters<typeof setup>[0];
-  return {ctx, captured: tools, contextHook};
+  return {ctx, captured: tools, contextHook, sessionHooks};
 }
+
+test('v2 setup unwires live resources when a late agent transform throws', async () => {
+  let iterReturned = 0;
+  const root = mkdtempSync(join(tmpdir(), 'fixate-v2-unwind-'));
+  try {
+    const tools: RegisteredTool[] = [];
+    const h = capturingCtx(tools, {
+      options: {persistState: false, childSessionJudge: false},
+      onIterReturn: () => {
+        iterReturned++;
+      },
+      agentTransform: async () => {
+        throw new Error('late transform failure');
+      },
+    });
+    await expect(setup(h.ctx)).rejects.toThrow('late transform failure');
+    expect(iterReturned).toBe(1);
+  } finally {
+    rmSync(root, {recursive: true, force: true});
+  }
+});
 
 test('v2 event session IDs accept direct and authoritative nested shapes only', () => {
   expect(getV2EventSessionID({sessionID: 'direct'})).toBe('direct');
@@ -105,26 +205,199 @@ test('v2 event session IDs accept direct and authoritative nested shapes only', 
   expect(getV2EventSessionID({})).toBeUndefined();
 });
 
-test('v2 parent-bound child creation fails closed instead of creating an unbound session', async () => {
-  let createCalls = 0;
-  const shim = createV2ClientShim(
+test('v2 parent-bound child creation delegates when supported and fails closed (cleaning up orphans) if host strips parentID', async () => {
+  // Supported host: preserves parentID on returned child session.
+  const supportedCalls: Array<Record<string, unknown>> = [];
+  const supportedShim = createV2ClientShim(
     {
       session: {
-        create: async () => {
-          createCalls++;
-          return {};
+        create: async (input: Record<string, unknown>) => {
+          supportedCalls.push(input);
+          return {id: 'child-1', parentID: input.parentID};
+        },
+        remove: async () => {
+          throw new Error('should not remove valid parent-bound child');
+        },
+      },
+    } as never,
+    {bySession: new Map()},
+  );
+  const child = (await supportedShim.session.create!({
+    parentID: 'parent',
+    title: 'child',
+  })) as {id?: string; parentID?: string};
+  expect(child).toEqual({id: 'child-1', parentID: 'parent'});
+  expect(supportedCalls).toHaveLength(1);
+  expect(supportedCalls[0]?.parentID).toBe('parent');
+
+  // Legacy host that strips parentID: clean up orphan via remove and fail closed.
+  const removedIDs: string[] = [];
+  const legacyShim = createV2ClientShim(
+    {
+      session: {
+        create: async () => ({data: {id: 'orphan-1'}}),
+        remove: async (input: {sessionID?: string}) => {
+          if (input.sessionID) removedIDs.push(input.sessionID);
         },
       },
     } as never,
     {bySession: new Map()},
   );
   await expect(
-    shim.session.create!({
+    legacyShim.session.create!({
       parentID: 'parent',
       title: 'child',
     }),
   ).rejects.toThrow(/unsupported.*no fork performed/i);
-  expect(createCalls).toBe(0);
+  expect(removedIDs).toEqual(['orphan-1']);
+});
+
+test('v2 prompt fails closed when the requested agent cannot be selected', async () => {
+  let promptCalls = 0;
+  const shim = createV2ClientShim(
+    {
+      session: {
+        switchAgent: async () => {
+          throw new Error('Agent not found: goal-verify');
+        },
+        prompt: async () => {
+          promptCalls++;
+          return {parts: [{type: 'text', text: 'verdict'}]};
+        },
+      },
+    } as never,
+    {bySession: new Map()},
+  );
+  await expect(
+    shim.session.prompt!({
+      sessionID: 'ses-child',
+      agent: 'goal-verify',
+      parts: [{type: 'text', text: 'judge'}],
+    }),
+  ).rejects.toThrow(/agent/i);
+  expect(promptCalls).toBe(0);
+
+  // A host without switchAgent must also fail closed for an explicit agent.
+  const noSwitch = createV2ClientShim(
+    {
+      session: {
+        prompt: async () => {
+          promptCalls++;
+          return {parts: [{type: 'text', text: 'verdict'}]};
+        },
+      },
+    } as never,
+    {bySession: new Map()},
+  );
+  await expect(
+    noSwitch.session.prompt!({
+      sessionID: 'ses-child',
+      agent: 'goal-verify',
+      parts: [{type: 'text', text: 'judge'}],
+    }),
+  ).rejects.toThrow(/agent/i);
+  expect(promptCalls).toBe(0);
+});
+
+test('v2 delete, update, and prompt wait delegate cleanly when host exposes remove/update/wait/switchAgent', async () => {
+  const events: string[] = [];
+  let interruptCalls = 0;
+  let switchedTo: unknown;
+  let updatePayload: unknown;
+  let removedPayload: unknown;
+
+  const shim = createV2ClientShim(
+    {
+      session: {
+        interrupt: async () => {
+          interruptCalls++;
+        },
+        remove: async (input: unknown) => {
+          removedPayload = input;
+        },
+        update: async (input: unknown) => {
+          updatePayload = input;
+        },
+        switchAgent: async (input: unknown) => {
+          switchedTo = input;
+          events.push('switchAgent');
+        },
+        prompt: async () => {
+          events.push('prompt');
+          return {
+            id: 'in-1',
+            sessionID: 'ses-child',
+            type: 'user',
+            payload: {text: 'judge'},
+          };
+        },
+        wait: async () => {
+          events.push('wait');
+        },
+        context: async () => [
+          {id: 'in-1', type: 'user'},
+          {
+            id: 'reply-1',
+            type: 'assistant',
+            agent: 'goal-verify',
+            finish: 'stop',
+            time: {created: 2, completed: 3},
+            content: [{type: 'text', text: '{"verdict":"pass"}'}],
+          },
+          {type: 'idle', outcome: 'succeeded', time: {created: 4}},
+        ],
+        get: async () => ({
+          id: 'ses-child',
+          outcome: 'succeeded',
+          time: {busy: 1, idle: 4},
+        }),
+      },
+    } as never,
+    {bySession: new Map()},
+  );
+
+  await shim.session.delete!({sessionID: 'ses-del'});
+  expect(removedPayload).toEqual({sessionID: 'ses-del'});
+  expect(interruptCalls).toBe(0);
+
+  await shim.session.update!({
+    path: {id: 'ses-upd'},
+    body: {title: 'Renamed', archived: true},
+  });
+  expect(updatePayload).toEqual({
+    sessionID: 'ses-upd',
+    title: 'Renamed',
+    archived: true,
+  });
+
+  await shim.session.prompt!({
+    sessionID: 'ses-child',
+    agent: 'goal-verify',
+    parts: [{type: 'text', text: 'Judge completion'}],
+  });
+  expect(switchedTo).toEqual({sessionID: 'ses-child', agent: 'goal-verify'});
+  expect(events).toEqual(['switchAgent', 'prompt', 'wait']);
+
+  // Synchronous host replies carrying parts must not block on session.wait.
+  events.length = 0;
+  const syncShim = createV2ClientShim(
+    {
+      session: {
+        prompt: async () => ({
+          parts: [{type: 'text', text: '{"verdict":"pass"}'}],
+        }),
+        wait: async () => {
+          events.push('unexpected-wait');
+        },
+      },
+    } as never,
+    {bySession: new Map()},
+  );
+  await syncShim.session.prompt!({
+    sessionID: 'ses-sync',
+    parts: [{type: 'text', text: 'Judge'}],
+  });
+  expect(events).toEqual([]);
 });
 
 // SESSION-GOAL-BINDING-1: unsupported ops must fail LOUDLY
@@ -468,5 +741,1016 @@ test('goal-command with an empty sessionID fails loudly instead of hitting a pha
     expect(JSON.stringify(missing)).toContain('requires an active session');
   } finally {
     await dispose();
+  }
+});
+
+test('v2 context bridge injects <fixate_on> into input.system for active goals while preserving native metadata and non-text parts', async () => {
+  const tools: RegisteredTool[] = [];
+  const {ctx, contextHook} = capturingCtx(tools);
+  const dispose = await setup(ctx);
+  try {
+    const createGoal = tools.find(t => t.name === 'create_goal') as
+      ExecutableGoalTool | undefined;
+    expect(createGoal?.execute).toBeDefined();
+    await createGoal!.execute!(
+      {objective: 'Write alpha.txt and check output'},
+      {sessionID: 'sys-active-s1'},
+    );
+
+    const input = {
+      sessionID: 'sys-active-s1',
+      agent: 'build',
+      model: {id: 'm1', providerID: 'p1'},
+      system: [
+        {
+          type: 'text',
+          text: 'host base prompt',
+          cache: {ttl: 60},
+          metadata: {host: 'yes'},
+        },
+        {type: 'effort', effort: 'high'},
+      ] as unknown[],
+      messages: [],
+      tools: {},
+    };
+
+    await contextHook.current!(input);
+    expect(input.system).toHaveLength(3);
+    expect(input.system[0]).toMatchObject({
+      type: 'text',
+    });
+    const injectedText = (input.system[0] as {text?: string}).text ?? '';
+    expect(injectedText).toContain('<fixate_on');
+    expect(injectedText).toContain('<goal_objective>');
+    expect(injectedText).toContain('Write alpha.txt and check output');
+    expect(input.system[1]).toMatchObject({
+      type: 'text',
+      text: 'host base prompt',
+      cache: {ttl: 60},
+      metadata: {host: 'yes'},
+    });
+    expect(input.system[2]).toEqual({type: 'effort', effort: 'high'});
+
+    // Re-running context hook must not duplicate <fixate_on> or drop non-text parts.
+    await contextHook.current!(input);
+    expect(input.system).toHaveLength(3);
+    expect(input.system[2]).toEqual({type: 'effort', effort: 'high'});
+  } finally {
+    await dispose();
+  }
+});
+
+test('v2 setup tolerates host rejecting experimental compaction hook', async () => {
+  const tools: RegisteredTool[] = [];
+  const {ctx, sessionHooks} = capturingCtx(tools, {
+    rejectHooks: ['compaction'],
+  });
+  const dispose = await setup(ctx);
+  try {
+    expect(sessionHooks.context).toBeDefined();
+    expect(sessionHooks.compaction).toBeUndefined();
+    expect(tools.some(t => t.name === 'create_goal')).toBe(true);
+  } finally {
+    await dispose();
+  }
+});
+
+test('v2 compaction hook injects active goal context into compaction input.system without duplicating retries', async () => {
+  const tools: RegisteredTool[] = [];
+  const {ctx, sessionHooks} = capturingCtx(tools);
+  const dispose = await setup(ctx);
+  try {
+    expect(sessionHooks.compaction).toBeDefined();
+    const goalCommand = tools.find(t => t.name === 'goal-command') as
+      ExecutableGoalTool | undefined;
+    await goalCommand!.execute!(
+      {
+        subcommand:
+          'set Finish migration cleanly --constraints "Keep tests passing"',
+      },
+      {sessionID: 'compact-active-s1'},
+    );
+
+    const input = {
+      sessionID: 'compact-active-s1',
+      agent: 'compaction',
+      model: {id: 'm1', providerID: 'p1'},
+      system: [
+        {
+          type: 'text',
+          text: 'Summarize conversation accurately.',
+          cache: {ttl: 120},
+        },
+      ] as unknown[],
+      messages: [{role: 'user', content: 'Summarize'}],
+      tools: {},
+    };
+
+    await sessionHooks.compaction!(input);
+    expect(input.system.length).toBeGreaterThanOrEqual(2);
+    const allTexts = input.system.map(p => (p as {text?: string}).text ?? '');
+    expect(allTexts.some(t => t.includes('<goal_context'))).toBe(true);
+    expect(allTexts.some(t => t.includes('Finish migration cleanly'))).toBe(
+      true,
+    );
+    expect(allTexts.some(t => t.includes('Keep tests passing'))).toBe(true);
+    expect(input.system[0]).toMatchObject({
+      type: 'text',
+      text: 'Summarize conversation accurately.',
+      cache: {ttl: 120},
+    });
+
+    // Repeated compaction hook invocations must not duplicate <goal_context>.
+    const countBeforeRetry = input.system.length;
+    await sessionHooks.compaction!(input);
+    expect(input.system).toHaveLength(countBeforeRetry);
+  } finally {
+    await dispose();
+  }
+});
+
+interface TestV2Event {
+  id?: string;
+  type: string;
+  location?: {directory?: string; workspaceID?: string} | null;
+  data?: Record<string, unknown>;
+}
+
+function createEventQueue(): {
+  stream: AsyncIterable<TestV2Event>;
+  push: (ev: TestV2Event) => void;
+  close: () => void;
+  /** True once the plugin's subscription loop has consumed every pushed event and
+   * parked on `next()` — which it can only do after awaiting the handler for the
+   * last delivered event. That makes "the event has been handled" observable
+   * without a timer: the loop calls `next()` only after its body returns. */
+  drained: () => boolean;
+} {
+  const buffered: TestV2Event[] = [];
+  const waiters: Array<(res: IteratorResult<TestV2Event>) => void> = [];
+  let closed = false;
+  let parked = 0;
+  return {
+    push(ev: TestV2Event) {
+      if (closed) return;
+      const waiter = waiters.shift();
+      if (waiter) {
+        parked -= 1;
+        waiter({done: false, value: ev});
+      } else {
+        buffered.push(ev);
+      }
+    },
+    close() {
+      closed = true;
+      while (waiters.length > 0) {
+        parked -= 1;
+        waiters.shift()!({done: true, value: undefined});
+      }
+    },
+    drained: () => buffered.length === 0 && parked > 0,
+    stream: {
+      [Symbol.asyncIterator]() {
+        return {
+          next() {
+            if (buffered.length > 0) {
+              return Promise.resolve({done: false, value: buffered.shift()!});
+            }
+            if (closed) {
+              return Promise.resolve({done: true, value: undefined});
+            }
+            return new Promise<IteratorResult<TestV2Event>>(resolve => {
+              parked += 1;
+              waiters.push(resolve);
+            });
+          },
+        };
+      },
+    },
+  };
+}
+
+test('v2 adapter uses ctx.location.directory, forwards it on unparented create, ignores foreign-location events, and canonicalizes symlinks', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'fixate-v2-loc-'));
+  const wsA = join(root, 'ws-a');
+  const wsB = join(root, 'ws-b');
+  mkdirSync(wsA, {recursive: true});
+  mkdirSync(wsB, {recursive: true});
+  const wsALink = join(root, 'ws-a-link');
+  symlinkSync(wsA, wsALink);
+
+  const createdInputs: Array<Record<string, unknown>> = [];
+  const queue = createEventQueue();
+  const tools: RegisteredTool[] = [];
+  const {ctx} = capturingCtx(tools, {
+    options: {logLevel: 'error'},
+    location: {directory: wsA},
+    createdInputs,
+    events: queue.stream,
+  });
+
+  const dispose = await setup(ctx);
+  try {
+    const createGoal = tools.find(t => t.name === 'create_goal') as
+      ExecutableGoalTool | undefined;
+    const getGoal = tools.find(t => t.name === 'get_goal') as
+      ExecutableGoalTool | undefined;
+    await createGoal!.execute!(
+      {objective: 'Stay in workspace A'},
+      {sessionID: 'loc-s1'},
+    );
+
+    // Emit foreign-location event AFTER the goal exists in active state.
+    queue.push({
+      type: 'session.error',
+      location: {directory: wsB},
+      data: {sessionID: 'loc-s1'},
+    });
+    await waitFor(
+      () => queue.drained(),
+      'the foreign-location session.error to be consumed',
+    );
+
+    // State must persist under ctx.location.directory (wsA), not process.cwd().
+    const expectedStatePath = join(
+      wsA,
+      '.opencode',
+      'goals',
+      'sessions',
+      'loc-s1',
+      'state.json',
+    );
+    expect(existsSync(expectedStatePath)).toBe(true);
+
+    // Foreign-location session.error for wsB must not settle/pause wsA's goal.
+    const stateAfterForeign = (await getGoal!.execute!(
+      {},
+      {sessionID: 'loc-s1'},
+    )) as {content?: string};
+    const parsedForeign = JSON.parse(stateAfterForeign.content ?? '{}') as {
+      goal?: {status?: string};
+    };
+    expect(parsedForeign.goal?.status).toBe('active');
+
+    // Same workspace via symlink alias MUST match and settle/pause the goal.
+    queue.push({
+      type: 'session.error',
+      location: {directory: wsALink},
+      data: {sessionID: 'loc-s1'},
+    });
+    await waitFor(
+      () => queue.drained(),
+      'the symlink-alias session.error to be consumed',
+    );
+
+    const stateAfterLocal = (await getGoal!.execute!(
+      {},
+      {sessionID: 'loc-s1'},
+    )) as {content?: string};
+    const parsedLocal = JSON.parse(stateAfterLocal.content ?? '{}') as {
+      goal?: {status?: string};
+    };
+    expect(parsedLocal.goal?.status).toBe('paused');
+
+    // Unparented session.create forwards location from ctx.location, while
+    // preserving an explicit caller-provided location.
+    const shim = createV2ClientShim(ctx, {bySession: new Map()});
+    await shim.session.create!({title: 'top-level'});
+    await shim.session.create!({
+      title: 'explicit',
+      location: {directory: wsB},
+    });
+    expect(createdInputs).toHaveLength(2);
+    expect(createdInputs[0]?.location).toEqual({directory: wsA});
+    expect(createdInputs[1]?.location).toEqual({directory: wsB});
+  } finally {
+    queue.close();
+    await dispose();
+    rmSync(root, {recursive: true, force: true});
+  }
+});
+
+test('v2 pluginOptions.workspaceDirectory overrides ctx.location.directory for persistence and location filtering', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'fixate-v2-override-'));
+  const overrideWs = join(root, 'override-ws');
+  const ctxWs = join(root, 'ctx-ws');
+  mkdirSync(overrideWs, {recursive: true});
+  mkdirSync(ctxWs, {recursive: true});
+
+  const queue = createEventQueue();
+  const tools: RegisteredTool[] = [];
+  const {ctx} = capturingCtx(tools, {
+    options: {logLevel: 'error', workspaceDirectory: overrideWs},
+    location: {directory: ctxWs},
+    events: queue.stream,
+  });
+
+  const dispose = await setup(ctx);
+  try {
+    const createGoal = tools.find(t => t.name === 'create_goal') as
+      ExecutableGoalTool | undefined;
+    const getGoal = tools.find(t => t.name === 'get_goal') as
+      ExecutableGoalTool | undefined;
+    await createGoal!.execute!(
+      {objective: 'Use workspaceDirectory override'},
+      {sessionID: 'override-s1'},
+    );
+
+    expect(
+      existsSync(
+        join(
+          overrideWs,
+          '.opencode',
+          'goals',
+          'sessions',
+          'override-s1',
+          'state.json',
+        ),
+      ),
+    ).toBe(true);
+    expect(
+      existsSync(
+        join(
+          ctxWs,
+          '.opencode',
+          'goals',
+          'sessions',
+          'override-s1',
+          'state.json',
+        ),
+      ),
+    ).toBe(false);
+
+    // Event from ctxWs (different from workspaceDirectory) is ignored.
+    queue.push({
+      type: 'session.error',
+      location: {directory: ctxWs},
+      data: {sessionID: 'override-s1'},
+    });
+    await waitFor(
+      () => queue.drained(),
+      'the foreign-workspace session.error to be consumed',
+    );
+
+    const state = (await getGoal!.execute!({}, {sessionID: 'override-s1'})) as {
+      content?: string;
+    };
+    const parsed = JSON.parse(state.content ?? '{}') as {
+      goal?: {status?: string};
+    };
+    expect(parsed.goal?.status).toBe('active');
+  } finally {
+    queue.close();
+    await dispose();
+    rmSync(root, {recursive: true, force: true});
+  }
+});
+
+test('v2 shim messages() normalizes ctx.session.context Session.Message.Info[] and buffered ModelMessage fallback', async () => {
+  const {
+    findLatestAssistantMessage,
+    getTextFromParts,
+    messageHasToolCall,
+    messageIsSettled,
+  } = await import('../src/message-helpers.ts');
+  const {normalizeMessageUsage} = await import('../src/accounting.ts');
+
+  const sessionContextMessages = [
+    {
+      id: 'msg_1',
+      type: 'user',
+      text: 'Fix the tests',
+      agent: 'build',
+      time: {created: 1000},
+    },
+    {
+      id: 'msg_2',
+      type: 'assistant',
+      agent: 'build',
+      model: {id: 'claude-sonnet-4', providerID: 'anthropic'},
+      finish: 'tool-calls',
+      cost: 0.015,
+      tokens: {
+        input: 300,
+        output: 80,
+        reasoning: 12,
+        cache: {read: 20, write: 10},
+      },
+      content: [
+        {type: 'text', text: 'Running bun test now.'},
+        {
+          type: 'tool',
+          id: 'tc_1',
+          name: 'bash',
+          state: {status: 'completed', input: {command: 'bun test'}},
+        },
+      ],
+      time: {created: 1100, completed: 1200},
+    },
+    {
+      id: 'msg_3',
+      type: 'synthetic',
+      text: 'Continue working on goal',
+      metadata: {source: 'goal'},
+      time: {created: 1300},
+    },
+  ];
+
+  const shim = createV2ClientShim(
+    {
+      session: {
+        context: async () => sessionContextMessages,
+      },
+    } as never,
+    {bySession: new Map()},
+  );
+
+  const normalized = (await shim.session.messages!({
+    sessionID: 'ctx-msg-s1',
+  })) as Array<{
+    info?: Record<string, unknown>;
+    parts?: Array<Record<string, unknown>>;
+  }>;
+  expect(normalized).toHaveLength(3);
+
+  const latest = findLatestAssistantMessage(normalized);
+  expect(latest).toBeTruthy();
+  expect(getTextFromParts((latest as {parts?: unknown[]}).parts)).toBe(
+    'Running bun test now.',
+  );
+  expect(messageHasToolCall(latest)).toBe(true);
+  expect(messageIsSettled(latest)).toBe(true);
+  expect(normalizeMessageUsage(latest)).toEqual({
+    input: 300,
+    output: 80,
+    reasoning: 12,
+    cacheRead: 20,
+    cacheWrite: 10,
+    cost: 0.015,
+    costKnown: true,
+  });
+
+  // Synthetic v2 messages must carry synthetic:true on parts so idle detection
+  // never mistakes continuation steers for human intervention.
+  expect(normalized[2]?.info?.role).toBe('user');
+  expect(normalized[2]?.info?.synthetic).toBe(true);
+  expect(normalized[2]?.parts?.[0]?.synthetic).toBe(true);
+  expect(normalized[0]?.info?.synthetic).toBeUndefined();
+
+  // Trailing limit preserves newest items.
+  const limited = (await shim.session.messages!({
+    sessionID: 'ctx-msg-s1',
+    limit: 2,
+  })) as Array<{info?: {id?: string}}>;
+  expect(limited.map(m => m.info?.id)).toEqual(['msg_2', 'msg_3']);
+
+  // Fallback to pre-turn buffered @opencode/ai ModelMessage when context() errors.
+  const buffer = {
+    bySession: new Map<string, unknown[]>([
+      [
+        'buf-s1',
+        [
+          {role: 'user', content: 'Hello'},
+          {
+            role: 'assistant',
+            content: [
+              {type: 'text', text: 'Checking files'},
+              {
+                type: 'tool-call',
+                toolCallId: 't1',
+                toolName: 'read',
+                input: {},
+              },
+            ],
+          },
+        ],
+      ],
+    ]),
+  };
+  const fallbackShim = createV2ClientShim(
+    {
+      session: {
+        context: async () => {
+          throw new Error('session.context failed');
+        },
+      },
+    } as never,
+    buffer,
+  );
+  const fallbackMsgs = (await fallbackShim.session.messages!({
+    sessionID: 'buf-s1',
+  })) as unknown[];
+  const fallbackLatest = findLatestAssistantMessage(fallbackMsgs);
+  expect(getTextFromParts((fallbackLatest as {parts?: unknown[]})?.parts)).toBe(
+    'Checking files',
+  );
+  expect(messageHasToolCall(fallbackLatest)).toBe(true);
+});
+
+test('v2 experimental.idle drives continuation synchronously, respects background jobs, dedupes trailing execution.succeeded, and falls back when unavailable', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'fixate-v2-idle-'));
+  try {
+    // Part 1: Active experimental.idle continuation + background gating + dedupe + cancellable minDelayMs
+    const wsA = join(root, 'ws-idle');
+    mkdirSync(wsA, {recursive: true});
+    const queue = createEventQueue();
+    const syntheticCalls: Array<{sessionID: string; text: string}> = [];
+    const contextMessagesBySession = new Map<string, unknown[]>();
+    const tools: RegisteredTool[] = [];
+
+    const {ctx, sessionHooks} = capturingCtx(tools, {
+      options: {logLevel: 'error', minDelayMs: 250},
+      location: {directory: wsA},
+      events: queue.stream,
+      // Durable cumulative totals match the completed first step below; idle
+      // no longer has to infer them from a potentially compacted context window.
+      sessionGet: async input => ({
+        id: input.sessionID,
+        cost: 0,
+        tokens: {
+          input: 200,
+          output: 100,
+          reasoning: 0,
+          cache: {read: 0, write: 0},
+        },
+      }),
+      sessionContext: async (input: Record<string, unknown>) =>
+        contextMessagesBySession.get(String(input.sessionID ?? '')) ?? [],
+      onSynthetic: async (input: Record<string, unknown>) => {
+        syntheticCalls.push({
+          sessionID: String(input.sessionID ?? ''),
+          text: String(input.text ?? ''),
+        });
+      },
+    });
+
+    const dispose = await setup(ctx);
+    try {
+      expect(sessionHooks['experimental.idle']).toBeDefined();
+      const createGoal = tools.find(t => t.name === 'create_goal') as
+        ExecutableGoalTool | undefined;
+      const getGoal = tools.find(t => t.name === 'get_goal') as
+        ExecutableGoalTool | undefined;
+      await createGoal!.execute!(
+        {objective: 'Run multi-turn v2 task until complete'},
+        {sessionID: 'exp-s1'},
+      );
+
+      // Turn 1 finished with tool call and token usage; shell background job must NOT block idle.
+      contextMessagesBySession.set('exp-s1', [
+        {id: 'u1', type: 'user', text: 'Go', time: {created: 1000}},
+        {
+          id: 'a1',
+          type: 'assistant',
+          agent: 'build',
+          finish: 'stop',
+          tokens: {
+            input: 200,
+            output: 100,
+            reasoning: 0,
+            cache: {read: 0, write: 0},
+          },
+          content: [
+            {type: 'text', text: 'Edited file A, next edit B.'},
+            {
+              type: 'tool',
+              id: 't1',
+              name: 'edit',
+              state: {status: 'completed', input: {}},
+            },
+          ],
+          time: {created: 1100, completed: 1200},
+        },
+      ]);
+
+      await sessionHooks['experimental.idle']!({
+        sessionID: 'exp-s1',
+        background: [
+          {kind: 'shell', sessionID: 'exp-s1', command: 'bun run dev'},
+        ],
+      });
+      // synthetic must have been admitted BEFORE experimental.idle returned!
+      expect(syntheticCalls).toHaveLength(1);
+      expect(syntheticCalls[0]?.sessionID).toBe('exp-s1');
+
+      const state1 = JSON.parse(
+        (
+          (await getGoal!.execute!({}, {sessionID: 'exp-s1'})) as {
+            content: string;
+          }
+        ).content,
+      ) as {
+        goal: {status: string; tokensUsed: number};
+      };
+      expect(state1.goal.status).toBe('active');
+      expect(state1.goal.tokensUsed).toBeGreaterThanOrEqual(300);
+
+      const goalCommand = tools.find(t => t.name === 'goal-command') as
+        ExecutableGoalTool | undefined;
+      const statusOut = (await goalCommand!.execute!(
+        {subcommand: 'status'},
+        {sessionID: 'exp-s1'},
+      )) as {content: string};
+      expect(statusOut.content).toContain('1/unlimited turns');
+
+      // Blocking subagent background job prevents continuation AND suppresses trailing execution.succeeded.
+      await sessionHooks['experimental.idle']!({
+        sessionID: 'exp-s1',
+        background: [
+          {kind: 'subagent', sessionID: 'exp-s1', childSessionID: 'sub-1'},
+        ],
+      });
+      expect(syntheticCalls).toHaveLength(1);
+
+      queue.push({
+        type: 'session.execution.succeeded',
+        location: {directory: wsA},
+        data: {sessionID: 'exp-s1'},
+      });
+      await waitFor(
+        () => queue.drained(),
+        'the trailing session.execution.succeeded to be consumed',
+      );
+      expect(syntheticCalls).toHaveLength(1);
+
+      // New step clears background lock and respects cancellable minDelayMs cooldown before continuing.
+      queue.push({
+        type: 'session.step.started',
+        location: {directory: wsA},
+        data: {sessionID: 'exp-s1'},
+      });
+      await waitFor(
+        () => queue.drained(),
+        'the session.step.started to be consumed',
+      );
+
+      contextMessagesBySession.set('exp-s1', [
+        ...contextMessagesBySession.get('exp-s1')!,
+        {
+          id: 'a2',
+          type: 'assistant',
+          agent: 'build',
+          finish: 'stop',
+          tokens: {
+            input: 10,
+            output: 5,
+            reasoning: 0,
+            cache: {read: 0, write: 0},
+          },
+          content: [{type: 'text', text: 'Repeating idle stall.'}],
+          time: {created: 2000, completed: 2100},
+        },
+      ]);
+
+      // Start experimental.idle (waits minDelayMs cooldown) and verify mid-delay human stop cancels continuation.
+      const delayedIdle = sessionHooks['experimental.idle']!({
+        sessionID: 'exp-s1',
+        background: [],
+      });
+      // Immediately admit an interrupting explicit-stop user message while cooldown sleeps.
+      queue.push({
+        type: 'session.input.admitted',
+        location: {directory: wsA},
+        data: {
+          sessionID: 'exp-s1',
+          input: {
+            id: 'stop-1',
+            type: 'user',
+            delivery: 'steer',
+            data: {text: 'stop'},
+          },
+        },
+      });
+      await delayedIdle;
+      expect(syntheticCalls).toHaveLength(1);
+
+      // Trailing session.execution.succeeded after experimental.idle must be deduplicated
+      // so the explicitly paused goal is not double-evaluated.
+      queue.push({
+        type: 'session.execution.succeeded',
+        location: {directory: wsA},
+        data: {sessionID: 'exp-s1'},
+      });
+      await waitFor(
+        () => queue.drained(),
+        'the post-stop trailing session.execution.succeeded to be consumed',
+      );
+      expect(syntheticCalls).toHaveLength(1);
+    } finally {
+      queue.close();
+      await dispose();
+    }
+
+    // Part 2: Fallback when experimental.idle is unavailable on host -> session.execution.succeeded drives continuation.
+    const wsFallback = join(root, 'ws-fallback');
+    mkdirSync(wsFallback, {recursive: true});
+    const fbQueue = createEventQueue();
+    const fbSynthetics: string[] = [];
+    const fbTools: RegisteredTool[] = [];
+    const {ctx: fbCtx, sessionHooks: fbHooks} = capturingCtx(fbTools, {
+      options: {logLevel: 'error', minDelayMs: 0},
+      location: {directory: wsFallback},
+      rejectHooks: ['experimental.idle'],
+      events: fbQueue.stream,
+      sessionContext: async () => [
+        {
+          id: 'fb-a1',
+          type: 'assistant',
+          finish: 'stop',
+          tokens: {
+            input: 50,
+            output: 100,
+            reasoning: 0,
+            cache: {read: 0, write: 0},
+          },
+          content: [
+            {type: 'text', text: 'Completed step 1.'},
+            {
+              type: 'tool',
+              id: 'ft1',
+              name: 'edit',
+              state: {status: 'completed', input: {}},
+            },
+          ],
+          time: {created: 1000, completed: 1100},
+        },
+      ],
+      onSynthetic: async (input: Record<string, unknown>) => {
+        fbSynthetics.push(String(input.text ?? ''));
+      },
+    });
+    const fbDispose = await setup(fbCtx);
+    try {
+      expect(fbHooks['experimental.idle']).toBeUndefined();
+      const createGoal = fbTools.find(t => t.name === 'create_goal') as
+        ExecutableGoalTool | undefined;
+      await createGoal!.execute!(
+        {objective: 'Fallback event continuation'},
+        {sessionID: 'fb-s1'},
+      );
+      fbQueue.push({
+        type: 'session.execution.succeeded',
+        location: {directory: wsFallback},
+        data: {sessionID: 'fb-s1'},
+      });
+      await waitFor(
+        () => fbSynthetics.length === 1,
+        'the fallback session.execution.succeeded to produce a continuation',
+      );
+      expect(fbSynthetics).toHaveLength(1);
+    } finally {
+      fbQueue.close();
+      await fbDispose();
+    }
+  } finally {
+    rmSync(root, {recursive: true, force: true});
+  }
+});
+
+test('v1PartsToV2Text and createV2ClientShim accept both flat and legacy shapes', async () => {
+  const flatTranslated = v1PartsToV2Text({
+    sessionID: 's-flat',
+    agent: 'build',
+    parts: [
+      {type: 'text', text: 'Continue'},
+      {type: 'text', text: 'Next', metadata: {'fixate-on': {goalId: 'g1'}}},
+    ],
+  });
+  expect(flatTranslated).toEqual({
+    sessionID: 's-flat',
+    text: 'Continue\n\nNext',
+    metadata: {goalId: 'g1'},
+    agent: 'build',
+  });
+
+  const legacyTranslated = v1PartsToV2Text({
+    path: {id: 's-legacy'},
+    body: {
+      agent: 'verifier',
+      parts: [
+        {
+          type: 'text',
+          text: 'Check claim',
+          metadata: {'fixate-on': {phase: 'verify'}},
+        },
+      ],
+    },
+  });
+  expect(legacyTranslated).toEqual({
+    sessionID: 's-legacy',
+    text: 'Check claim',
+    metadata: {phase: 'verify'},
+    agent: 'verifier',
+  });
+
+  const createPayloads: Array<Record<string, unknown>> = [];
+  const getPayloads: Array<Record<string, unknown>> = [];
+  const shim = createV2ClientShim(
+    {
+      app: {},
+      location: {directory: '/tmp/ws-shape'},
+      options: {},
+      session: {
+        prompt: async () => ({}),
+        synthetic: async () => ({}),
+        command: async () => ({}),
+        create: async input => {
+          createPayloads.push(input);
+          return {data: {id: 'child-1', parentID: input.parentID}};
+        },
+        get: async input => {
+          getPayloads.push(input);
+          return {id: input.sessionID};
+        },
+        interrupt: async () => ({}),
+        generate: async () => ({}),
+        hook: async () => ({dispose: async () => {}}),
+      },
+      event: {
+        subscribe: async function* () {},
+      },
+      tool: {transform: async () => ({dispose: async () => {}})},
+      command: {transform: async () => ({dispose: async () => {}})},
+    },
+    {bySession: new Map()},
+  );
+
+  await shim.session.create!({
+    body: {parentID: 'parent-99', title: 'Judge Session'},
+  });
+  expect(createPayloads).toEqual([
+    {parentID: 'parent-99', title: 'Judge Session'},
+  ]);
+
+  await shim.session.get!({path: {id: 's-legacy'}});
+  expect(getPayloads).toEqual([{sessionID: 's-legacy'}]);
+});
+
+test('v2 ctx.agent.transform registers goal + read-only goal-verify agents, disposes cleanly, and fails closed on verifier collision', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'fixate-v2-agent-'));
+  try {
+    // 1. Default setup registers goal (primary) and goal-verify (hidden read-only subagent).
+    const registeredAgents = new Map<string, Record<string, unknown>>();
+    let agentDisposed = false;
+    const tools: RegisteredTool[] = [];
+    const {ctx} = capturingCtx(tools, {
+      options: {logLevel: 'error', workspaceDirectory: root},
+    });
+    (ctx as unknown as Record<string, unknown>).agent = {
+      transform: async (
+        cb: (draft: {
+          get: (id: string) => Record<string, unknown> | undefined;
+          update: (
+            id: string,
+            edit: (entry: Record<string, unknown>) => void,
+          ) => void;
+        }) => void,
+      ) => {
+        cb({
+          get: id => registeredAgents.get(id),
+          update: (id, edit) => {
+            const entry = registeredAgents.get(id) ?? {
+              id,
+              permissions: [{action: '*', resource: '*', effect: 'allow'}],
+            };
+            registeredAgents.set(id, entry);
+            edit(entry);
+          },
+        });
+        return {
+          dispose: async () => {
+            agentDisposed = true;
+          },
+        };
+      },
+    };
+    const dispose = await setup(ctx);
+    expect(registeredAgents.has('goal')).toBe(true);
+    expect(registeredAgents.get('goal')?.mode).toBe('primary');
+    expect(registeredAgents.get('goal')?.hidden).toBe(false);
+    expect(registeredAgents.has('goal-verify')).toBe(true);
+    const verifier = registeredAgents.get('goal-verify') as {
+      mode?: string;
+      hidden?: boolean;
+      system?: string;
+      permissions?: Array<{action: string; resource: string; effect: string}>;
+    };
+    expect(verifier.mode).toBe('subagent');
+    expect(verifier.hidden).toBe(true);
+    expect(verifier.system).toBeTruthy();
+    expect(verifier.permissions?.[0]).toEqual({
+      action: '*',
+      resource: '*',
+      effect: 'deny',
+    });
+    expect(
+      verifier.permissions?.some(
+        r => r.action === 'read' && r.resource === '*' && r.effect === 'allow',
+      ),
+    ).toBe(true);
+    expect(
+      verifier.permissions?.some(
+        r => r.action === 'edit' && r.resource === '*' && r.effect === 'deny',
+      ),
+    ).toBe(true);
+    expect(
+      verifier.permissions?.some(
+        r => r.action === 'update_goal' && r.effect === 'deny',
+      ),
+    ).toBe(true);
+    await dispose();
+    expect(agentDisposed).toBe(true);
+
+    // 2. Pre-existing verifier collision refuses setup rather than reusing untrusted agent.
+    const {ctx: collisionCtx} = capturingCtx([], {
+      options: {logLevel: 'error', workspaceDirectory: root},
+    });
+    (collisionCtx as unknown as Record<string, unknown>).agent = {
+      transform: async (
+        cb: (draft: {
+          get: (id: string) => Record<string, unknown> | undefined;
+          update: (
+            id: string,
+            edit: (entry: Record<string, unknown>) => void,
+          ) => void;
+        }) => void,
+      ) => {
+        cb({
+          get: id =>
+            id === 'goal-verify'
+              ? {id: 'goal-verify', mode: 'subagent'}
+              : undefined,
+          update: () => {},
+        });
+        return {dispose: async () => {}};
+      },
+    };
+    await expect(setup(collisionCtx)).rejects.toThrow(
+      /childSessionJudge cannot safely use existing agent/,
+    );
+
+    // 3. registerAgents: false skips agent creation.
+    const skippedAgents = new Map<string, Record<string, unknown>>();
+    const {ctx: skipCtx} = capturingCtx([], {
+      options: {
+        logLevel: 'error',
+        workspaceDirectory: root,
+        registerAgents: false,
+      },
+    });
+    (skipCtx as unknown as Record<string, unknown>).agent = {
+      transform: async (
+        cb: (draft: {
+          get: (id: string) => Record<string, unknown> | undefined;
+          update: (
+            id: string,
+            edit: (entry: Record<string, unknown>) => void,
+          ) => void;
+        }) => void,
+      ) => {
+        cb({
+          get: id => skippedAgents.get(id),
+          update: (id, edit) => {
+            const entry = skippedAgents.get(id) ?? {id, permissions: []};
+            skippedAgents.set(id, entry);
+            edit(entry);
+          },
+        });
+        return {dispose: async () => {}};
+      },
+    };
+    const skipDispose = await setup(skipCtx);
+    expect(skippedAgents.has('goal')).toBe(false);
+    expect(skippedAgents.has('goal-verify')).toBe(false);
+    await skipDispose();
+
+    // 4. Equal goal/verifier names are rejected, matching the v1 config-hook guard.
+    const equalNameCtx = capturingCtx([], {
+      options: {
+        logLevel: 'error',
+        workspaceDirectory: root,
+        goalAgentName: 'same',
+        verifierAgentName: 'same',
+      },
+    }).ctx;
+    (equalNameCtx as unknown as Record<string, unknown>).agent = {
+      transform: async (
+        cb: (draft: {
+          get: (id: string) => Record<string, unknown> | undefined;
+          update: (
+            id: string,
+            edit: (entry: Record<string, unknown>) => void,
+          ) => void;
+        }) => void,
+      ) => {
+        cb({get: () => undefined, update: () => {}});
+        return {dispose: async () => {}};
+      },
+    };
+    await expect(setup(equalNameCtx)).rejects.toThrow(
+      /goalAgentName and verifierAgentName must be different/,
+    );
+  } finally {
+    rmSync(root, {recursive: true, force: true});
   }
 });
